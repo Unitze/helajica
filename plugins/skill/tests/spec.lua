@@ -143,6 +143,24 @@ case("builtin_skill_install_names_where_skills_go", function()
   )
 end)
 
+case("builtin_addon_dev_names_where_addons_go", function()
+  local addon_dev = require("addon_dev")
+  eq(addon_dev.name, "helajica-addon")
+  assert(#addon_dev.description > 0, "description should not be empty")
+  assert(
+    addon_dev.content:find(addon_dev.addons_dir_placeholder, 1, true),
+    "content should hold the add-ons dir placeholder"
+  )
+end)
+
+case("builtin_subagents_guide_covers_the_task_inputs", function()
+  local subagents = require("subagents")
+  eq(subagents.name, "maki-subagents")
+  for _, input in ipairs({ "subagent_type", "model_tier", "background" }) do
+    assert(subagents.content:find(input, 1, true), "content should explain " .. input)
+  end
+end)
+
 -- ── builtin plugin_dev skill ──
 
 case("builtin_plugin_dev_skill_loads", function()

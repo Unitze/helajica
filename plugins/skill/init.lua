@@ -68,6 +68,8 @@ end
 local opts = maki.api.register_options({
   plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
   skill_install = { default = true, desc = "Offer the builtin maki-skill-install skill for finding or writing skills." },
+  addon_dev = { default = true, desc = "Offer the builtin helajica-addon skill for writing add-ons." },
+  subagents = { default = true, desc = "Offer the builtin maki-subagents skill for delegating work to subagents." },
 })
 
 local ok, builtin, reference = pcall(function()
@@ -78,15 +80,28 @@ if not ok then
   builtin = nil
 end
 
-local installer = require("skill_install")
+local ADDONS_DIR = "pack/addons/start"
 
-local function resolve_installer_content()
+local function skills_dir()
   local config = maki.env.config_dir()
-  local dir = config and maki.fs.joinpath(config, "skills") or "~/.agents/skills"
-  return (installer.content:gsub(installer.skills_dir_placeholder, function()
-    return dir
-  end))
+  return config and maki.fs.joinpath(config, "skills") or "~/.agents/skills"
 end
+
+local function addons_dir()
+  local site = maki.env.site_dir()
+  return site and maki.fs.joinpath(site, ADDONS_DIR) or ("<maki data dir>/site/" .. ADDONS_DIR)
+end
+
+local installer = require("skill_install")
+local addon_dev = require("addon_dev")
+local subagents = require("subagents")
+
+-- Guides that name a folder resolve it when loaded, so the path is this machine's.
+local GUIDES = {
+  { option = "skill_install", module = installer, placeholder = installer.skills_dir_placeholder, dir = skills_dir },
+  { option = "addon_dev", module = addon_dev, placeholder = addon_dev.addons_dir_placeholder, dir = addons_dir },
+  { option = "subagents", module = subagents },
+}
 
 local function resolve_builtin_content()
   local state = maki.env.state_dir()
@@ -121,14 +136,22 @@ local function discover_skills()
     }
   end
 
-  if opts.skill_install then
-    skills[installer.name] = {
-      name = installer.name,
-      description = installer.description,
-      content = installer.content,
-      location = "builtin:" .. installer.name,
-      resolve = resolve_installer_content,
-    }
+  for _, guide in ipairs(GUIDES) do
+    if opts[guide.option] then
+      local module = guide.module
+      skills[module.name] = {
+        name = module.name,
+        description = module.description,
+        content = module.content,
+        location = "builtin:" .. module.name,
+        resolve = guide.dir and function()
+          local dir = guide.dir()
+          return (module.content:gsub(guide.placeholder, function()
+            return dir
+          end))
+        end or nil,
+      }
+    end
   end
 
   local config = maki.env.config_dir()

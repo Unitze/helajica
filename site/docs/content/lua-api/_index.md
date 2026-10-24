@@ -116,7 +116,7 @@ The rules:
 | [`maki.async.Permit`](#maki-async-Permit) | One slot in a semaphore, obtained from `Semaphore:acquire()`. |
 | [`maki.async.Task`](#maki-async-Task) | Handle returned by `maki.async.spawn`. |
 | [`maki.base64`](#maki-base64) | Base64 encoding and decoding, modelled after `vim.base64`. |
-| [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
+| [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, packages, legacy). |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
 | [`maki.gui`](#maki-gui) | Message bus between Lua plugins and the Helajica desktop app (`maki gui`). |
@@ -2169,7 +2169,7 @@ maki.base64.decode("aGVsbG8=") -- "hello"
 
 ## maki.env {#maki-env}
 
-Paths to maki's own directories (config, state, logs, legacy).
+Paths to maki's own directories (config, state, logs, packages, legacy).
 
 Use these to locate config files or persistent state without hard-coding paths.
 
@@ -2243,6 +2243,28 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 ```lua
 local dir = maki.env.logs_dir()
+```
+
+---
+
+### `maki.env.site_dir()` {#maki-env-site_dir}
+
+```lua
+maki.env.site_dir()
+```
+
+Return the directory installed packages live under, as
+`<site>/pack/<group>/start/<name>`. Typically something like
+`~/.local/share/maki/site`.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string?`) Package site directory path, or nil if it cannot be determined.
+
+**Example:**
+
+```lua
+local dir = maki.env.site_dir()
 ```
 
 ---

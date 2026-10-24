@@ -108,7 +108,31 @@ pub struct Transcript {
     pub working: bool,
     /// When the agent last started working, for the live status line.
     pub turn_started: Option<Instant>,
+    /// Time spent thinking since then, shown instead of the thinking itself.
+    pub thinking: ThinkingClock,
     pub totals: Totals,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ThinkingClock {
+    spent: Duration,
+    since: Option<Instant>,
+}
+
+impl ThinkingClock {
+    fn start(&mut self) {
+        self.since.get_or_insert_with(Instant::now);
+    }
+
+    fn stop(&mut self) {
+        if let Some(since) = self.since.take() {
+            self.spent += since.elapsed();
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.spent + self.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
 }
 
 /// What a fold changed, so the view remeasures only what moved.
@@ -229,6 +253,7 @@ impl Transcript {
     pub fn begin_turn(&mut self) {
         self.working = true;
         self.turn_started = Some(Instant::now());
+        self.thinking = ThinkingClock::default();
     }
 
     /// The list the agent's latest `todo_write` set since the user last spoke.
@@ -257,6 +282,10 @@ impl Transcript {
     pub fn apply(&mut self, envelope: &Envelope) -> Change {
         if envelope.subagent.is_some() {
             return Change::None;
+        }
+        match &envelope.event {
+            AgentEvent::ThinkingDelta { .. } => self.thinking.start(),
+            _ => self.thinking.stop(),
         }
         match &envelope.event {
             AgentEvent::TextDelta { text } => self.extend(text, false),
@@ -568,6 +597,15 @@ mod tests {
             Change::Updated(0)
         );
         assert!(matches!(&t.items[..], [Item::Assistant(s)] if s == "hello"));
+    }
+
+    #[test]
+    fn thinking_time_stops_once_the_reply_starts() {
+        let mut t = Transcript::default();
+        t.apply(&envelope(AgentEvent::ThinkingDelta { text: "hmm".into() }));
+        t.apply(&envelope(AgentEvent::TextDelta { text: "hi".into() }));
+        let frozen = t.thinking.elapsed();
+        assert_eq!(t.thinking.elapsed(), frozen);
     }
 
     #[test]

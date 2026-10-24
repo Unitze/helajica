@@ -27,7 +27,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Anchor, Animation, AnimationExt as _, App, AppContext as _, AsyncWindowContext, ClipboardEntry,
-    Context, Div, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, Image,
+    Context, Div, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, Image, ImageSource,
     InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, ListAlignment, ListOffset,
     ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, WeakEntity,
@@ -48,6 +48,7 @@ use crate::customize::{CustomizeView, PluginsChanged};
 use crate::engine::{Boot, BtwEvent, Command, Engine, Update, UsageReport};
 use crate::ext::{COMMAND_TOPIC_PREFIX, Effect, Extensions, NotifyLevel};
 use crate::goal::{self, Goal, Next};
+use crate::media::{self, Segment};
 use crate::model_picker::{ModelPicker, OnPick};
 use crate::new_project::{self, OnProject};
 use crate::nodes;
@@ -78,8 +79,8 @@ const THOUGHT_LABEL: &str = "Thought";
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const SPINNER_COLOR: u32 = 0xd97757;
-const THINKING_ACTIVITY: &str = "Thinking…";
 const WRITING_ACTIVITY: &str = "Writing…";
+const THINKING_CHIP: &str = "thinking";
 const WORKING_ACTIVITY: &str = "Working…";
 /// In `expanded`, this key marks the todo card as folded: it starts open.
 const TODOS_FOLDED_KEY: &str = "todos-folded";
@@ -112,6 +113,7 @@ const UNTITLED: &str = "Untitled session";
 const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline, / for commands";
 const THUMB_SIZE: f32 = 56.;
 const COMPOSER_THUMB_SIZE: f32 = 140.;
+const REPLY_IMAGE_HEIGHT: f32 = 420.;
 const PALETTE_HEIGHT: f32 = 360.;
 const FILE_CHIP_WIDTH: f32 = 220.;
 const MESSAGE_THUMB_SIZE: f32 = 200.;
@@ -187,7 +189,7 @@ pub struct WorkspaceView {
     expanded: HashSet<String>,
     sidebar_hidden: bool,
     /// The picture open over the window, after a thumbnail was clicked.
-    viewing: Option<Arc<Image>>,
+    viewing: Option<ImageSource>,
     list: ListState,
     scroller: Scroller,
     sidebar_scroller: Scroller,
@@ -236,9 +238,6 @@ impl WorkspaceView {
                 },
             );
         let store = ProjectStore::load(gui_dir.as_deref());
-        let thinking = Settings::load(gui_dir.as_deref())
-            .thinking
-            .and_then(|t| StoredThinking::parse_setting(&t).ok());
         let initial = project.or_else(|| store.last_opened().map(|p| p.path.clone()));
         let list = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW));
         let mut this = Self {
@@ -261,7 +260,7 @@ impl WorkspaceView {
             goal: None,
             page: None,
             model_picker: None,
-            thinking,
+            thinking: None,
             usage: None,
             reload_pending: false,
             mode: Mode::Ask,
@@ -598,6 +597,7 @@ impl WorkspaceView {
                 } else if this.mode == Mode::Bypass {
                     let _ = session.commands.send(Command::Yolo(true));
                 }
+                this.thinking = this.saved_thinking(&session.boot.model);
                 if let Some(thinking) = this.thinking {
                     let _ = session.commands.send(Command::Thinking(thinking));
                 }
@@ -659,11 +659,22 @@ impl WorkspaceView {
         cx.new(|cx| ModelPicker::new(models, current, on_pick, window, cx))
     }
 
+    fn saved_thinking(&self, model: &str) -> Option<StoredThinking> {
+        Settings::load(self.gui_dir.as_deref())
+            .thinking_for(model)
+            .and_then(|t| StoredThinking::parse_setting(t).ok())
+    }
+
     fn set_thinking(&mut self, thinking: StoredThinking) {
         self.thinking = Some(thinking);
         let dir = self.gui_dir.as_deref();
         let mut settings = Settings::load(dir);
         settings.thinking = Some(thinking.to_string());
+        if let Phase::Ready { boot, .. } = &self.phase {
+            settings
+                .model_thinking
+                .insert(boot.model.clone(), thinking.to_string());
+        }
         settings.save(dir);
         self.send(Command::Thinking(thinking));
     }
@@ -820,7 +831,8 @@ impl WorkspaceView {
             return;
         }
         let gui_dir = self.gui_dir.clone();
-        let view = cx.new(|cx| SettingsView::new(gui_dir, on_change, window, cx));
+        let engine = self.engine.clone();
+        let view = cx.new(|cx| SettingsView::new(engine.as_ref(), gui_dir, on_change, window, cx));
         self.page = Some(MainPage::Settings(view));
         cx.notify();
     }
@@ -1356,7 +1368,12 @@ impl WorkspaceView {
                     picker.update(cx, |picker, _| picker.set_current(&spec));
                 }
                 self.usage = None;
+                let thinking = self.saved_thinking(&spec);
                 self.send(Command::Model(spec));
+                if let Some(thinking) = thinking {
+                    self.thinking = Some(thinking);
+                    self.send(Command::Thinking(thinking));
+                }
                 self.send(Command::Usage);
             }
             PaletteAction::Thinking(thinking) => self.set_thinking(thinking),
@@ -1644,6 +1661,9 @@ impl WorkspaceView {
         let last = index + 1 == len;
         let fresh = index >= self.animate_from && index + 2 >= len;
         let run = step_run(&self.transcript.items, index);
+        if matches!(item, Item::Thinking(_)) && run.as_ref().is_none_or(|run| index > run.start) {
+            return div().into_any_element();
+        }
         let joined = run.as_ref().is_some_and(|run| index > run.start);
         let content = match run {
             Some(run) => self.render_step(index, run, cx),
@@ -1753,11 +1773,7 @@ impl WorkspaceView {
                     )
                 })
                 .into_any_element(),
-            Item::Assistant(text) => {
-                TextView::markdown(SharedString::from(format!("item-{index}")), text.clone())
-                    .text_sm()
-                    .into_any_element()
-            }
+            Item::Assistant(text) => self.render_reply(index, text, cx).into_any_element(),
             Item::Thinking(text) => {
                 let key = format!("thinking-{index}");
                 let open = self.expanded.contains(&key);
@@ -1817,7 +1833,8 @@ impl WorkspaceView {
         let key = format!("steps-{}", run.start);
         let open = self.expanded.contains(&key) != running;
         let first = index == run.start;
-        let row = open.then(|| self.render_step_row(index, &run, cx));
+        let shown = !matches!(self.transcript.items[index], Item::Thinking(_));
+        let row = (open && shown).then(|| self.render_step_row(index, &run, cx));
         if !first {
             return row.map_or_else(|| div().into_any_element(), IntoElement::into_any_element);
         }
@@ -2229,15 +2246,63 @@ impl WorkspaceView {
         });
         match (running, turn.next()) {
             (Some(call), _) => step_label(call),
-            (None, Some(Item::Thinking(_))) => THINKING_ACTIVITY.into(),
             (None, Some(Item::Assistant(_))) => WRITING_ACTIVITY.into(),
             _ => WORKING_ACTIVITY.into(),
         }
     }
 
+    /// A reply's markdown, with the pictures and videos it embeds drawn in
+    /// place of their `![…](path)`.
+    fn render_reply(&self, index: usize, text: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let project = self.project.as_deref();
+        v_flex()
+            .gap_3()
+            .children(
+                media::split(text)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(part, segment)| {
+                        let id = SharedString::from(format!("item-{index}-{part}"));
+                        match segment {
+                            Segment::Text(text) => TextView::markdown(id, text.to_owned())
+                                .text_sm()
+                                .into_any_element(),
+                            Segment::Image(path) => {
+                                let source = ImageSource::from(media::resolve(&path, project));
+                                let full = source.clone();
+                                div()
+                                    .id(id)
+                                    .max_w_full()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.viewing = Some(full.clone());
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        img(source)
+                                            .max_w_full()
+                                            .max_h(px(REPLY_IMAGE_HEIGHT))
+                                            .object_fit(ObjectFit::Contain)
+                                            .rounded(cx.theme().radius_lg)
+                                            .border_1()
+                                            .border_color(cx.theme().border),
+                                    )
+                                    .into_any_element()
+                            }
+                            Segment::Video(path) => {
+                                render_video(id, media::resolve(&path, project), cx)
+                                    .into_any_element()
+                            }
+                        }
+                    }),
+            )
+    }
+
     fn render_activity(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = SharedString::from(self.activity());
         let started = self.transcript.turn_started;
+        let thinking = self.transcript.thinking.clone();
+        let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
         let cycle = SPINNER_INTERVAL * SPINNER_FRAMES.len() as u32;
         h_flex()
@@ -2259,6 +2324,21 @@ impl WorkspaceView {
                     )
                     .child(div().min_w_0().truncate().child(label.clone()))
                     .children(elapsed.map(|elapsed| div().flex_none().child(elapsed)))
+                    .when(!thinking.elapsed().is_zero(), |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(border)
+                                .text_xs()
+                                .child(format!(
+                                    "{THINKING_CHIP} {}",
+                                    short_duration(thinking.elapsed())
+                                )),
+                        )
+                    })
                 },
             )
     }
@@ -3083,14 +3163,63 @@ fn thumbnail(image: &Arc<Image>, size: f32, cx: &Context<WorkspaceView>) -> impl
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
-            this.viewing = Some(full.clone());
+            this.viewing = Some(full.clone().into());
             cx.notify();
         }))
         .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
 }
 
+/// A video the reply made: GPUI cannot play one, so the system player does.
+fn render_video(id: SharedString, path: PathBuf, cx: &Context<WorkspaceView>) -> impl IntoElement {
+    let play = path.clone();
+    let reveal = path.clone();
+    h_flex()
+        .id(id)
+        .gap_3()
+        .px_4()
+        .py_3()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().secondary)
+        .cursor_pointer()
+        .on_click(move |_, _, cx| cx.open_with_system(&play))
+        .child(Icon::new(Lucide::Film).text_color(cx.theme().muted_foreground))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .truncate()
+                        .child(name_of(&path)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(path.display().to_string()),
+                ),
+        )
+        .child(
+            Button::new("reveal-video")
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(Lucide::FolderOpen))
+                .tooltip("Show in folder")
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.reveal_path(&reveal)
+                }),
+        )
+        .child(Icon::new(Lucide::Play).small())
+}
+
 /// The picture alone on a dimmed window; a click anywhere or Escape closes it.
-fn render_viewer(image: Arc<Image>, cx: &mut Context<WorkspaceView>) -> impl IntoElement {
+fn render_viewer(image: ImageSource, cx: &mut Context<WorkspaceView>) -> impl IntoElement {
     div()
         .id("image-viewer")
         .absolute()

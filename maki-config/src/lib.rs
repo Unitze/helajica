@@ -590,18 +590,22 @@ impl RawConfig {
         })
     }
 
-    /// Plugins switched on or off outside any config file, such as in the
-    /// desktop app, win over it. A name no plugin answers to is dropped rather
-    /// than failing validation: it is not a typo in a file the user can fix,
-    /// just a package removed since it was switched.
-    pub fn switch_plugins(&mut self, switches: &BTreeMap<String, bool>, packages: &[String]) {
-        for (name, &enabled) in switches {
-            if DEFAULT_BUILTINS.contains(&name.as_str())
+    /// Plugin settings made outside any config file, such as in the desktop
+    /// app, win over it. A name no plugin answers to is dropped rather than
+    /// failing validation: it is not a typo in a file the user can fix, just a
+    /// package removed since it was switched.
+    pub fn overlay_plugins(&mut self, overlay: &PluginOverlay, packages: &[String]) {
+        let known = |name: &String| {
+            DEFAULT_BUILTINS.contains(&name.as_str())
                 || OPTIONAL_BUILTINS.contains(&name.as_str())
                 || packages.contains(name)
-            {
-                self.plugins.entry(name.clone()).or_default().enabled = Some(enabled);
-            }
+        };
+        for (name, &enabled) in overlay.switches.iter().filter(|(name, _)| known(name)) {
+            self.plugins.entry(name.clone()).or_default().enabled = Some(enabled);
+        }
+        for (name, opts) in overlay.options.iter().filter(|(name, _)| known(name)) {
+            let entry = self.plugins.entry(name.clone()).or_default();
+            entry.opts.extend(opts.clone());
         }
     }
 
@@ -630,6 +634,14 @@ impl RawConfig {
         }
         Ok(())
     }
+}
+
+/// Plugins switched on or off, and options set, by something other than a
+/// config file, such as the desktop app. See [`RawConfig::overlay_plugins`].
+#[derive(Debug, Default)]
+pub struct PluginOverlay {
+    pub switches: BTreeMap<String, bool>,
+    pub options: BTreeMap<String, JsonMap<String, JsonValue>>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -2848,6 +2860,9 @@ mod tests {
     }
 
     const REMOVED_PACKAGE: &str = "gone_package";
+    const TASK_PLUGIN: &str = "task";
+    const MAX_CONCURRENT: &str = "max_concurrent";
+    const ALLOW_BACKGROUND: &str = "allow_background";
 
     #[test_case("websearch", false, &[], Some(false) ; "builtin_switched_off")]
     #[test_case("completion", true, &[], Some(true) ; "optional_switched_on")]
@@ -2862,8 +2877,37 @@ mod tests {
         let mut raw = RawConfig::default();
         raw.plugins.insert(name.into(), plugin_enabled(!enabled));
         let packages: Vec<String> = packages.iter().map(|p| (*p).to_owned()).collect();
-        raw.switch_plugins(&BTreeMap::from([(name.to_owned(), enabled)]), &packages);
+        let overlay = PluginOverlay {
+            switches: BTreeMap::from([(name.to_owned(), enabled)]),
+            ..PluginOverlay::default()
+        };
+        raw.overlay_plugins(&overlay, &packages);
         assert_eq!(raw.plugins[name].enabled, expected);
+    }
+
+    #[test]
+    fn overlay_options_join_the_config_ones() {
+        let mut raw = RawConfig::default();
+        raw.plugins.insert(
+            TASK_PLUGIN.into(),
+            PluginFileConfig {
+                opts: JsonMap::from_iter([(MAX_CONCURRENT.into(), JsonValue::from(2))]),
+                ..PluginFileConfig::default()
+            },
+        );
+        let overlay = PluginOverlay {
+            options: BTreeMap::from([(
+                TASK_PLUGIN.to_owned(),
+                JsonMap::from_iter([(ALLOW_BACKGROUND.into(), JsonValue::Bool(true))]),
+            )]),
+            ..PluginOverlay::default()
+        };
+        raw.overlay_plugins(&overlay, &[]);
+        let opts = &raw.plugins[TASK_PLUGIN].opts;
+        assert_eq!(
+            (opts[MAX_CONCURRENT].clone(), opts[ALLOW_BACKGROUND].clone()),
+            (JsonValue::from(2), JsonValue::Bool(true))
+        );
     }
 
     fn plugin_enabled(enabled: bool) -> PluginFileConfig {

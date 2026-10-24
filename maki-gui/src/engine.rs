@@ -2,7 +2,7 @@
 //! [`Engine`] with the same stack the TUI builds, so a session opened here is
 //! the same agent, tools, plugins and prompt cache as `maki` in a terminal.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
 use flume::{Receiver, Sender};
@@ -29,6 +29,9 @@ pub trait Engine: Send + Sync + 'static {
 
     /// Every plugin a session could load: bundled ones and installed packages.
     fn plugins(&self) -> Vec<PluginInfo>;
+
+    /// Where the user's own add-ons go: a package group loaded at startup.
+    fn addons_dir(&self) -> Option<PathBuf>;
 }
 
 pub struct PluginInfo {

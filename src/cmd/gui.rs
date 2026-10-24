@@ -2,7 +2,7 @@
 //! lives in `maki-gui`; this file is its [`Engine`]: per project, the same
 //! stack `cmd::tui` builds, and a session driven in-process.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,8 +25,8 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode};
 use maki_config::{
-    DEFAULT_BUILTINS, ModelPolicy, OPTIONAL_BUILTINS, PROVIDER_BUILTINS, SessionDefaults,
-    load_env_files,
+    DEFAULT_BUILTINS, ModelPolicy, OPTIONAL_BUILTINS, PROVIDER_BUILTINS, PluginOverlay,
+    SessionDefaults, load_env_files,
 };
 use maki_gui::{
     Boot, BtwEvent, Command, Engine, PluginInfo, PluginKind, Session, SlashCommand, Update,
@@ -53,6 +53,9 @@ const BIN_NAME: &str = "maki";
 const GUI_DIR: &str = "gui";
 const PLAN_FILE: &str = "plan.md";
 const COMMAND_PREFIX: char = '/';
+/// A package group of its own, so the user's add-ons sit apart from anything
+/// else installed by hand. Mirrors `ADDONS_DIR` in the skill plugin.
+const ADDONS_DIR: &str = "pack/addons/start";
 const NO_ANSWER: &str = "The user dismissed the question without answering.";
 
 static LOGGING: Once = Once::new();
@@ -153,7 +156,7 @@ impl Engine for MakiEngine {
         let flags = self.flags.clone();
         let storage = self.storage.clone();
         let project = project.to_path_buf();
-        let plugin_switches = maki_gui::plugin_switches(self.gui_dir.as_deref());
+        let plugin_overlay = maki_gui::plugin_overlay(self.gui_dir.as_deref());
         let lua_route = Arc::clone(&self.lua_route);
         let thread = thread::Builder::new()
             .name("maki-session".into())
@@ -164,7 +167,7 @@ impl Engine for MakiEngine {
                     &storage,
                     &project,
                     resume,
-                    &plugin_switches,
+                    &plugin_overlay,
                     &lua_route,
                     ready_tx,
                 ) {
@@ -236,6 +239,10 @@ impl Engine for MakiEngine {
             });
         bundled.chain(optional).chain(packages).collect()
     }
+
+    fn addons_dir(&self) -> Option<PathBuf> {
+        maki_lua::site_dir().ok().map(|site| site.join(ADDONS_DIR))
+    }
 }
 
 /// Builds the project's stack, hands the session back through `ready`, then
@@ -245,7 +252,7 @@ fn run_project(
     storage: &StateDir,
     project: &Path,
     resume: Option<String>,
-    plugin_switches: &BTreeMap<String, bool>,
+    plugin_overlay: &PluginOverlay,
     lua_route: &Mutex<Option<Sender<Update>>>,
     ready: Sender<Result<Session>>,
 ) -> Result<()> {
@@ -266,7 +273,7 @@ fn run_project(
         cwd: &cwd,
         storage,
         interaction: Interaction::None,
-        plugin_switches,
+        plugin_overlay,
     };
     let (stack, mut warnings) = build_stack(&launch, &trust, None)?;
     warnings.extend(trust.state.restricted_warning());

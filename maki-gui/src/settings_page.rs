@@ -2,6 +2,7 @@
 //! user connected, and add-ons. Changes that affect sessions are reported
 //! through `on_change`, so the open session can pick them up.
 
+use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -27,6 +28,7 @@ use crate::app::set_dark;
 use crate::custom_providers::{
     self, Connected, Draft, PROTOCOLS, ProviderModel, parse_tokens, protocol_label,
 };
+use crate::engine::{Engine, PluginKind};
 use crate::scroller::{Scroller, SmoothScroll as _};
 use crate::settings::Settings;
 use crate::titlebar::APP_NAME;
@@ -37,6 +39,10 @@ const MENU_WIDTH: f32 = 220.;
 const MODEL_LIST_HEIGHT: f32 = 280.;
 const CONTEXT_INPUT_WIDTH: f32 = 110.;
 const CONTEXT_PLACEHOLDER: &str = "Context";
+const USER_ADDONS_HINT: &str = "Lua add-ons that add tools, rewrite the system prompt or wrap the \
+                                agent's tools. Ask the agent to write one, like \
+                                \"make an add-on that …\".";
+const NO_USER_ADDONS: &str = "None yet.";
 
 pub type OnChange = Rc<dyn Fn(&mut App)>;
 
@@ -185,6 +191,9 @@ pub struct SettingsView {
     form: ProviderForm,
     error: Option<SharedString>,
     signing_in: bool,
+    /// Installed packages, the user's add-ons among them.
+    packages: Vec<String>,
+    addons_dir: Option<PathBuf>,
     page_scroller: Scroller,
     models_scroller: Scroller,
     _subscription: Subscription,
@@ -192,6 +201,7 @@ pub struct SettingsView {
 
 impl SettingsView {
     pub fn new(
+        engine: &dyn Engine,
         gui_dir: Option<PathBuf>,
         on_change: OnChange,
         window: &mut Window,
@@ -218,6 +228,13 @@ impl SettingsView {
             form,
             error: None,
             signing_in: false,
+            packages: engine
+                .plugins()
+                .into_iter()
+                .filter(|plugin| plugin.kind == PluginKind::Package)
+                .map(|plugin| plugin.name)
+                .collect(),
+            addons_dir: engine.addons_dir(),
             page_scroller: Scroller::area(),
             models_scroller: Scroller::area(),
             _subscription: subscription,
@@ -430,6 +447,73 @@ impl SettingsView {
                 cx.notify();
             }
         }
+    }
+
+    fn switch_package(&mut self, name: &str, enabled: bool, cx: &mut Context<Self>) {
+        Settings::switch_plugin(
+            self.gui_dir.as_deref(),
+            name,
+            PluginKind::Package.on_by_default(),
+            enabled,
+        );
+        self.changed(cx);
+    }
+
+    fn open_addons_dir(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.addons_dir.clone() else {
+            return;
+        };
+        match fs::create_dir_all(&dir) {
+            Ok(()) => cx.open_with_system(&dir),
+            Err(e) => {
+                self.error = Some(format!("Could not create {}: {e}", dir.display()).into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn render_user_addons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let switches = self.settings().plugins;
+        let rows = self.packages.iter().map(|name| {
+            let package = name.clone();
+            v_flex().child(divider(cx)).child(
+                h_flex()
+                    .px_4()
+                    .py_2p5()
+                    .gap_4()
+                    .child(div().flex_1().min_w_0().text_sm().child(name.clone()))
+                    .child(
+                        Switch::new(SharedString::from(format!("package-{name}")))
+                            .checked(switches.get(name).copied().unwrap_or(true))
+                            .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                                this.switch_package(&package, *checked, cx)
+                            })),
+                    ),
+            )
+        });
+        card(cx)
+            .child(row(
+                "Your add-ons",
+                USER_ADDONS_HINT,
+                Button::new("open-addons")
+                    .outline()
+                    .small()
+                    .icon(Icon::new(Lucide::FolderOpen))
+                    .label("Open folder")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_addons_dir(cx))),
+                cx,
+            ))
+            .children(rows)
+            .when(self.packages.is_empty(), |this| {
+                this.child(divider(cx)).child(
+                    div()
+                        .px_4()
+                        .py_2p5()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(NO_USER_ADDONS),
+                )
+            })
     }
 
     fn set_addon(&mut self, addon: Addon, enabled: bool, cx: &mut Context<Self>) {
@@ -734,6 +818,7 @@ impl SettingsView {
                             .child(self.render_chatgpt_account(cx))
                     })
             }))
+            .child(self.render_user_addons(cx))
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().text_sm().text_color(cx.theme().danger).child(error))
             })

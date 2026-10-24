@@ -14,6 +14,7 @@ mod customize;
 pub mod engine;
 mod ext;
 mod goal;
+mod media;
 mod model_picker;
 mod new_project;
 mod nodes;
@@ -26,12 +27,12 @@ mod transcript;
 mod update;
 mod workspace;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
+use maki_config::PluginOverlay;
 
 pub use engine::{
     Boot, BtwEvent, Command, Engine, PluginInfo, PluginKind, Session, SlashCommand, Update,
@@ -69,8 +70,19 @@ pub fn run(engine: Arc<dyn Engine>, gui_dir: Option<PathBuf>, project: Option<Pa
         });
 }
 
-/// The plugins the user switched on or off in the window, which a session
-/// opened from it applies over the config.
-pub fn plugin_switches(gui_dir: Option<&Path>) -> BTreeMap<String, bool> {
-    settings::Settings::load(gui_dir).plugins
+/// What the window changed about plugins, which a session opened from it
+/// applies over the config: the switches in Customize and Settings, and the
+/// options the add-ons switched on set.
+pub fn plugin_overlay(gui_dir: Option<&Path>) -> PluginOverlay {
+    let settings = settings::Settings::load(gui_dir);
+    let storage = maki_storage::StateDir::resolve().ok();
+    let options = addons::Addon::ALL
+        .into_iter()
+        .filter(|addon| addon.enabled(&settings, storage.as_ref()))
+        .filter_map(addons::Addon::plugin_options)
+        .collect();
+    PluginOverlay {
+        switches: settings.plugins,
+        options,
+    }
 }

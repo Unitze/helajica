@@ -52,6 +52,7 @@ declare maki: {
     state_dir: @checked () -> (string?),
     config_dir: @checked () -> (string?),
     logs_dir: @checked () -> (string?),
+    site_dir: @checked () -> (string?),
     legacy_dir: @checked () -> (string?),
   },
   fn: {

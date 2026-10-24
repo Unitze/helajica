@@ -3,6 +3,7 @@
 
 use maki_providers::openai_auth;
 use maki_storage::StateDir;
+use serde_json::{Map, Value};
 
 use crate::settings::Settings;
 
@@ -10,20 +11,27 @@ use crate::settings::Settings;
 pub enum Addon {
     /// Sign in to OpenAI with a ChatGPT plan instead of an API key.
     ChatGptSignIn,
+    /// Subagents that run while the agent keeps working and report back.
+    BackgroundSubagents,
 }
 
+const TASK_PLUGIN: &str = "task";
+const ALLOW_BACKGROUND: &str = "allow_background";
+
 impl Addon {
-    pub const ALL: [Self; 1] = [Self::ChatGptSignIn];
+    pub const ALL: [Self; 2] = [Self::ChatGptSignIn, Self::BackgroundSubagents];
 
     pub fn id(self) -> &'static str {
         match self {
             Self::ChatGptSignIn => "openai-oauth",
+            Self::BackgroundSubagents => "background-subagents",
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Self::ChatGptSignIn => "ChatGPT sign-in for OpenAI",
+            Self::BackgroundSubagents => "Background subagents",
         }
     }
 
@@ -32,6 +40,10 @@ impl Addon {
             Self::ChatGptSignIn => {
                 "Use your ChatGPT plan for OpenAI models instead of an API key. \
                  Signing in opens your browser."
+            }
+            Self::BackgroundSubagents => {
+                "Let the agent hand work to subagents that run while it keeps going, \
+                 and pick up their results when they finish. Applies to the next session."
             }
         }
     }
@@ -45,12 +57,25 @@ impl Addon {
             .copied()
             .unwrap_or_else(|| match self {
                 Self::ChatGptSignIn => storage.is_some_and(openai_auth::signed_in),
+                Self::BackgroundSubagents => false,
             })
     }
 
     pub fn apply(self, enabled: bool) {
         match self {
             Self::ChatGptSignIn => openai_auth::set_oauth_enabled(enabled),
+            Self::BackgroundSubagents => {}
+        }
+    }
+
+    /// The plugin options this add-on sets while on, laid over the config.
+    pub fn plugin_options(self) -> Option<(String, Map<String, Value>)> {
+        match self {
+            Self::ChatGptSignIn => None,
+            Self::BackgroundSubagents => Some((
+                TASK_PLUGIN.to_owned(),
+                Map::from_iter([(ALLOW_BACKGROUND.to_owned(), Value::Bool(true))]),
+            )),
         }
     }
 }

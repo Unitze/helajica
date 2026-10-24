@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
@@ -12,7 +11,7 @@ use color_eyre::eyre::Context;
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
-use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
+use maki_config::{Config, PluginOverlay, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
@@ -86,7 +85,7 @@ fn load_config(
     init_files: InitFiles,
     project_config: &ProjectConfig,
     names: &super::KnownNames<'_>,
-    plugin_switches: &BTreeMap<String, bool>,
+    plugin_overlay: &PluginOverlay,
     warnings: &mut Vec<String>,
 ) -> Result<Config> {
     let raw_config = plugin_host
@@ -95,7 +94,7 @@ fn load_config(
 
     let names = names(plugin_host)?;
     let mut raw_config = raw_config.unwrap_or_default();
-    raw_config.switch_plugins(plugin_switches, &names);
+    raw_config.overlay_plugins(plugin_overlay, &names);
     let mut config = raw_config.into_config(&names).context("invalid config")?;
     config.permissions = load_permissions(project_config);
 
@@ -140,8 +139,8 @@ pub(super) struct Launch<'a> {
     pub(super) cwd: &'a Path,
     pub(super) storage: &'a StateDir,
     pub(super) interaction: Interaction,
-    /// Plugins the desktop app switched on or off, over the config.
-    pub(super) plugin_switches: &'a BTreeMap<String, bool>,
+    /// Plugin settings the desktop app made, over the config.
+    pub(super) plugin_overlay: &'a PluginOverlay,
 }
 
 /// The one construction path for a generation: first startup passes
@@ -178,7 +177,7 @@ pub(super) fn build_stack(
                 InitFiles::resolve(&trust.project_config, cli.no_plugins),
                 &trust.project_config,
                 names,
-                launch.plugin_switches,
+                launch.plugin_overlay,
                 warnings,
             );
             config_or_fallback(loaded, fallback_config, warnings)
@@ -321,7 +320,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         cwd: &cwd,
         storage: &storage,
         interaction,
-        plugin_switches: &BTreeMap::new(),
+        plugin_overlay: &PluginOverlay::default(),
     };
     let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None)?;
 
@@ -460,7 +459,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         cwd: &cwd,
         storage: &storage,
         interaction,
-        plugin_switches: &BTreeMap::new(),
+        plugin_overlay: &PluginOverlay::default(),
     };
 
     loop {
@@ -710,7 +709,7 @@ mod tests {
             InitFiles::Disabled,
             &ProjectConfig::for_project(dir.path()),
             &no_names,
-            &BTreeMap::new(),
+            &PluginOverlay::default(),
             &mut Vec::new(),
         )
         .expect("no-plugins must skip the broken init.lua and still load defaults");
@@ -752,7 +751,7 @@ mod tests {
             InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
             &ProjectConfig::for_project(dir.path()),
             &no_names,
-            &BTreeMap::new(),
+            &PluginOverlay::default(),
             &mut Vec::new(),
         ) {
             Err(_) => {}

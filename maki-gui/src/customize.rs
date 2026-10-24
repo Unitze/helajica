@@ -113,15 +113,13 @@ impl CustomizeView {
             .unwrap_or_else(|| plugin.kind.on_by_default())
     }
 
-    /// A switch back to the default is forgotten, so the config decides again.
     fn switch(&mut self, name: String, kind: PluginKind, enabled: bool, cx: &mut Context<Self>) {
-        let mut settings = Settings::load(self.gui_dir.as_deref());
-        match enabled == kind.on_by_default() {
-            true => settings.plugins.remove(&name),
-            false => settings.plugins.insert(name, enabled),
-        };
-        settings.save(self.gui_dir.as_deref());
-        self.switches = settings.plugins;
+        self.switches = Settings::switch_plugin(
+            self.gui_dir.as_deref(),
+            &name,
+            kind.on_by_default(),
+            enabled,
+        );
         cx.emit(PluginsChanged);
         cx.notify();
     }

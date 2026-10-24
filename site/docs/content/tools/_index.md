@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (20 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 22 built-in tools in this reference (21 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -18,6 +18,7 @@ Commands run in the session's working directory (see Environment) by default.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
+| `background` | boolean | no |  | Run without waiting, for servers, watchers and long builds or tests. Returns a job id at once; its exit code and last output arrive later in a notice. |
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | Short description (3-5 words) of what the command does |
 | `tail` | integer | no |  | Return only the last N lines |
@@ -225,3 +226,13 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
+
+## Additional tools
+
+### `bash_stop` {#bash_stop}
+
+Stop a shell started with bash `background` before it exits, and return its last output.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job` | integer | yes | The job id bash returned |

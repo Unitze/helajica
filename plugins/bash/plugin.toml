@@ -1,3 +1,5 @@
 [permissions]
 fs_read = true
 run = true
+# Waking the chat when a background shell exits.
+agent = true

@@ -16,6 +16,9 @@ local MAX_EDGE = 1568
 -- host-side pixel cap against decode bombs.
 local MAX_INPUT_BYTES = 50 * 1024 * 1024
 
+local SHOW_MEDIA_HINT = [[
+- The desktop app draws media embedded in your reply: to show the user an image or a video, make the file (save the plot, render the clip with ffmpeg, ...) and put `![caption](absolute/path/to/file)` on its own line. Images show in place; videos open in the system player.]]
+
 local MEDIA_TYPES = {
   png = "image/png",
   jpeg = "image/jpeg",
@@ -156,3 +159,7 @@ maki.api.register_tool({
     return load_image(path)
   end,
 })
+
+if maki.gui.active() then
+  maki.api.register_prompt_hint({ slot = "tool_usage", content = SHOW_MEDIA_HINT })
+end

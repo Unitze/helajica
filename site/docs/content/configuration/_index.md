@@ -250,6 +250,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `allow_background` | boolean | `true` | - | Expose a `background` input that runs the command without waiting and reports to the chat when it exits, and the `bash_stop` tool. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
@@ -311,8 +312,10 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `addon_dev` | boolean | `true` | - | Offer the builtin helajica-addon skill for writing add-ons. |
 | `plugin_dev` | boolean | `true` | - | Offer the builtin maki-plugin-dev skill for writing maki plugins. |
 | `skill_install` | boolean | `true` | - | Offer the builtin maki-skill-install skill for finding or writing skills. |
+| `subagents` | boolean | `true` | - | Offer the builtin maki-subagents skill for delegating work to subagents. |
 
 ### `plugins.task`
 
