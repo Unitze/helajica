@@ -1,0 +1,45 @@
+<!--
+  The MSI for Helajica. Installs per user, under %LOCALAPPDATA%\Programs, so
+  the in-app updater can swap helajica.exe without asking for admin rights.
+  Build: wix build -arch x64 -d Version=X.Y.Z -d Exe=<helajica.exe> -d Icon=<helajica.ico> helajica.wxs
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Helajica" Manufacturer="Unitze" Version="$(Version)"
+           UpgradeCode="6F1C2B7E-4A0D-4C55-9E3B-2B7D9A61C4F3" Scope="perUser">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Helajica is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="HelajicaIcon" SourceFile="$(Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="HelajicaIcon" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Helajica">
+          <Component Id="App" Guid="2E8C4F61-0B7A-4D93-8A1E-5F6C3B9D2E47">
+            <File Id="HelajicaExe" Source="$(Exe)" Name="helajica.exe" />
+            <RegistryValue Root="HKCU" Key="Software\Unitze\Helajica" Name="App"
+                           Type="integer" Value="1" KeyPath="yes" />
+            <!-- What the updater leaves next to the exe while swapping it. -->
+            <RemoveFile Id="UpdaterLeftovers" Name="helajica.exe.*" On="uninstall" />
+            <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+            <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="7A3D9E25-6C14-4B8F-9D07-1E4B8C6F3A52">
+        <Shortcut Id="StartMenu" Name="Helajica" Target="[INSTALLFOLDER]helajica.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="HelajicaIcon" />
+        <RegistryValue Root="HKCU" Key="Software\Unitze\Helajica" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentRef Id="App" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

@@ -114,6 +114,28 @@ jobs:
           cp "target/release/helajica${{ matrix.exe }}" "$asset"
           gh release upload "${{ needs.prepare.outputs.tag }}" "$asset" --clobber
 
+      # The bare exe above is what installed apps update from; these are for
+      # first installs. Both install per user, so updates need no admin.
+      - name: Build and upload installers
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          $exe = "$PWD\target\release\helajica.exe"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          dotnet tool install --global wix --version 5.0.2
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" build -arch x64 `
+            -d Version=$($version.Split('-')[0]) -d Exe=$exe -d Icon=assets\helajica.ico `
+            -o dist\helajica-windows-x86_64.msi packaging\windows\helajica.wxs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          & $iscc /DAppVersion=$version /DExe=$exe /DOutDir="$PWD\dist" packaging\windows\helajica.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release upload $env:TAG dist\helajica-windows-x86_64.msi dist\helajica-windows-x86_64-setup.exe --clobber
+
   publish:
     name: Publish
     needs: [prepare, build]

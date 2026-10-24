@@ -27,9 +27,11 @@ efficiency and plugins as `maki` in a terminal.
 
 ## Install
 
-Download the binary for your platform from
-[Releases](https://github.com/Unitze/helajica/releases/latest) and run it.
-From source:
+Download from [Releases](https://github.com/Unitze/helajica/releases/latest).
+On Windows, run `helajica-windows-x86_64-setup.exe` or install
+`helajica-windows-x86_64.msi`: both install for your user only, with a Start
+menu entry, and need no admin rights. On other platforms, run the binary for
+your platform. From source:
 
 ```sh
 cargo build --release --bin helajica
