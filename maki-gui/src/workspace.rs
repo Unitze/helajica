@@ -50,6 +50,7 @@ use crate::model_picker::{ModelPicker, OnPick};
 use crate::new_project::{self, OnProject};
 use crate::nodes;
 use crate::projects::ProjectStore;
+use crate::scroller::Scroller;
 use crate::settings::Settings;
 use crate::settings_window;
 use crate::titlebar::{Handler, title_bar};
@@ -93,6 +94,7 @@ const MENU_HEIGHT: f32 = 360.;
 const UNTITLED: &str = "Untitled session";
 const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline, / for commands";
 const THUMB_SIZE: f32 = 56.;
+const FILE_CHIP_WIDTH: f32 = 220.;
 const MESSAGE_THUMB_SIZE: f32 = 120.;
 const SUGGESTION_KEYS: [&str; 5] = ["up", "down", "tab", "enter", "escape"];
 const PASTE_KEY: &str = "v";
@@ -137,6 +139,8 @@ pub struct WorkspaceView {
     ext: Extensions,
     composer: Entity<TextareaState>,
     attachments: Vec<Attachment>,
+    /// Files that are not images: the agent gets their paths to read.
+    files: Vec<PathBuf>,
     /// Images of the user messages in the transcript, by item index.
     thumbs: HashMap<usize, Vec<Arc<Image>>>,
     /// The highlighted suggestion while a `/command` is being typed.
@@ -156,6 +160,7 @@ pub struct WorkspaceView {
     update: UpdateState,
     expanded: HashSet<String>,
     list: ListState,
+    scroller: Scroller,
     /// Items from here on arrived live and fade in; the loaded history does not.
     animate_from: usize,
     focus: FocusHandle,
@@ -209,6 +214,7 @@ impl WorkspaceView {
                 .map(|p| p.path.clone())
                 .find(|p| p.is_dir())
         });
+        let list = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW));
         let mut this = Self {
             engine,
             gui_dir,
@@ -221,6 +227,7 @@ impl WorkspaceView {
             ext: Extensions::default(),
             composer,
             attachments: Vec::new(),
+            files: Vec::new(),
             thumbs: HashMap::new(),
             suggestion: 0,
             suggestions_dismissed: false,
@@ -234,7 +241,8 @@ impl WorkspaceView {
             mode: Mode::Ask,
             update: UpdateState::Idle,
             expanded: HashSet::new(),
-            list: ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW)),
+            scroller: Scroller::new(list.clone()),
+            list,
             animate_from: 0,
             focus: cx.focus_handle(),
             _session: None,
@@ -755,7 +763,13 @@ impl WorkspaceView {
     }
 
     fn attach_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
-        for path in paths.iter().filter(|p| attachments::is_image(p)) {
+        for path in paths {
+            if !attachments::is_image(path) {
+                if !self.files.contains(path) {
+                    self.files.push(path.clone());
+                }
+                continue;
+            }
             match Attachment::from_path(path) {
                 Ok(attachment) => self.attach(attachment, cx),
                 Err(e) => window.push_notification(
@@ -766,9 +780,10 @@ impl WorkspaceView {
                 ),
             }
         }
+        cx.notify();
     }
 
-    fn pick_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn pick_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -799,12 +814,11 @@ impl WorkspaceView {
                         pasted = true;
                     }
                 }
-                ClipboardEntry::ExternalPaths(paths) => {
-                    if paths.paths().iter().any(|p| attachments::is_image(p)) {
-                        self.attach_paths(paths.paths(), window, cx);
-                        pasted = true;
-                    }
+                ClipboardEntry::ExternalPaths(paths) if !paths.paths().is_empty() => {
+                    self.attach_paths(paths.paths(), window, cx);
+                    pasted = true;
                 }
+                ClipboardEntry::ExternalPaths(_) => {}
                 ClipboardEntry::String(_) => {}
             }
         }
@@ -931,6 +945,7 @@ impl WorkspaceView {
 
     fn scroll_to_end(&self) {
         self.sync_list();
+        self.scroller.stop();
         self.list.set_follow_mode(FollowMode::Tail);
     }
 
@@ -960,7 +975,8 @@ impl WorkspaceView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
-        if (text.is_empty() && self.attachments.is_empty()) || self.commands().is_none() {
+        let nothing = text.is_empty() && self.attachments.is_empty() && self.files.is_empty();
+        if nothing || self.commands().is_none() {
             return;
         }
         self.composer
@@ -969,6 +985,7 @@ impl WorkspaceView {
             let args = args.to_owned();
             return self.run_builtin(command, &args, &text, window, cx);
         }
+        let text = attachments::with_files(&text, &std::mem::take(&mut self.files));
         self.prompt(text.clone(), text, cx);
     }
 
@@ -1207,7 +1224,7 @@ impl WorkspaceView {
             PaletteEntry::new("Open folder…", PaletteAction::OpenFolder),
             PaletteEntry::new("New project…", PaletteAction::NewProject),
             PaletteEntry::new("Settings", PaletteAction::Settings),
-            PaletteEntry::new("Attach images…", PaletteAction::AttachImages),
+            PaletteEntry::new("Attach files…", PaletteAction::AttachFiles),
             PaletteEntry::new("Toggle dark mode", PaletteAction::ToggleDark),
             PaletteEntry::new("Mode: Ask before edits", PaletteAction::Mode(Mode::Ask)),
             PaletteEntry::new("Mode: Plan", PaletteAction::Mode(Mode::Plan)),
@@ -1256,7 +1273,7 @@ impl WorkspaceView {
             PaletteAction::Project(path) => self.open_project(path, None, window, cx),
             PaletteAction::Palette => self.open_palette(&OpenPalette, window, cx),
             PaletteAction::Settings => self.open_settings(window, cx),
-            PaletteAction::AttachImages => self.pick_images(window, cx),
+            PaletteAction::AttachFiles => self.pick_files(window, cx),
             PaletteAction::ToggleDark => toggle_dark(self.gui_dir.as_deref(), window, cx),
             PaletteAction::Mode(mode) => self.set_mode(mode),
             PaletteAction::Trust => match self.project.clone().map(|p| self.engine.trust(&p)) {
@@ -1876,7 +1893,9 @@ impl WorkspaceView {
                                     )
                                     .size_full(),
                                 )
-                                .child(self.render_turn_rail(cx)),
+                                .child(self.scroller.catcher(cx.entity_id()))
+                                .child(self.render_turn_rail(cx))
+                                .children(self.scroller.autoscroll_mark(cx)),
                         )
                     })
                     .child(self.render_composer(boot, cx))
@@ -1889,7 +1908,9 @@ impl WorkspaceView {
     /// the left; plugin status, cost, model and context fill on the right.
     fn render_composer(&self, boot: &Boot, cx: &mut Context<Self>) -> impl IntoElement {
         let working = self.transcript.working;
-        let empty = self.composer.read(cx).value().trim().is_empty() && self.attachments.is_empty();
+        let empty = self.composer.read(cx).value().trim().is_empty()
+            && self.attachments.is_empty()
+            && self.files.is_empty();
         let suggestions = self.suggestions(cx);
         div().px_6().pb_3().child(
             v_flex()
@@ -1934,9 +1955,10 @@ impl WorkspaceView {
                                         this.on_composer_key(event, window, cx)
                                     },
                                 ))
-                                .when(!self.attachments.is_empty(), |this| {
-                                    this.child(self.render_attachments(cx))
-                                })
+                                .when(
+                                    !self.attachments.is_empty() || !self.files.is_empty(),
+                                    |this| this.child(self.render_attachments(cx)),
+                                )
                                 .child(
                                     h_flex()
                                         .items_center()
@@ -1976,8 +1998,46 @@ impl WorkspaceView {
     }
 
     fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex().gap_2().px_1().pt_1().flex_wrap().children(
-            self.attachments.iter().enumerate().map(|(i, attachment)| {
+        let files = self.files.iter().enumerate().map(|(i, path)| {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            h_flex()
+                .h(px(THUMB_SIZE))
+                .max_w(px(FILE_CHIP_WIDTH))
+                .gap_2()
+                .pl_3()
+                .pr_1()
+                .rounded(cx.theme().radius_lg)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().muted)
+                .child(Icon::new(Lucide::File).small())
+                .child(div().flex_1().min_w_0().truncate().text_sm().child(name))
+                .child(
+                    Button::new(("remove-file", i))
+                        .ghost()
+                        .xsmall()
+                        .rounded(px(999.))
+                        .icon(IconName::Close)
+                        .tooltip("Remove")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if i < this.files.len() {
+                                this.files.remove(i);
+                            }
+                            cx.notify();
+                        })),
+                )
+                .into_any_element()
+        });
+        h_flex()
+            .gap_2()
+            .px_1()
+            .pt_1()
+            .flex_wrap()
+            .children(files)
+            .children(self.attachments.iter().enumerate().map(|(i, attachment)| {
                 div()
                     .relative()
                     .group(SharedString::from(format!("attachment-{i}")))
@@ -1997,8 +2057,8 @@ impl WorkspaceView {
                                 })),
                         ),
                     )
-            }),
-        )
+                    .into_any_element()
+            }))
     }
 
     fn render_suggestions(
@@ -2138,8 +2198,8 @@ impl WorkspaceView {
                     .max_h(px(MENU_HEIGHT))
                     .scrollable(true)
                     .item(
-                        action_item(&workspace, "Attach images…", PaletteAction::AttachImages)
-                            .icon(Icon::new(Lucide::ImagePlus)),
+                        action_item(&workspace, "Attach files…", PaletteAction::AttachFiles)
+                            .icon(Icon::new(Lucide::Paperclip)),
                     )
                     .item(
                         action_item(&workspace, "All commands…", PaletteAction::Palette)
@@ -2466,7 +2526,8 @@ fn thinking_label(thinking: StoredThinking) -> String {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.scroller.tick(window);
         v_flex()
             .size_full()
             .key_context(KEY_CONTEXT)
@@ -2786,7 +2847,7 @@ enum PaletteAction {
     Project(PathBuf),
     Palette,
     Settings,
-    AttachImages,
+    AttachFiles,
     ToggleDark,
     Mode(Mode),
     Trust,

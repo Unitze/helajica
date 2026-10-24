@@ -17,6 +17,7 @@ mod model_picker;
 mod new_project;
 mod nodes;
 mod projects;
+mod scroller;
 mod settings;
 mod settings_window;
 mod titlebar;

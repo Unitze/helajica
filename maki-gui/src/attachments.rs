@@ -1,8 +1,9 @@
-//! Images attached to a prompt, from the clipboard, a file picker or a drop.
-//! The window keeps them as GPUI images to draw; the agent gets base64.
+//! Files attached to a prompt, from the clipboard, a file picker or a drop.
+//! Images are kept as GPUI images to draw and reach the agent as base64;
+//! any other file reaches it as a path for its tools to read.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -11,6 +12,8 @@ use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use gpui_kit::{Image, ImageFormat};
 use maki_providers::{ImageMediaType, ImageSource};
+
+const FILES_HEADING: &str = "Attached files:";
 
 #[derive(Clone)]
 pub struct Attachment {
@@ -53,6 +56,21 @@ impl Attachment {
     }
 }
 
+/// `text` with the paths of `files` listed under it.
+pub fn with_files(text: &str, files: &[PathBuf]) -> String {
+    if files.is_empty() {
+        return text.to_owned();
+    }
+    let list: String = files
+        .iter()
+        .map(|path| format!("\n- {}", path.display()))
+        .collect();
+    match text.is_empty() {
+        true => format!("{FILES_HEADING}{list}"),
+        false => format!("{text}\n\n{FILES_HEADING}{list}"),
+    }
+}
+
 pub fn is_image(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| media_for_extension(&e.to_string_lossy()).is_some())
@@ -89,8 +107,6 @@ fn format_of(media: ImageMediaType) -> ImageFormat {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use test_case::test_case;
 
     use super::*;
@@ -103,6 +119,14 @@ mod tests {
     #[test_case("no_extension", false ; "none")]
     fn recognises_image_files(name: &str, expected: bool) {
         assert_eq!(is_image(&PathBuf::from(name)), expected);
+    }
+
+    #[test_case("read these", &[], "read these" ; "no_files")]
+    #[test_case("", &["a.pdf"], "Attached files:\n- a.pdf" ; "files_only")]
+    #[test_case("look", &["a.pdf", "b.zip"], "look\n\nAttached files:\n- a.pdf\n- b.zip" ; "text_and_files")]
+    fn files_are_listed_under_the_prompt(text: &str, files: &[&str], expected: &str) {
+        let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+        assert_eq!(with_files(text, &files), expected);
     }
 
     #[test]
