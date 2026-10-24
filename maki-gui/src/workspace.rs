@@ -192,7 +192,7 @@ pub struct WorkspaceView {
     animate_from: usize,
     focus: FocusHandle,
     _session: Option<Task<()>>,
-    _subscription: Subscription,
+    _subscriptions: [Subscription; 2],
 }
 
 impl Focusable for WorkspaceView {
@@ -269,7 +269,7 @@ impl WorkspaceView {
             animate_from: 0,
             focus: cx.focus_handle(),
             _session: None,
-            _subscription: subscription,
+            _subscriptions: [subscription, paste_interceptor(cx)],
         };
         if let Some(project) = initial {
             this.open_project(project, None, window, cx);
@@ -887,8 +887,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// Before the input sees a key: the suggestion list keys, and pasting
-    /// an image.
+    /// Before the input sees a key: the suggestion list keys.
     fn on_composer_key(
         &mut self,
         event: &KeyDownEvent,
@@ -896,12 +895,6 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        if keystroke.key == PASTE_KEY
-            && keystroke.modifiers.secondary()
-            && self.paste_images(window, cx)
-        {
-            return cx.stop_propagation();
-        }
         if keystroke.modifiers.modified() || !SUGGESTION_KEYS.contains(&keystroke.key.as_str()) {
             return;
         }
@@ -2889,6 +2882,26 @@ impl Render for WorkspaceView {
             )
             .children(self.viewing.clone().map(|image| render_viewer(image, cx)))
     }
+}
+
+/// The input binds the paste key itself, and a binding runs before any key
+/// listener, so pictures and files on the clipboard are taken here, ahead of
+/// it, while the composer has focus. Text still reaches the input.
+fn paste_interceptor(cx: &mut Context<WorkspaceView>) -> Subscription {
+    let workspace = cx.entity().downgrade();
+    cx.intercept_keystrokes(move |event, window, cx| {
+        let keystroke = &event.keystroke;
+        if keystroke.key != PASTE_KEY || !keystroke.modifiers.secondary() {
+            return;
+        }
+        let _ = workspace.update(cx, |this, cx| {
+            if this.composer.focus_handle(cx).contains_focused(window, cx)
+                && this.paste_images(window, cx)
+            {
+                cx.stop_propagation();
+            }
+        });
+    })
 }
 
 fn action_item(
