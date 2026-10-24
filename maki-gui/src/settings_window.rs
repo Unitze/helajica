@@ -7,7 +7,8 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
@@ -18,8 +19,8 @@ use gpui_kit::component::{
 use gpui_kit::{
     Anchor, AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, WindowBounds, WindowOptions, div,
-    prelude::FluentBuilder as _, px, size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowBounds,
+    WindowOptions, div, prelude::FluentBuilder as _, px, size,
 };
 use maki_config::providers::Protocol;
 use maki_providers::openai_auth;
@@ -27,7 +28,9 @@ use maki_storage::StateDir;
 
 use crate::addons::Addon;
 use crate::app::set_dark;
-use crate::custom_providers::{self, Connected, Draft, PROTOCOLS, protocol_label};
+use crate::custom_providers::{
+    self, Connected, Draft, PROTOCOLS, ProviderModel, parse_tokens, protocol_label,
+};
 use crate::settings::Settings;
 use crate::titlebar::APP_NAME;
 use crate::update;
@@ -38,6 +41,9 @@ const NAV_WIDTH: f32 = 200.;
 const CONTENT_WIDTH: f32 = 560.;
 const TITLE_BAR_HEIGHT: f32 = 40.;
 const MENU_WIDTH: f32 = 220.;
+const MODEL_LIST_HEIGHT: f32 = 280.;
+const CONTEXT_INPUT_WIDTH: f32 = 110.;
+const CONTEXT_PLACEHOLDER: &str = "Context";
 
 pub type OnChange = Rc<dyn Fn(&mut App)>;
 
@@ -98,11 +104,20 @@ pub fn open(
     }
 }
 
+struct ModelRow {
+    id: String,
+    /// Saved with the provider; fetched models start out unticked.
+    enabled: bool,
+    context: Entity<InputState>,
+}
+
 struct ProviderForm {
     name: Entity<InputState>,
     base_url: Entity<InputState>,
     api_key: Entity<InputState>,
-    models: Entity<InputState>,
+    models: Vec<ModelRow>,
+    new_model: Entity<InputState>,
+    fetching: bool,
     protocol: Option<Protocol>,
     /// The slug being edited, `None` while connecting a new one.
     editing: Option<String>,
@@ -115,9 +130,9 @@ impl ProviderForm {
             base_url: cx
                 .new(|cx| InputState::new(window, cx).placeholder("https://llm.example.com/v1")),
             api_key: cx.new(|cx| InputState::new(window, cx).masked(true)),
-            models: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("fast-v1, smart-v1 (blank lists them)")
-            }),
+            models: Vec::new(),
+            new_model: cx.new(|cx| InputState::new(window, cx).placeholder("Model id")),
+            fetching: false,
             protocol: Some(Protocol::Openai),
             editing: None,
         }
@@ -129,7 +144,45 @@ impl ProviderForm {
             protocol: self.protocol,
             base_url: self.base_url.read(cx).value().to_string(),
             api_key: self.api_key.read(cx).value().to_string(),
-            models: self.models.read(cx).value().to_string(),
+            models: self
+                .models
+                .iter()
+                .filter(|row| row.enabled)
+                .map(|row| ProviderModel {
+                    id: row.id.clone(),
+                    context_window: parse_tokens(&row.context.read(cx).value()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Adds models not listed yet, keeping the ticks and windows of those
+    /// that are.
+    fn add_models(
+        &mut self,
+        models: impl IntoIterator<Item = ProviderModel>,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        for model in models {
+            if self.models.iter().any(|row| row.id == model.id) {
+                continue;
+            }
+            let value = model
+                .context_window
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let context = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(CONTEXT_PLACEHOLDER)
+                    .default_value(value)
+            });
+            self.models.push(ModelRow {
+                id: model.id,
+                enabled,
+                context,
+            });
         }
     }
 
@@ -150,12 +203,11 @@ impl ProviderForm {
             cx,
         );
         set(&self.api_key, String::new(), window, cx);
-        set(
-            &self.models,
-            provider.map(|p| p.models.join(", ")).unwrap_or_default(),
-            window,
-            cx,
-        );
+        set(&self.new_model, String::new(), window, cx);
+        self.models.clear();
+        self.fetching = false;
+        let saved = provider.map(|p| p.models.clone()).unwrap_or_default();
+        self.add_models(saved, true, window, cx);
         self.protocol = Some(provider.map_or(Protocol::Openai, |p| p.protocol));
         self.editing = provider.map(|p| p.slug.clone());
     }
@@ -170,6 +222,7 @@ struct SettingsView {
     form: ProviderForm,
     error: Option<SharedString>,
     signing_in: bool,
+    _subscription: Subscription,
 }
 
 impl SettingsView {
@@ -180,15 +233,27 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let storage = StateDir::resolve().ok();
+        let form = ProviderForm::new(window, cx);
+        // The model box filters the list as it is typed in; Enter adds it.
+        let subscription = cx.subscribe_in(
+            &form.new_model,
+            window,
+            |this, _, event, window, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => this.add_typed_model(window, cx),
+                _ => {}
+            },
+        );
         Self {
             providers: custom_providers::list(storage.as_ref()),
             gui_dir,
             storage,
             on_change,
             page: Page::General,
-            form: ProviderForm::new(window, cx),
+            form,
             error: None,
             signing_in: false,
+            _subscription: subscription,
         }
     }
 
@@ -229,6 +294,159 @@ impl SettingsView {
                 cx.notify();
             }
         }
+    }
+
+    fn fetch_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.form.draft(cx);
+        let storage = self.storage.clone();
+        self.form.fetching = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move {
+                    custom_providers::fetch_models(&draft, storage.as_ref())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.form.fetching = false;
+                match fetched {
+                    Ok(models) if models.is_empty() => {
+                        this.error = Some("The provider listed no models.".into());
+                    }
+                    Ok(models) => this.form.add_models(models, false, window, cx),
+                    Err(e) => this.error = Some(e.into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn add_typed_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.form.new_model.read(cx).value().trim().to_owned();
+        if id.is_empty() {
+            return;
+        }
+        let model = ProviderModel {
+            id,
+            context_window: None,
+        };
+        self.form.add_models([model], true, window, cx);
+        self.form
+            .new_model
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn render_models(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let filter = self.form.new_model.read(cx).value().trim().to_lowercase();
+        let shown: Vec<usize> = (0..self.form.models.len())
+            .filter(|&i| {
+                filter.is_empty() || self.form.models[i].id.to_lowercase().contains(&filter)
+            })
+            .collect();
+        let all = !shown.is_empty() && shown.iter().all(|&i| self.form.models[i].enabled);
+        let toggled = shown.clone();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(Input::new(&self.form.new_model)))
+                    .child(Button::new("add-model").label("Add").on_click(
+                        cx.listener(|this, _, window, cx| this.add_typed_model(window, cx)),
+                    ))
+                    .child(
+                        Button::new("fetch-models")
+                            .label("Fetch /models")
+                            .loading(self.form.fetching)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.fetch_models(window, cx)),
+                            ),
+                    ),
+            )
+            .when(self.form.models.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("None picked: maki lists them from the provider at startup."),
+                )
+            })
+            .when(!self.form.models.is_empty(), move |this| {
+                this.child(
+                    v_flex()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius)
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .px_3()
+                                .py_1p5()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(Checkbox::new("all-models").checked(all).on_click(
+                                    cx.listener(move |this, checked: &bool, _, cx| {
+                                        for &i in &toggled {
+                                            if let Some(row) = this.form.models.get_mut(i) {
+                                                row.enabled = *checked;
+                                            }
+                                        }
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(div().flex_1().child(format!(
+                                    "{} of {} models",
+                                    self.form.models.iter().filter(|m| m.enabled).count(),
+                                    self.form.models.len()
+                                )))
+                                .child(div().w(px(CONTEXT_INPUT_WIDTH)).child("Context window")),
+                        )
+                        .child(divider(cx))
+                        .child(
+                            div()
+                                .id("provider-models")
+                                .max_h(px(MODEL_LIST_HEIGHT))
+                                .overflow_y_scrollbar()
+                                .child(v_flex().children(shown.iter().map(|&i| {
+                                    let row = &self.form.models[i];
+                                    h_flex()
+                                        .gap_3()
+                                        .px_3()
+                                        .py_1()
+                                        .child(
+                                            Checkbox::new(("model-enabled", i))
+                                                .checked(row.enabled)
+                                                .on_click(cx.listener(
+                                                    move |this, checked: &bool, _, cx| {
+                                                        if let Some(row) =
+                                                            this.form.models.get_mut(i)
+                                                        {
+                                                            row.enabled = *checked;
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_sm()
+                                                .child(row.id.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(CONTEXT_INPUT_WIDTH))
+                                                .child(Input::new(&row.context).small()),
+                                        )
+                                }))),
+                        ),
+                )
+            })
     }
 
     fn remove_provider(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -490,7 +708,7 @@ impl SettingsView {
                             Input::new(&self.form.api_key).mask_toggle(),
                             cx,
                         ))
-                        .child(field("Models", Input::new(&self.form.models), cx))
+                        .child(field("Models", self.render_models(cx), cx))
                         .when_some(self.error.clone(), |this, error| {
                             this.child(div().text_sm().text_color(cx.theme().danger).child(error))
                         })

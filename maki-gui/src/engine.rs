@@ -8,8 +8,8 @@ use color_eyre::Result;
 use flume::{Receiver, Sender};
 use maki_agent::Envelope;
 use maki_agent::permissions::PermissionAnswer;
-use maki_providers::{ImageSource, Message};
-use maki_storage::sessions::SessionSummary;
+use maki_providers::{ImageSource, Message, ProviderUsage};
+use maki_storage::sessions::{SessionSummary, StoredThinking};
 use serde_json::Value;
 
 pub trait Engine: Send + Sync + 'static {
@@ -19,6 +19,9 @@ pub trait Engine: Send + Sync + 'static {
     fn open(&self, project: &Path, resume: Option<String>) -> Result<Session>;
 
     fn sessions(&self, project: &Path) -> Vec<SessionSummary>;
+
+    /// Deletes a saved session, closing it first if it is the open one.
+    fn delete_session(&self, id: &str) -> Result<()>;
 
     /// Records the user's trust in `project`, so its `.maki` config, plugins
     /// and GUI extensions load on the next [`Engine::open`].
@@ -35,6 +38,10 @@ pub struct Boot {
     pub session_id: String,
     pub model: String,
     pub models: Vec<String>,
+    /// The startup model's, until a turn reports the one in use.
+    pub context_window: u32,
+    /// What the config asks for; the window may override it.
+    pub thinking: StoredThinking,
     pub tools: Vec<String>,
     pub warnings: Vec<String>,
     pub history: Vec<Message>,
@@ -72,6 +79,11 @@ pub enum Command {
         data: Value,
     },
     Model(String),
+    /// Thinking for the prompts sent from now on.
+    Thinking(StoredThinking),
+    /// Asks the current model's provider for its usage limits, answered by
+    /// [`Update::Usage`].
+    Usage,
     /// Turns yolo on or off: tools stop (or start) asking for permission.
     Yolo(bool),
     /// Ends the session. The engine sends it itself before opening another.
@@ -89,6 +101,15 @@ pub enum Update {
         input: Value,
     },
     Btw(BtwEvent),
+    Usage(UsageReport),
+}
+
+#[derive(Clone)]
+pub enum UsageReport {
+    Ready(ProviderUsage),
+    /// The provider has no quota endpoint.
+    Unsupported,
+    Failed(String),
 }
 
 pub enum BtwEvent {

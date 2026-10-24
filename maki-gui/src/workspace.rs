@@ -2,10 +2,12 @@
 //! conversation in the middle, the composer under it, and whatever Lua
 //! plugins add around them.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flume::Sender;
 use gpui_kit::assets::IconName as Lucide;
@@ -14,36 +16,42 @@ use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::{Notification, NotificationType};
-use gpui_kit::component::progress::ProgressCircle;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::progress::{Progress, ProgressCircle};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
     WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    Anchor, AnyWindowHandle, App, AppContext as _, AsyncWindowContext, ClipboardEntry, Context,
-    Entity, ExternalPaths, FocusHandle, Focusable, Image, InteractiveElement as _, IntoElement,
-    KeyBinding, KeyDownEvent, ObjectFit, ParentElement as _, PathPromptOptions, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
-    Subscription, Task, WeakEntity, Window, actions, div, img, prelude::FluentBuilder as _, px,
+    Anchor, Animation, AnimationExt as _, AnyWindowHandle, App, AppContext as _,
+    AsyncWindowContext, ClipboardEntry, Context, DispatchPhase, Entity, ExternalPaths, FocusHandle,
+    Focusable, FollowMode, HitboxBehavior, Image, InteractiveElement as _, IntoElement, KeyBinding,
+    KeyDownEvent, ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _,
+    PathPromptOptions, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    Styled as _, StyledImage as _, Subscription, Task, WeakEntity, Window, actions, canvas, div,
+    ease_out_quint, img, list, prelude::FluentBuilder as _, px,
 };
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
 use maki_storage::now_epoch;
-use maki_storage::sessions::SessionSummary;
+use maki_storage::sessions::{Effort, SessionSummary, StoredThinking};
 use serde_json::Value;
 
 use crate::app::{apply_theme_message, toggle_dark};
 use crate::attachments::{self, Attachment};
 use crate::commands::{self, Builtin, Suggestion};
-use crate::engine::{Boot, BtwEvent, Command, Engine, Update};
+use crate::engine::{Boot, BtwEvent, Command, Engine, Update, UsageReport};
 use crate::ext::{COMMAND_TOPIC_PREFIX, Effect, Extensions, NotifyLevel};
 use crate::goal::{self, Goal, Next};
+use crate::model_picker::{ModelPicker, OnPick};
 use crate::new_project::{self, OnProject};
 use crate::nodes;
 use crate::projects::ProjectStore;
+use crate::settings::Settings;
 use crate::settings_window;
 use crate::titlebar::{Handler, title_bar};
 use crate::transcript::{Change, Item, Level, ToolCall, ToolStatus, Transcript};
@@ -59,9 +67,32 @@ const SIDEBAR_WIDTH: f32 = 264.;
 const TRANSCRIPT_WIDTH: f32 = 820.;
 const TOOL_PREVIEW_LINES: usize = 12;
 const THINKING_PREVIEW_LINES: usize = 3;
-const FOLLOW_TAIL_SLACK: f32 = 64.;
+const LIST_OVERDRAW: f32 = 800.;
+const SCROLL_LINE_HEIGHT: f32 = 40.;
+/// Share of the outstanding wheel distance covered each frame.
+const SCROLL_EASING: f32 = 0.35;
+const SCROLL_SETTLED: f32 = 0.5;
+const TURN_TICK_WIDTH: f32 = 10.;
+const TURN_TICK_ACTIVE_WIDTH: f32 = 18.;
+const TURN_TICK_HEIGHT: f32 = 1.5;
+const TURN_TICK_GAP: f32 = 6.;
+const TURN_CARD_WIDTH: f32 = 320.;
+const TURN_PREVIEW_LINES: usize = 3;
+const FADE_IN: Duration = Duration::from_millis(180);
+const RISE_IN: f32 = 6.;
 const SESSIONS_PER_PROJECT: usize = 30;
-const CONTEXT_RING_SIZE: f32 = 14.;
+const USAGE_RING_SIZE: f32 = 14.;
+const USAGE_CARD_WIDTH: f32 = 340.;
+const USAGE_WARNING_PERCENT: u32 = 70;
+const USAGE_DANGER_PERCENT: u32 = 90;
+const CONTEXT_TICKS: u32 = 20;
+const CONTEXT_TICK_WIDTH: f32 = 1.5;
+const CONTEXT_TICK_HEIGHT: f32 = 9.;
+const CONTEXT_TICK_GAP: f32 = 2.;
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 3_600;
+const SECONDS_PER_DAY: u64 = 86_400;
+const MILLIS_PER_SECOND: u64 = 1_000;
 const MENU_WIDTH: f32 = 240.;
 const MENU_HEIGHT: f32 = 360.;
 const UNTITLED: &str = "Untitled session";
@@ -74,6 +105,7 @@ const ATTACH_PROMPT: &str = "Attach";
 const GOAL_STOP_WORDS: [&str; 3] = ["clear", "stop", "off"];
 const ASIDE_HEIGHT: f32 = 240.;
 const SUGGESTIONS_HEIGHT: f32 = 320.;
+const DELETE_DIALOG_WIDTH: f32 = 420.;
 const MODEL_QUERY: &str = "Model: ";
 const CANCELLED_REASON: &str = "cancelled";
 
@@ -118,12 +150,21 @@ pub struct WorkspaceView {
     aside: Option<Aside>,
     goal: Option<Goal>,
     settings_window: Option<AnyWindowHandle>,
+    model_picker: Option<Entity<ModelPicker>>,
+    /// The thinking level picked here, over the config's.
+    thinking: Option<StoredThinking>,
+    /// The provider's usage limits; `None` while they load.
+    usage: Option<UsageReport>,
     /// Providers changed mid-run; the session reopens once the run ends.
     reload_pending: bool,
     mode: Mode,
     update: UpdateState,
     expanded: HashSet<String>,
-    scroll: ScrollHandle,
+    list: ListState,
+    /// Items from here on arrived live and fade in; the loaded history does not.
+    animate_from: usize,
+    /// Wheel distance not scrolled yet; eased out over the next frames.
+    scroll_pending: Rc<Cell<f32>>,
     focus: FocusHandle,
     _session: Option<Task<()>>,
     _subscription: Subscription,
@@ -165,6 +206,9 @@ impl WorkspaceView {
                 },
             );
         let store = ProjectStore::load(gui_dir.as_deref());
+        let thinking = Settings::load(gui_dir.as_deref())
+            .thinking
+            .and_then(|t| StoredThinking::parse_setting(&t).ok());
         let initial = project.or_else(|| {
             store
                 .projects()
@@ -190,11 +234,16 @@ impl WorkspaceView {
             aside: None,
             goal: None,
             settings_window: None,
+            model_picker: None,
+            thinking,
+            usage: None,
             reload_pending: false,
             mode: Mode::Ask,
             update: UpdateState::Idle,
             expanded: HashSet::new(),
-            scroll: ScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW)),
+            scroll_pending: Rc::default(),
+            animate_from: 0,
             focus: cx.focus_handle(),
             _session: None,
             _subscription: subscription,
@@ -335,6 +384,9 @@ impl WorkspaceView {
 
     fn refresh_sessions(&mut self, project: &Path) {
         let mut sessions = self.engine.sessions(project);
+        // Newest first by when they began (ids are UUIDv7), so using a session
+        // does not move it.
+        sessions.sort_by(|a, b| b.id.as_bytes().cmp(a.id.as_bytes()));
         sessions.truncate(SESSIONS_PER_PROJECT);
         self.sessions.insert(project.to_path_buf(), sessions);
     }
@@ -345,6 +397,73 @@ impl WorkspaceView {
             if !self.sessions.contains_key(project) {
                 self.refresh_sessions(project);
             }
+        }
+        cx.notify();
+    }
+
+    fn confirm_delete_session(
+        &mut self,
+        project: PathBuf,
+        id: String,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let workspace = workspace.clone();
+            let project = project.clone();
+            let id = id.clone();
+            dialog
+                .title("Delete session?")
+                .w(px(DELETE_DIALOG_WIDTH))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "\u{201c}{title}\u{201d} and its history will be gone for good."
+                        )),
+                )
+                .footer(
+                    DialogFooter::new().children([
+                        Button::new("cancel-delete")
+                            .label("Cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                        Button::new("confirm-delete")
+                            .danger()
+                            .label("Delete")
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = workspace.update(cx, |this, cx| {
+                                    this.delete_session(&project, &id, window, cx)
+                                });
+                            }),
+                    ]),
+                )
+        });
+    }
+
+    fn delete_session(
+        &mut self,
+        project: &Path,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current =
+            self.project.as_deref() == Some(project) && self.current_session() == Some(id);
+        if let Err(e) = self.engine.delete_session(id) {
+            window.push_notification(
+                Notification::new()
+                    .message(format!("Could not delete the session: {e:#}"))
+                    .with_type(NotificationType::Error),
+                cx,
+            );
+        }
+        self.refresh_sessions(project);
+        if current {
+            self.start(None, window, cx);
         }
         cx.notify();
     }
@@ -410,6 +529,8 @@ impl WorkspaceView {
         self.ext = Extensions::default();
         self.aside = None;
         self.goal = None;
+        self.usage = None;
+        self.model_picker = None;
         self.reload_pending = false;
         self._session = None;
         cx.notify();
@@ -445,11 +566,18 @@ impl WorkspaceView {
                 } else if this.mode == Mode::Bypass {
                     let _ = session.commands.send(Command::Yolo(true));
                 }
+                if let Some(thinking) = this.thinking {
+                    let _ = session.commands.send(Command::Thinking(thinking));
+                }
+                let _ = session.commands.send(Command::Usage);
+                this.model_picker = Some(this.model_picker(&session.boot, window, cx));
                 this.phase = Phase::Ready {
                     boot: session.boot,
                     commands: session.commands,
                 };
-                this.scroll.scroll_to_bottom();
+                this.list.reset(0);
+                this.animate_from = this.transcript.items.len();
+                this.scroll_to_end();
                 this.composer.read(cx).focus_handle(cx).focus(window, cx);
                 cx.notify();
             });
@@ -471,7 +599,41 @@ impl WorkspaceView {
             Update::Lua { topic, data } => this.on_lua(&topic, data, window, cx),
             Update::Question { input } => this.ask(&input, window, cx),
             Update::Btw(event) => this.on_aside(event, cx),
+            Update::Usage(report) => {
+                this.usage = Some(report);
+                cx.notify();
+            }
         })
+    }
+
+    fn model_picker(
+        &self,
+        boot: &Boot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ModelPicker> {
+        let workspace = cx.entity().downgrade();
+        // Deferred: the picker is still being updated when it calls this, and
+        // the workspace updates it back.
+        let on_pick: OnPick = Rc::new(move |spec, window, cx| {
+            let workspace = workspace.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = workspace.update(cx, |this, cx| {
+                    this.run(PaletteAction::Model(spec), window, cx)
+                });
+            });
+        });
+        let (models, current) = (boot.models.clone(), boot.model.clone());
+        cx.new(|cx| ModelPicker::new(models, current, on_pick, window, cx))
+    }
+
+    fn set_thinking(&mut self, thinking: StoredThinking) {
+        self.thinking = Some(thinking);
+        let dir = self.gui_dir.as_deref();
+        let mut settings = Settings::load(dir);
+        settings.thinking = Some(thinking.to_string());
+        settings.save(dir);
+        self.send(Command::Thinking(thinking));
     }
 
     /// Decodes the images of user messages not drawn yet.
@@ -738,12 +900,13 @@ impl WorkspaceView {
         {
             return self.ask_permission(id, &tool.to_string(), reason.as_deref(), window, cx);
         }
-        let following = self.following_tail();
-        if self.transcript.apply(envelope) != Change::None {
-            if following {
-                self.scroll.scroll_to_bottom();
+        match self.transcript.apply(envelope) {
+            Change::None => {}
+            Change::Appended => cx.notify(),
+            Change::Updated(index) => {
+                self.list.remeasure_items(index..index + 1);
+                cx.notify();
             }
-            cx.notify();
         }
         if envelope.subagent.is_some() {
             return;
@@ -753,6 +916,7 @@ impl WorkspaceView {
                 if let Some(project) = self.project.clone() {
                     self.refresh_sessions(&project);
                 }
+                self.send(Command::Usage);
                 let cancelled = reason.to_string() == CANCELLED_REASON;
                 self.after_run(cancelled, window, cx);
                 cx.notify();
@@ -762,9 +926,20 @@ impl WorkspaceView {
         }
     }
 
-    fn following_tail(&self) -> bool {
-        let offset = -self.scroll.offset().y;
-        offset + px(FOLLOW_TAIL_SLACK) >= self.scroll.max_offset().y
+    /// Items only ever get appended to a transcript; a new one starts the
+    /// list over (see [`Self::start`]).
+    fn sync_list(&self) {
+        let (shown, len) = (self.list.item_count(), self.transcript.items.len());
+        if len < shown {
+            self.list.reset(len);
+        } else if len > shown {
+            self.list.splice(shown..shown, len - shown);
+        }
+    }
+
+    fn scroll_to_end(&self) {
+        self.sync_list();
+        self.list.set_follow_mode(FollowMode::Tail);
     }
 
     fn on_lua(&mut self, topic: &str, data: Value, window: &mut Window, cx: &mut Context<Self>) {
@@ -819,7 +994,7 @@ impl WorkspaceView {
             plan: self.mode == Mode::Plan,
             images,
         });
-        self.scroll.scroll_to_bottom();
+        self.scroll_to_end();
         cx.notify();
     }
 
@@ -886,7 +1061,7 @@ impl WorkspaceView {
             }
             Builtin::Exit => cx.quit(),
         }
-        self.scroll.scroll_to_bottom();
+        self.scroll_to_end();
         cx.notify();
     }
 
@@ -1106,8 +1281,14 @@ impl WorkspaceView {
                 if let Phase::Ready { boot, .. } = &mut self.phase {
                     boot.model.clone_from(&spec);
                 }
+                if let Some(picker) = &self.model_picker {
+                    picker.update(cx, |picker, _| picker.set_current(&spec));
+                }
+                self.usage = None;
                 self.send(Command::Model(spec));
+                self.send(Command::Usage);
             }
+            PaletteAction::Thinking(thinking) => self.set_thinking(thinking),
             PaletteAction::Lua(id) => self.send(Command::Lua {
                 topic: format!("{COMMAND_TOPIC_PREFIX}{id}"),
                 data: Value::Null,
@@ -1261,9 +1442,12 @@ impl WorkspaceView {
             let active = current && self.current_session() == Some(id.as_str());
             let project = path.to_path_buf();
             let resume = id.clone();
+            let doomed = (path.to_path_buf(), id.clone(), title_of(&session.title));
+            let row = SharedString::from(format!("session-row-{id}"));
             rows.push(
                 h_flex()
                     .id(SharedString::from(format!("session-{id}")))
+                    .group(row.clone())
                     .gap_2()
                     .pl_7()
                     .pr_2()
@@ -1292,6 +1476,24 @@ impl WorkspaceView {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(short_ago(now, session.updated_at)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .invisible()
+                            .group_hover(row, |s| s.visible())
+                            .child(
+                                Button::new(SharedString::from(format!("delete-session-{id}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(Lucide::Trash))
+                                    .tooltip("Delete session")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        let (project, id, title) = doomed.clone();
+                                        this.confirm_delete_session(project, id, title, window, cx);
+                                    })),
+                            ),
                     )
                     .into_any_element(),
             );
@@ -1363,6 +1565,123 @@ impl WorkspaceView {
                     ),
             )
             .children(rows)
+    }
+
+    fn render_row(&self, index: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let Some(item) = self.transcript.items.get(index) else {
+            return div().into_any_element();
+        };
+        let len = self.transcript.items.len();
+        let last = index + 1 == len;
+        let fresh = index >= self.animate_from && index + 2 >= len;
+        let row = h_flex().w_full().justify_center().child(
+            div()
+                .w(px(TRANSCRIPT_WIDTH))
+                .max_w_full()
+                .px_6()
+                .pt(px(if index == 0 { 24. } else { 16. }))
+                .when(last, |this| this.pb_6())
+                .child(self.render_item(index, item, cx)),
+        );
+        match fresh {
+            true => fade_in(row, ("row-in", index)).into_any_element(),
+            false => row.into_any_element(),
+        }
+    }
+
+    /// Takes wheel input over the transcript before the list does, so
+    /// [`Self::ease_scroll`] can spread each notch over a few frames.
+    fn wheel_catcher(&self) -> impl IntoElement {
+        let pending = Rc::clone(&self.scroll_pending);
+        canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |_, hitbox, window, _| {
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                    let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
+                    if phase == DispatchPhase::Capture
+                        && hitbox.should_handle_scroll(window)
+                        && delta.y.abs() > delta.x.abs()
+                    {
+                        pending.set(pending.get() + f32::from(delta.y));
+                        cx.stop_propagation();
+                        window.refresh();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+    }
+
+    fn ease_scroll(&self, window: &mut Window) {
+        let pending = self.scroll_pending.get();
+        if pending.abs() < SCROLL_SETTLED {
+            self.scroll_pending.set(0.);
+            return;
+        }
+        let step = if (pending * SCROLL_EASING).abs() < SCROLL_SETTLED {
+            pending
+        } else {
+            pending * SCROLL_EASING
+        };
+        self.list.scroll_by(px(-step));
+        self.scroll_pending.set(pending - step);
+        window.request_animation_frame();
+    }
+
+    /// A tick per prompt down the side of the transcript; hovering one
+    /// previews the turn, clicking it scrolls there.
+    fn render_turn_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let turns = turns(&self.transcript.items);
+        let top = self.list.logical_scroll_top().item_ix;
+        let workspace = cx.entity().downgrade();
+        let current = turns.iter().rposition(|t| t.index <= top).unwrap_or(0);
+        v_flex()
+            .absolute()
+            .left_1()
+            .top_0()
+            .bottom_0()
+            .justify_center()
+            .when(turns.len() > 1, |this| {
+                this.children(turns.into_iter().enumerate().map(|(n, turn)| {
+                    let active = n == current;
+                    let index = turn.index;
+                    let workspace = workspace.clone();
+                    div()
+                        .id(("turn-tick", n))
+                        .py(px(TURN_TICK_GAP / 2.))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .w(px(if active {
+                                    TURN_TICK_ACTIVE_WIDTH
+                                } else {
+                                    TURN_TICK_WIDTH
+                                }))
+                                .h(px(TURN_TICK_HEIGHT))
+                                .bg(if active {
+                                    cx.theme().foreground
+                                } else {
+                                    cx.theme().muted_foreground.opacity(0.5)
+                                }),
+                        )
+                        .tooltip(move |window, cx| {
+                            let (prompt, reply) = workspace
+                                .upgrade()
+                                .map(|w| turn.texts(&w.read(cx).transcript.items))
+                                .unwrap_or_default();
+                            Tooltip::element(move |_, cx| turn_card(&prompt, &reply, cx))
+                                .build(window, cx)
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.list.scroll_to(ListOffset {
+                                item_ix: index,
+                                offset_in_item: px(0.),
+                            });
+                            cx.notify();
+                        }))
+                }))
+            })
     }
 
     fn render_item(
@@ -1559,14 +1878,7 @@ impl WorkspaceView {
                 )
                 .into_any_element(),
             Phase::Ready { boot, .. } => {
-                let items: Vec<_> = self
-                    .transcript
-                    .items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| self.render_item(i, item, cx))
-                    .collect();
-                let empty = items.is_empty();
+                let empty = self.transcript.items.is_empty();
                 let name = self.project_name().unwrap_or_default();
                 v_flex()
                     .flex_1()
@@ -1586,23 +1898,34 @@ impl WorkspaceView {
                         )
                     })
                     .when(!empty, |this| {
-                        this.child(
+                        self.sync_list();
+                        this.when(!boot.trusted, |this| {
+                            this.child(
+                                div()
+                                    .w(px(TRANSCRIPT_WIDTH))
+                                    .max_w_full()
+                                    .mx_auto()
+                                    .px_6()
+                                    .pt_4()
+                                    .child(trust_banner(cx)),
+                            )
+                        })
+                        .child(
                             div()
-                                .id("transcript")
+                                .relative()
                                 .flex_1()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.scroll)
+                                .min_h_0()
                                 .child(
-                                    v_flex()
-                                        .w(px(TRANSCRIPT_WIDTH))
-                                        .max_w_full()
-                                        .mx_auto()
-                                        .px_6()
-                                        .py_6()
-                                        .gap_4()
-                                        .when(!boot.trusted, |this| this.child(trust_banner(cx)))
-                                        .children(items),
-                                ),
+                                    list(
+                                        self.list.clone(),
+                                        cx.processor(|this, index: usize, _, cx| {
+                                            this.render_row(index, cx)
+                                        }),
+                                    )
+                                    .size_full(),
+                                )
+                                .child(self.wheel_catcher())
+                                .child(self.render_turn_rail(cx)),
                         )
                     })
                     .child(self.render_composer(boot, cx))
@@ -1624,13 +1947,19 @@ impl WorkspaceView {
                 .mx_auto()
                 .gap_1p5()
                 .when_some(self.aside.as_ref(), |this, aside| {
-                    this.child(self.render_aside(aside, cx))
+                    this.child(fade_in(
+                        div().child(self.render_aside(aside, cx)),
+                        "aside-in",
+                    ))
                 })
                 .child(
                     div()
                         .relative()
                         .when(!suggestions.is_empty(), |this| {
-                            this.child(self.render_suggestions(&suggestions, cx))
+                            this.child(fade_in(
+                                div().child(self.render_suggestions(&suggestions, cx)),
+                                "suggestions-in",
+                            ))
                         })
                         .child(
                             v_flex()
@@ -1879,22 +2208,9 @@ impl WorkspaceView {
     }
 
     fn render_session_bar(&self, boot: &Boot, cx: &mut Context<Self>) -> impl IntoElement {
-        let totals = &self.transcript.totals;
-        let percent = match totals.context_window {
-            0 => 0.,
-            window => (u64::from(totals.context_size) * 100) as f32 / window as f32,
-        };
-        let tokens = format!(
-            "{:.0}% of context · ↑{} ↓{}",
-            percent,
-            totals.usage.input + totals.usage.cache_read + totals.usage.cache_creation,
-            totals.usage.output
-        );
         let workspace = cx.entity().downgrade();
         let mode_workspace = workspace.clone();
         let mode = self.mode;
-        let models = boot.models.clone();
-        let current = boot.model.clone();
         h_flex()
             .px_2()
             .gap_2()
@@ -1925,6 +2241,7 @@ impl WorkspaceView {
                             })
                     }),
             )
+            .child(self.render_context(boot, cx))
             .when_some(self.goal.as_ref(), |this, goal| {
                 this.child(
                     Button::new("goal")
@@ -1949,47 +2266,257 @@ impl WorkspaceView {
             })
             .child(div().flex_1())
             .children(self.ext.status.iter().map(|s| div().child(s.text.clone())))
-            .children(totals.cost.map(|cost| format!("${cost:.2}")))
-            .child(
-                Button::new("model")
-                    .ghost()
-                    .xsmall()
-                    .label(short_model(&boot.model))
-                    .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-                        let mut menu = menu
-                            .min_w(px(MENU_WIDTH))
-                            .max_h(px(MENU_HEIGHT))
-                            .scrollable(true);
-                        for spec in &models {
-                            menu = menu.item(
-                                action_item(
-                                    &workspace,
-                                    spec.clone(),
-                                    PaletteAction::Model(spec.clone()),
-                                )
-                                .checked(*spec == current),
-                            );
-                        }
-                        menu
-                    }),
+            .children(
+                self.transcript
+                    .totals
+                    .cost
+                    .map(|cost| format!("${cost:.2}")),
             )
+            .child(self.render_effort(boot, &workspace))
+            .when_some(self.model_picker.clone(), |this, picker| {
+                this.child(render_model_picker(short_model(&boot.model), picker, cx))
+            })
+            .child(self.render_usage(cx))
+    }
+
+    /// How full the context window is, as a row of ticks.
+    fn render_context(&self, boot: &Boot, cx: &mut Context<Self>) -> impl IntoElement {
+        let totals = &self.transcript.totals;
+        let window = match totals.context_window {
+            0 => boot.context_window,
+            window => window,
+        };
+        let used = totals.context_size;
+        let filled = match window {
+            0 => 0,
+            window => (u64::from(used) * u64::from(CONTEXT_TICKS)).div_ceil(u64::from(window)),
+        };
+        let details: SharedString = format!(
+            "Context {used} of {window} tokens · ↑{} ↓{}",
+            totals.usage.input + totals.usage.cache_read + totals.usage.cache_creation,
+            totals.usage.output
+        )
+        .into();
+        let (on, off) = (cx.theme().foreground, cx.theme().border);
+        h_flex()
+            .id("context")
+            .gap_2()
+            .tooltip(move |window, cx| Tooltip::new(details.clone()).build(window, cx))
             .child(
-                Button::new("context")
-                    .ghost()
-                    .xsmall()
-                    .tooltip(tokens)
-                    .child(
-                        ProgressCircle::new("context-ring")
-                            .size(px(CONTEXT_RING_SIZE))
-                            .color(cx.theme().muted_foreground)
-                            .value(percent),
-                    ),
+                h_flex()
+                    .gap(px(CONTEXT_TICK_GAP))
+                    .children((0..CONTEXT_TICKS).map(|tick| {
+                        div()
+                            .w(px(CONTEXT_TICK_WIDTH))
+                            .h(px(CONTEXT_TICK_HEIGHT))
+                            .bg(if u64::from(tick) < filled { on } else { off })
+                    })),
             )
+            .child(format!(
+                "{} / {}",
+                compact_tokens(used),
+                compact_tokens(window)
+            ))
+    }
+
+    fn render_effort(&self, boot: &Boot, workspace: &WeakEntity<Self>) -> impl IntoElement {
+        let current = self.thinking.unwrap_or(boot.thinking);
+        let workspace = workspace.clone();
+        Button::new("effort")
+            .ghost()
+            .xsmall()
+            .label(thinking_label(current))
+            .tooltip("Thinking effort")
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+                thinking_choices().fold(menu.min_w(px(MENU_WIDTH)), |menu, choice| {
+                    menu.item(
+                        action_item(
+                            &workspace,
+                            thinking_label(choice),
+                            PaletteAction::Thinking(choice),
+                        )
+                        .checked(choice == current),
+                    )
+                })
+            })
+    }
+
+    /// A ring as full as the tightest usage limit, opening onto all of them.
+    fn render_usage(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let percent = self.usage.as_ref().and_then(tightest_limit).unwrap_or(0);
+        let color = match percent {
+            p if p >= USAGE_DANGER_PERCENT => cx.theme().danger,
+            p if p >= USAGE_WARNING_PERCENT => cx.theme().warning,
+            _ => cx.theme().muted_foreground,
+        };
+        let report = self.usage.clone();
+        Popover::new("usage")
+            .anchor(Anchor::BottomRight)
+            .trigger(
+                Button::new("usage-ring").ghost().xsmall().child(
+                    ProgressCircle::new("usage-ring-progress")
+                        .size(px(USAGE_RING_SIZE))
+                        .color(color)
+                        .value(percent as f32),
+                ),
+            )
+            .content(move |_, _, cx| usage_card(report.as_ref(), cx))
+    }
+}
+
+fn render_model_picker(label: String, picker: Entity<ModelPicker>, cx: &App) -> impl IntoElement {
+    let search = picker.read(cx).search_focus(cx);
+    Popover::new("model")
+        .anchor(Anchor::BottomRight)
+        .track_focus(&search)
+        .trigger(Button::new("model-button").ghost().xsmall().label(label))
+        .content(move |_, _, cx| {
+            let popover = cx.entity().downgrade();
+            picker.update(cx, |picker, _| picker.shown_in(popover));
+            picker.clone()
+        })
+}
+
+fn usage_card(report: Option<&UsageReport>, cx: &App) -> gpui_kit::AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let note = |text: String| {
+        div()
+            .text_sm()
+            .text_color(muted)
+            .child(text)
+            .into_any_element()
+    };
+    let (plan, rows): (Option<String>, Vec<gpui_kit::AnyElement>) = match report {
+        None => (
+            None,
+            vec![
+                h_flex()
+                    .gap_2()
+                    .child(Spinner::new().xsmall())
+                    .child(note("Loading…".into()))
+                    .into_any_element(),
+            ],
+        ),
+        Some(UsageReport::Unsupported) => (
+            None,
+            vec![note("This provider does not report usage limits.".into())],
+        ),
+        Some(UsageReport::Failed(e)) => (None, vec![note(e.clone())]),
+        Some(UsageReport::Ready(usage)) if usage.limits.is_empty() => {
+            (usage.plan.clone(), vec![note("No limits reported.".into())])
+        }
+        Some(UsageReport::Ready(usage)) => {
+            let now = now_epoch();
+            let rows = usage
+                .limits
+                .iter()
+                .enumerate()
+                .map(|(i, limit)| {
+                    let percent = limit.percentage.unwrap_or(0);
+                    let detail = [
+                        limit.reset_at.and_then(|at| resets_in(now, at)),
+                        limit.detail.clone(),
+                        limit.percentage.map(|p| format!("{p}%")),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                    v_flex()
+                        .gap_1p5()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_3()
+                                .child(div().text_sm().child(limit.label.clone()))
+                                .child(div().text_xs().text_color(muted).child(detail)),
+                        )
+                        .child(
+                            Progress::new(("usage-limit", i))
+                                .value(percent as f32)
+                                .color(match percent {
+                                    p if p >= USAGE_DANGER_PERCENT => cx.theme().danger,
+                                    p if p >= USAGE_WARNING_PERCENT => cx.theme().warning,
+                                    _ => cx.theme().primary,
+                                }),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            (usage.plan.clone(), rows)
+        }
+    };
+    let title = match plan {
+        Some(plan) => format!("Usage limits · {plan}"),
+        None => "Usage limits".to_owned(),
+    };
+    v_flex()
+        .w(px(USAGE_CARD_WIDTH))
+        .gap_3()
+        .child(div().text_sm().text_color(muted).child(title))
+        .children(rows)
+        .into_any_element()
+}
+
+fn tightest_limit(report: &UsageReport) -> Option<u32> {
+    match report {
+        UsageReport::Ready(usage) => usage.limits.iter().filter_map(|l| l.percentage).max(),
+        UsageReport::Unsupported | UsageReport::Failed(_) => None,
+    }
+}
+
+/// "Resets in 2h 50m", or `None` once `reset_at_ms` has passed.
+fn resets_in(now: u64, reset_at_ms: u64) -> Option<String> {
+    let left = (reset_at_ms / MILLIS_PER_SECOND).checked_sub(now)?;
+    let (days, hours, minutes) = (
+        left / SECONDS_PER_DAY,
+        left % SECONDS_PER_DAY / SECONDS_PER_HOUR,
+        left % SECONDS_PER_HOUR / SECONDS_PER_MINUTE,
+    );
+    Some(match (days, hours) {
+        (0, 0) => format!("Resets in {minutes}m"),
+        (0, _) => format!("Resets in {hours}h {minutes}m"),
+        _ => format!("Resets in {days}d {hours}h"),
+    })
+}
+
+fn compact_tokens(tokens: u32) -> String {
+    const THOUSAND: u32 = 1_000;
+    const MILLION: u32 = 1_000_000;
+    match tokens {
+        t if t >= MILLION && t % MILLION == 0 => format!("{}M", t / MILLION),
+        t if t >= MILLION => format!("{:.1}M", f64::from(t) / f64::from(MILLION)),
+        t if t >= THOUSAND => format!("{}k", t / THOUSAND),
+        t => t.to_string(),
+    }
+}
+
+fn thinking_choices() -> impl Iterator<Item = StoredThinking> {
+    [StoredThinking::Off, StoredThinking::Adaptive]
+        .into_iter()
+        .chain(Effort::ALL.map(|level| StoredThinking::Effort { level }))
+}
+
+fn thinking_label(thinking: StoredThinking) -> String {
+    match thinking {
+        StoredThinking::Off => "Thinking off".into(),
+        StoredThinking::Adaptive => "Auto".into(),
+        StoredThinking::Effort { level } => match level {
+            Effort::Minimal => "Minimal",
+            Effort::Low => "Low",
+            Effort::Medium => "Medium",
+            Effort::High => "High",
+            Effort::XHigh => "Extra high",
+            Effort::Max => "Max",
+        }
+        .into(),
+        StoredThinking::Budget { tokens } => format!("{} thinking", compact_tokens(tokens)),
     }
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ease_scroll(window);
         v_flex()
             .size_full()
             .key_context(KEY_CONTEXT)
@@ -2157,6 +2684,78 @@ fn title_of(title: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Turn {
+    index: usize,
+    reply: Option<usize>,
+}
+
+impl Turn {
+    /// The prompt's first line and the start of the reply. Built on hover
+    /// only, not on every frame the rail is drawn.
+    fn texts(self, items: &[Item]) -> (SharedString, SharedString) {
+        let prompt = match items.get(self.index) {
+            Some(Item::User { text, .. }) => text.lines().next().unwrap_or_default().to_owned(),
+            _ => String::new(),
+        };
+        let reply = match self.reply.and_then(|i| items.get(i)) {
+            Some(Item::Assistant(text)) => preview(text, TURN_PREVIEW_LINES),
+            _ => String::new(),
+        };
+        (prompt.into(), reply.into())
+    }
+}
+
+/// Each user message, with the first reply under it.
+fn turns(items: &[Item]) -> Vec<Turn> {
+    let mut turns: Vec<Turn> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            Item::User { .. } => turns.push(Turn { index, reply: None }),
+            Item::Assistant(_) => {
+                if let Some(turn) = turns.last_mut().filter(|t| t.reply.is_none()) {
+                    turn.reply = Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+fn fade_in<E: gpui_kit::Styled + IntoElement + 'static>(
+    element: E,
+    id: impl Into<gpui_kit::ElementId>,
+) -> impl IntoElement {
+    element.with_animation(
+        id,
+        Animation::new(FADE_IN).with_easing(ease_out_quint()),
+        |element, delta| element.opacity(delta).mt(px((1. - delta) * RISE_IN)),
+    )
+}
+
+fn turn_card(prompt: &SharedString, reply: &SharedString, cx: &App) -> gpui_kit::AnyElement {
+    v_flex()
+        .w(px(TURN_CARD_WIDTH))
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
+                .truncate()
+                .child(prompt.clone()),
+        )
+        .when(!reply.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(reply.clone()),
+            )
+        })
+        .into_any_element()
+}
+
 fn preview(text: &str, lines: usize) -> String {
     let mut out: String = text.lines().take(lines).collect::<Vec<_>>().join("\n");
     if text.lines().nth(lines).is_some() {
@@ -2243,6 +2842,7 @@ enum PaletteAction {
     Trust,
     Insert(String),
     Model(String),
+    Thinking(StoredThinking),
     Lua(String),
 }
 
@@ -2483,5 +3083,59 @@ mod tests {
     #[test_case(2 * 86_400, "2d" ; "days")]
     fn ages_are_compact(elapsed: u64, expected: &str) {
         assert_eq!(short_ago(1_000_000, 1_000_000 - elapsed), expected);
+    }
+
+    #[test_case(999, "999" ; "small")]
+    #[test_case(12_345, "12k" ; "thousands")]
+    #[test_case(1_000_000, "1M" ; "round_million")]
+    #[test_case(1_500_000, "1.5M" ; "fractional_million")]
+    fn token_counts_are_compact(tokens: u32, expected: &str) {
+        assert_eq!(compact_tokens(tokens), expected);
+    }
+
+    #[test_case(5 * 60, Some("Resets in 5m") ; "minutes")]
+    #[test_case(2 * 3_600 + 50 * 60, Some("Resets in 2h 50m") ; "hours")]
+    #[test_case(3 * 86_400 + 4 * 3_600, Some("Resets in 3d 4h") ; "days")]
+    fn reset_times_are_relative(left: u64, expected: Option<&str>) {
+        let now = 1_000_000;
+        assert_eq!(resets_in(now, (now + left) * 1_000).as_deref(), expected);
+    }
+
+    #[test]
+    fn turns_pair_each_prompt_with_its_first_reply() {
+        let user = |text: &str| Item::User {
+            text: text.into(),
+            images: Vec::new(),
+        };
+        let items = [
+            user(
+                "fix the bug
+in detail",
+            ),
+            Item::Assistant("Done.".into()),
+            Item::Assistant("Anything else?".into()),
+            user("thanks"),
+        ];
+        let turns = turns(&items);
+        assert_eq!(
+            turns,
+            [
+                Turn {
+                    index: 0,
+                    reply: Some(1)
+                },
+                Turn {
+                    index: 3,
+                    reply: None
+                }
+            ]
+        );
+        let (prompt, reply) = turns[0].texts(&items);
+        assert_eq!((prompt.as_ref(), reply.as_ref()), ("fix the bug", "Done."));
+    }
+
+    #[test]
+    fn past_reset_is_hidden() {
+        assert_eq!(resets_in(1_000_000, 1_000), None);
     }
 }

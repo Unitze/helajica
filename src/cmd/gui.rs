@@ -25,15 +25,15 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode};
 use maki_config::{ModelPolicy, SessionDefaults, load_env_files};
-use maki_gui::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update};
+use maki_gui::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update, UsageReport};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_lua::{GuiMessage, Interaction};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, from_model};
 use maki_providers::{ProviderEvent, RequestOptions, Timeouts, adapt_images_for_model};
 use maki_storage::StateDir;
-use maki_storage::id::SessionRef;
-use maki_storage::sessions::SessionSummary;
+use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::sessions::{SessionClaim, SessionSummary, StoredThinking};
 use maki_ui::AppSession;
 use maki_ui::app::btw::{BTW_FALLBACK_SYSTEM, btw_question};
 use serde_json::Value;
@@ -75,6 +75,7 @@ struct Flags {
 }
 
 struct Running {
+    session_id: String,
     commands: WeakSender<Command>,
     thread: JoinHandle<()>,
 }
@@ -122,7 +123,10 @@ impl MakiEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(Running { commands, thread }) = running {
+        if let Some(Running {
+            commands, thread, ..
+        }) = running
+        {
             if let Some(commands) = commands.upgrade() {
                 let _ = commands.send(Command::Close);
             }
@@ -156,6 +160,7 @@ impl Engine for MakiEngine {
             .recv()
             .map_err(|_| eyre!("session thread exited before starting"))??;
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
+            session_id: session.boot.session_id.clone(),
             commands: session.commands.downgrade(),
             thread,
         });
@@ -164,6 +169,25 @@ impl Engine for MakiEngine {
 
     fn sessions(&self, project: &Path) -> Vec<SessionSummary> {
         AppSession::list(&project.to_string_lossy(), &self.storage).unwrap_or_default()
+    }
+
+    fn delete_session(&self, id: &str) -> Result<()> {
+        let parsed: MakiId = id
+            .parse()
+            .map_err(|e| eyre!("invalid session id {id:?}: {e}"))?;
+        let open = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|r| r.session_id == id);
+        if open {
+            self.close_running();
+        }
+        // Claiming refuses a session another maki is writing, rather than
+        // unlinking the file it keeps appending to.
+        let claim = SessionClaim::acquire(parsed, &self.storage).context("claim session")?;
+        AppSession::delete(&claim, &self.storage).context("delete session")
     }
 
     fn trust(&self, project: &Path) -> Result<()> {
@@ -299,6 +323,12 @@ fn run_project(
         session_id: session_id.clone(),
         model: startup_model.spec(),
         models: available_model_specs(&model_policy),
+        context_window: startup_model.context_window,
+        thinking: stack
+            .config
+            .session_defaults
+            .thinking
+            .unwrap_or(StoredThinking::Off),
         tools: handle.tool_names.clone(),
         warnings,
         history,
@@ -378,7 +408,7 @@ fn serve(
     commands: &Receiver<Command>,
     handle: &InteractiveHandle,
     slash_commands: &[CustomCommand],
-    defaults: SessionDefaults,
+    mut defaults: SessionDefaults,
     model_policy: &ModelPolicy,
     cwd: &Path,
     plan: &AtomicBool,
@@ -428,6 +458,13 @@ fn serve(
                         updates,
                     ))
                     .detach();
+                }
+            }
+            Command::Thinking(thinking) => defaults.thinking = Some(thinking),
+            Command::Usage => {
+                if let Some(updates) = aside.updates.clone() {
+                    smol::spawn(report_usage(aside.model.clone(), aside.timeouts, updates))
+                        .detach();
                 }
             }
             Command::Model(spec) => match Model::from_spec_with_policy(&spec, model_policy) {
@@ -505,6 +542,20 @@ async fn answer_aside(
         Ok(_) => BtwEvent::Done,
         Err(e) => BtwEvent::Failed(e.to_string()),
     });
+}
+
+async fn report_usage(mut model: Model, timeouts: Timeouts, updates: WeakSender<Update>) {
+    let report = match from_model(&mut model, timeouts) {
+        Err(e) => UsageReport::Failed(e.to_string()),
+        Ok(provider) => match provider.fetch_usage().await {
+            Ok(Some(usage)) => UsageReport::Ready(usage),
+            Ok(None) => UsageReport::Unsupported,
+            Err(e) => UsageReport::Failed(e.user_message()),
+        },
+    };
+    if let Some(updates) = updates.upgrade() {
+        let _ = updates.send(Update::Usage(report));
+    }
 }
 
 /// Snapshots are terminal cells baked for the TUI; the window has nothing to

@@ -8,8 +8,8 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, StyledExt as _, TitleBar, h_flex};
 use gpui_kit::{
-    AnyElement, App, ParentElement as _, SharedString, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, App, InteractiveElement as _, MouseButton, ParentElement as _, SharedString,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::app::toggle_dark;
@@ -59,6 +59,11 @@ pub fn title_bar(
             h_flex()
                 .gap_1()
                 .pr_2()
+                // The bar under these is a window drag area, and the title
+                // bar starts a window move on a press it sees: without both,
+                // a click here becomes a grab of the window.
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .children(notice)
                 .child(
                     Button::new("titlebar-theme")

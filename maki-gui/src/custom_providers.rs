@@ -2,14 +2,20 @@
 //! `providers.toml` and a key in maki's credential store, so the terminal
 //! `maki` sees the same providers.
 
+use std::time::Duration;
+
+use isahc::config::Configurable as _;
+use isahc::{ReadResponseExt as _, Request, RequestExt as _};
 use maki_config::providers::{
     ModelDef, ModelTier, Protocol, ProvidersConfig, builtin_provider, slugify,
 };
+use maki_providers::catalog_providers;
 use maki_storage::StateDir;
 use maki_storage::auth::{
     ProviderCredentials, delete_provider_credentials, load_provider_credentials,
     save_provider_credentials,
 };
+use serde_json::Value;
 
 pub const PROTOCOLS: [(Protocol, &str); 4] = [
     (Protocol::Openai, "OpenAI-compatible"),
@@ -20,7 +26,29 @@ pub const PROTOCOLS: [(Protocol, &str); 4] = [
 const SECURE_SCHEME: &str = "https://";
 const PLAIN_SCHEME: &str = "http://";
 const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
-const MODEL_SEPARATORS: [char; 2] = [',', '\n'];
+const MODELS_PATH: &str = "/models";
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+const ERROR_BODY_CHARS: usize = 200;
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const GOOGLE_MODEL_PREFIX: &str = "models/";
+/// Where `/models` listings put a model's context window, by API.
+const CONTEXT_FIELDS: [&str; 6] = [
+    "context_length",
+    "context_window",
+    "max_context_length",
+    "max_model_len",
+    "max_input_tokens",
+    "inputTokenLimit",
+];
+const THOUSAND: f64 = 1_000.;
+const MILLION: f64 = 1_000_000.;
+
+/// A model of a provider, with the context window maki should assume for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModel {
+    pub id: String,
+    pub context_window: Option<u32>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Connected {
@@ -28,7 +56,7 @@ pub struct Connected {
     pub name: String,
     pub protocol: Protocol,
     pub base_url: String,
-    pub models: Vec<String>,
+    pub models: Vec<ProviderModel>,
     pub has_key: bool,
 }
 
@@ -38,9 +66,8 @@ pub struct Draft {
     pub protocol: Option<Protocol>,
     pub base_url: String,
     pub api_key: String,
-    /// Model ids separated by commas or lines. Empty asks the provider's
-    /// model list instead.
-    pub models: String,
+    /// Empty asks the provider's model list instead.
+    pub models: Vec<ProviderModel>,
 }
 
 pub fn protocol_label(protocol: Protocol) -> &'static str {
@@ -61,7 +88,14 @@ pub fn list(storage: Option<&StateDir>) -> Vec<Connected> {
                 name: def.display_name.clone().unwrap_or_else(|| slug.clone()),
                 protocol: def.protocol?,
                 base_url: def.base_url.clone().unwrap_or_default(),
-                models: def.models.iter().map(|m| m.id.clone()).collect(),
+                models: def
+                    .models
+                    .iter()
+                    .map(|m| ProviderModel {
+                        id: m.id.clone(),
+                        context_window: m.context_window,
+                    })
+                    .collect(),
                 has_key: def.api_key.is_some()
                     || storage.is_some_and(|s| load_provider_credentials(s, &slug).is_some()),
                 slug,
@@ -76,15 +110,27 @@ pub fn list(storage: Option<&StateDir>) -> Vec<Connected> {
 /// model list keeps what was saved before.
 pub fn connect(draft: &Draft, storage: Option<&StateDir>) -> Result<String, String> {
     let (slug, protocol, base_url) = validate(draft)?;
-    let models = parse_models(&draft.models);
     let mut config = ProvidersConfig::load_or_default();
     let mut def = config.get(&slug).cloned().unwrap_or_default();
     def.display_name = Some(draft.name.trim().to_owned());
     def.protocol = Some(protocol);
     def.base_url = Some(base_url);
-    if !models.is_empty() {
-        def.default_model = Some(format!("{slug}/{}", models[0]));
-        def.models = models.into_iter().map(model).collect();
+    if let Some(first) = draft.models.first() {
+        def.default_model = Some(format!("{slug}/{}", first.id));
+        let saved = std::mem::take(&mut def.models);
+        def.models = draft
+            .models
+            .iter()
+            .map(|wanted| {
+                let mut def = saved
+                    .iter()
+                    .find(|m| m.id == wanted.id)
+                    .cloned()
+                    .unwrap_or_else(|| model(wanted.id.clone()));
+                def.context_window = wanted.context_window;
+                def
+            })
+            .collect();
     }
     def.discover_models = def.models.is_empty();
     let key = draft.api_key.trim();
@@ -117,6 +163,103 @@ pub fn disconnect(slug: &str, storage: Option<&StateDir>) -> Result<(), String> 
     Ok(())
 }
 
+/// Asks the provider's `/models` for what it serves, with the context window
+/// it reports or, failing that, the one models.dev knows.
+pub fn fetch_models(
+    draft: &Draft,
+    storage: Option<&StateDir>,
+) -> Result<Vec<ProviderModel>, String> {
+    let (slug, protocol, base_url) = validate(draft)?;
+    let key = Some(draft.api_key.trim().to_owned())
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            storage
+                .and_then(|s| load_provider_credentials(s, &slug))
+                .map(|c| c.api_key)
+        });
+    let mut request = Request::get(format!("{base_url}{MODELS_PATH}")).timeout(FETCH_TIMEOUT);
+    if let Some(key) = &key {
+        request = match protocol {
+            Protocol::Anthropic => request
+                .header("x-api-key", key)
+                .header("anthropic-version", ANTHROPIC_VERSION),
+            Protocol::Google => request.header("x-goog-api-key", key),
+            _ => request.header("authorization", format!("Bearer {key}")),
+        };
+    }
+    let mut response = request
+        .body(())
+        .map_err(|e| e.to_string())?
+        .send()
+        .map_err(|e| format!("Could not reach {base_url}: {e}"))?;
+    let text = response.text().map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        let excerpt: String = text.chars().take(ERROR_BODY_CHARS).collect();
+        return Err(format!(
+            "{MODELS_PATH} answered {}: {excerpt}",
+            response.status()
+        ));
+    }
+    let listing: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{MODELS_PATH} is not JSON: {e}"))?;
+    let mut models = parse_listing(&listing);
+    if models.iter().any(|m| m.context_window.is_none()) {
+        let catalog = catalog_providers();
+        for model in models.iter_mut().filter(|m| m.context_window.is_none()) {
+            model.context_window = catalog
+                .iter()
+                .find_map(|p| p.models.get(&model.id).and_then(|meta| meta.context));
+        }
+    }
+    Ok(models)
+}
+
+/// OpenAI-style `{"data": [...]}` (Anthropic too) or Gemini's
+/// `{"models": [...]}`, sorted by id.
+fn parse_listing(listing: &Value) -> Vec<ProviderModel> {
+    let rows = listing["data"]
+        .as_array()
+        .or_else(|| listing["models"].as_array())
+        .or_else(|| listing.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut models: Vec<ProviderModel> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = row["id"].as_str().or_else(|| {
+                row["name"]
+                    .as_str()
+                    .map(|n| n.strip_prefix(GOOGLE_MODEL_PREFIX).unwrap_or(n))
+            })?;
+            let context_window = CONTEXT_FIELDS
+                .iter()
+                .find_map(|field| row[*field].as_u64())
+                .and_then(|n| u32::try_from(n).ok());
+            Some(ProviderModel {
+                id: id.to_owned(),
+                context_window,
+            })
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    models
+}
+
+/// `128000`, `128k` or `1M`.
+pub fn parse_tokens(text: &str) -> Option<u32> {
+    let text = text.trim().to_lowercase();
+    let (number, scale) = match text.strip_suffix('k') {
+        Some(n) => (n, THOUSAND),
+        None => match text.strip_suffix('m') {
+            Some(n) => (n, MILLION),
+            None => (text.as_str(), 1.),
+        },
+    };
+    let value = number.trim().parse::<f64>().ok()? * scale;
+    (value >= 1. && value <= f64::from(u32::MAX)).then_some(value.round() as u32)
+}
+
 fn validate(draft: &Draft) -> Result<(String, Protocol, String), String> {
     let slug = slugify(&draft.name);
     if slug.is_empty() {
@@ -145,14 +288,6 @@ fn allowed_url(url: &str) -> bool {
                 .is_some_and(|tail| tail.is_empty() || tail.starts_with([':', '/']))
         })
     })
-}
-
-fn parse_models(text: &str) -> Vec<String> {
-    text.split(MODEL_SEPARATORS)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 fn model(id: String) -> ModelDef {
@@ -222,11 +357,27 @@ mod tests {
         assert!(allowed_url(url));
     }
 
-    #[test]
-    fn reads_models_from_commas_and_lines() {
-        assert_eq!(
-            parse_models(" fast-v1, smart-v1\n\nlocal "),
-            ["fast-v1", "smart-v1", "local"]
-        );
+    #[test_case("128000", Some(128_000) ; "plain")]
+    #[test_case("128k", Some(128_000) ; "thousands")]
+    #[test_case(" 1M ", Some(1_000_000) ; "millions")]
+    #[test_case("1.5m", Some(1_500_000) ; "fractional")]
+    #[test_case("", None ; "blank")]
+    #[test_case("lots", None ; "words")]
+    #[test_case("0", None ; "zero")]
+    fn token_counts_parse(text: &str, expected: Option<u32>) {
+        assert_eq!(parse_tokens(text), expected);
+    }
+
+    #[test_case(r#"{"data":[{"id":"b","context_length":8192},{"id":"a"}]}"#, &[("a", None), ("b", Some(8192))] ; "openai")]
+    #[test_case(r#"{"data":[{"id":"claude","max_input_tokens":200000}]}"#, &[("claude", Some(200_000))] ; "anthropic")]
+    #[test_case(r#"{"models":[{"name":"models/gemini","inputTokenLimit":1048576}]}"#, &[("gemini", Some(1_048_576))] ; "gemini")]
+    #[test_case(r#"{"error":"nope"}"#, &[] ; "not_a_listing")]
+    fn listings_parse(json: &str, expected: &[(&str, Option<u32>)]) {
+        let models = parse_listing(&serde_json::from_str(json).unwrap());
+        let got: Vec<(&str, Option<u32>)> = models
+            .iter()
+            .map(|m| (m.id.as_str(), m.context_window))
+            .collect();
+        assert_eq!(got, expected);
     }
 }

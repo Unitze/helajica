@@ -13,6 +13,7 @@ mod custom_providers;
 pub mod engine;
 mod ext;
 mod goal;
+mod model_picker;
 mod new_project;
 mod nodes;
 mod projects;
@@ -29,7 +30,7 @@ use std::sync::Arc;
 use gpui_kit::component::TitleBar;
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 
-pub use engine::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update};
+pub use engine::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update, UsageReport};
 
 const WINDOW_WIDTH: f32 = 1240.;
 const WINDOW_HEIGHT: f32 = 820.;

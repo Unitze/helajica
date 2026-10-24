@@ -17,6 +17,9 @@ pub struct Settings {
     /// Add-ons switched on or off, by id. One missing here takes its default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub addons: BTreeMap<String, bool>,
+    /// The thinking level picked by the composer, as maki's `/thinking` takes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl Settings {
@@ -43,6 +46,7 @@ mod tests {
 
     const THEME: &str = "Ayu Light";
     const ADDON: &str = "openai-oauth";
+    const THINKING: &str = "high";
 
     #[test]
     fn round_trips_through_disk() {
@@ -51,6 +55,7 @@ mod tests {
             dark: true,
             theme: Some(THEME.into()),
             addons: BTreeMap::from([(ADDON.into(), true)]),
+            thinking: Some(THINKING.into()),
         };
         settings.save(Some(dir.path()));
         assert_eq!(Settings::load(Some(dir.path())), settings);
