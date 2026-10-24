@@ -13,10 +13,14 @@ use maki_storage::sessions::{SessionSummary, StoredThinking};
 use serde_json::Value;
 
 pub trait Engine: Send + Sync + 'static {
-    /// Builds the project's stack and starts a session in it, closing any
-    /// session still open: the agent reads the process cwd, so one project
-    /// runs at a time. Blocks while plugins load.
+    /// Starts a session in `project`, fresh or `resume`. Sessions of one
+    /// project run side by side on one stack; opening another project closes
+    /// them all, as the agent reads the process cwd. Blocks while plugins load.
     fn open(&self, project: &Path, resume: Option<String>) -> Result<Session>;
+
+    /// Closes every session and drops the stack, so the next
+    /// [`Engine::open`] builds it again with changed providers or plugins.
+    fn reload(&self);
 
     fn sessions(&self, project: &Path) -> Vec<SessionSummary>;
 
@@ -115,7 +119,9 @@ pub enum Command {
     Usage,
     /// Turns yolo on or off: tools stop (or start) asking for permission.
     Yolo(bool),
-    /// Ends the session. The engine sends it itself before opening another.
+    /// This session is the one on screen: `maki.gui.emit` reaches it.
+    Focus,
+    /// Ends the session. The engine sends it itself when closing a project.
     Close,
 }
 

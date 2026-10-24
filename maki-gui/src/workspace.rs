@@ -3,6 +3,7 @@
 //! plugins add around them.
 
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -114,6 +115,7 @@ const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline, / 
 const THUMB_SIZE: f32 = 56.;
 const COMPOSER_THUMB_SIZE: f32 = 140.;
 const REPLY_IMAGE_HEIGHT: f32 = 420.;
+const SESSION_DOT_SIZE: f32 = 6.;
 const PALETTE_HEIGHT: f32 = 360.;
 const FILE_CHIP_WIDTH: f32 = 220.;
 const MESSAGE_THUMB_SIZE: f32 = 200.;
@@ -162,6 +164,8 @@ pub struct WorkspaceView {
     unfolded: HashSet<PathBuf>,
     sessions: HashMap<PathBuf, Vec<SessionSummary>>,
     phase: Phase,
+    /// Sessions of the project switched away from, still running, by id.
+    parked: HashMap<String, Parked>,
     transcript: Transcript,
     ext: Extensions,
     composer: Entity<TextareaState>,
@@ -248,6 +252,7 @@ impl WorkspaceView {
             unfolded: HashSet::new(),
             sessions: HashMap::new(),
             phase: Phase::Idle,
+            parked: HashMap::new(),
             transcript: Transcript::default(),
             ext: Extensions::default(),
             composer,
@@ -405,12 +410,166 @@ impl WorkspaceView {
             );
             return cx.notify();
         }
+        if self.project.as_ref() != Some(&project) && self.busy() {
+            return self.confirm_switch(project, resume, window, cx);
+        }
+        self.switch_project(project, resume, window, cx);
+    }
+
+    fn switch_project(
+        &mut self,
+        project: PathBuf,
+        resume: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.page = None;
         self.store.touch(&project, now_epoch());
         self.unfolded.insert(project.clone());
         self.refresh_sessions(&project);
+        let same = self.project.as_ref() == Some(&project);
+        if !same {
+            self.drop_sessions();
+        }
         self.project = Some(project);
-        self.start(resume, window, cx);
+        match resume {
+            Some(id) if same && self.current_session() == Some(id.as_str()) => cx.notify(),
+            Some(id) if self.parked.contains_key(&id) => self.unpark(&id, window, cx),
+            resume => self.start(resume, false, window, cx),
+        }
+    }
+
+    /// Whether any session of the open project is running.
+    fn busy(&self) -> bool {
+        self.transcript.working || self.parked.values().any(|p| p.transcript.working)
+    }
+
+    /// Ends every session of the open project: they share its stack.
+    fn drop_sessions(&mut self) {
+        self.parked.clear();
+        self._session = None;
+        self.phase = Phase::Idle;
+    }
+
+    fn confirm_switch(
+        &mut self,
+        project: PathBuf,
+        resume: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.entity().downgrade();
+        let from = self.project_name().unwrap_or_default();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let workspace = workspace.clone();
+            let project = project.clone();
+            let resume = resume.clone();
+            dialog
+                .title("Stop running sessions?")
+                .w(px(DELETE_DIALOG_WIDTH))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Sessions in \u{201c}{from}\u{201d} are still working. \
+                             Only one project runs at a time, so opening another stops them."
+                        )),
+                )
+                .footer(
+                    DialogFooter::new().children([
+                        Button::new("cancel-switch")
+                            .label("Cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                        Button::new("confirm-switch")
+                            .danger()
+                            .label("Stop and switch")
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let (project, resume) = (project.clone(), resume.clone());
+                                let _ = workspace.update(cx, |this, cx| {
+                                    this.switch_project(project, resume, window, cx)
+                                });
+                            }),
+                    ]),
+                )
+        });
+    }
+
+    /// Moves the session on screen aside, still running. A fresh one with
+    /// nothing in it is dropped instead, which ends it.
+    fn park(&mut self) {
+        let phase = mem::replace(&mut self.phase, Phase::Idle);
+        let (Phase::Ready { boot, commands }, Some(task)) = (phase, self._session.take()) else {
+            return;
+        };
+        if self.transcript.items.is_empty() && !self.transcript.working {
+            return;
+        }
+        self.thumbs.clear();
+        self.parked.insert(
+            boot.session_id.clone(),
+            Parked {
+                boot,
+                commands,
+                transcript: mem::take(&mut self.transcript),
+                ext: mem::take(&mut self.ext),
+                aside: self.aside.take(),
+                goal: self.goal.take(),
+                usage: self.usage.take(),
+                model_picker: self.model_picker.take(),
+                expanded: mem::take(&mut self.expanded),
+                pending: Vec::new(),
+                run_ended: None,
+                _task: task,
+            },
+        );
+    }
+
+    /// Brings a parked session back on screen, with what it waited to show.
+    fn unpark(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parked) = self.parked.remove(id) else {
+            return;
+        };
+        self.park();
+        let Parked {
+            boot,
+            commands,
+            transcript,
+            ext,
+            aside,
+            goal,
+            usage,
+            model_picker,
+            expanded,
+            pending,
+            run_ended,
+            _task,
+        } = parked;
+        self.transcript = transcript;
+        self.ext = ext;
+        self.aside = aside;
+        self.goal = goal;
+        self.usage = usage;
+        self.model_picker = model_picker;
+        self.expanded = expanded;
+        self.thinking = self.saved_thinking(&boot.model);
+        let _ = commands.send(Command::Focus);
+        let _ = commands.send(Command::Yolo(self.mode == Mode::Bypass));
+        self.phase = Phase::Ready { boot, commands };
+        self._session = Some(_task);
+        self.refresh_thumbs();
+        self.list.reset(0);
+        self.animate_from = self.transcript.items.len();
+        self.scroll_to_end();
+        if let Some(cancelled) = run_ended {
+            self.after_run(cancelled, window, cx);
+        }
+        for update in pending {
+            self.receive(update, window, cx);
+        }
+        self.composer.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
     }
 
     fn refresh_sessions(&mut self, project: &Path) {
@@ -484,6 +643,11 @@ impl WorkspaceView {
     ) {
         let current =
             self.project.as_deref() == Some(project) && self.current_session() == Some(id);
+        if current {
+            self._session = None;
+            self.phase = Phase::Idle;
+        }
+        self.parked.remove(id);
         if let Err(e) = self.engine.delete_session(id) {
             window.push_notification(
                 Notification::new()
@@ -494,7 +658,7 @@ impl WorkspaceView {
         }
         self.refresh_sessions(project);
         if current {
-            self.start(None, window, cx);
+            self.start(None, false, window, cx);
         }
         cx.notify();
     }
@@ -505,8 +669,7 @@ impl WorkspaceView {
         self.sessions.remove(project);
         if self.project.as_deref() == Some(project) {
             self.project = None;
-            self.phase = Phase::Idle;
-            self._session = None;
+            self.drop_sessions();
             self.transcript = Transcript::default();
             self.ext = Extensions::default();
             window.refresh();
@@ -547,13 +710,23 @@ impl WorkspaceView {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// Opens a session in the current project, a fresh one or `resume`.
-    /// Dropping the previous task drops its command sender, which is what
-    /// ends the old session.
-    fn start(&mut self, resume: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a session in the current project, a fresh one or `resume`, and
+    /// parks the one on screen. `reload` first rebuilds the project's stack,
+    /// which ends every session in it.
+    fn start(
+        &mut self,
+        resume: Option<String>,
+        reload: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project) = self.project.clone() else {
             return;
         };
+        match reload {
+            true => self.drop_sessions(),
+            false => self.park(),
+        }
         self.phase = Phase::Loading;
         self.transcript = Transcript::default();
         self.thumbs.clear();
@@ -571,7 +744,12 @@ impl WorkspaceView {
             let opened = cx
                 .background_spawn({
                     let project = project.clone();
-                    async move { engine.open(&project, resume) }
+                    async move {
+                        if reload {
+                            engine.reload();
+                        }
+                        engine.open(&project, resume)
+                    }
                 })
                 .await;
             let session = match opened {
@@ -585,6 +763,7 @@ impl WorkspaceView {
                 }
             };
             let updates = session.updates;
+            let session_id = session.boot.session_id.clone();
             let _ = this.update_in(cx, |this, window, cx| {
                 this.transcript = Transcript::from_history(&session.boot.history);
                 this.refresh_thumbs();
@@ -614,28 +793,50 @@ impl WorkspaceView {
                 cx.notify();
             });
             while let Ok(update) = updates.recv_async().await {
-                if Self::deliver(&this, update, cx).is_err() {
+                if Self::deliver(&this, &session_id, update, cx).is_err() {
                     return;
                 }
             }
         }));
     }
 
+    /// To the session on screen, or else the parked one it belongs to.
     fn deliver(
         this: &WeakEntity<Self>,
+        session: &str,
         update: Update,
         cx: &mut AsyncWindowContext,
     ) -> gpui_kit::Result<()> {
-        this.update_in(cx, |this, window, cx| match update {
-            Update::Agent(envelope) => this.on_agent(&envelope, window, cx),
-            Update::Lua { topic, data } => this.on_lua(&topic, data, window, cx),
-            Update::Question { input } => this.ask(&input, window, cx),
-            Update::Btw(event) => this.on_aside(event, cx),
+        this.update_in(cx, |this, window, cx| {
+            if this.current_session() == Some(session) {
+                return this.receive(update, window, cx);
+            }
+            let Some(parked) = this.parked.get_mut(session) else {
+                return;
+            };
+            if parked.receive(update) {
+                if let Some(project) = this.project.clone() {
+                    this.refresh_sessions(&project);
+                }
+                if this.reload_pending && !this.busy() {
+                    this.reload_session(window, cx);
+                }
+            }
+            cx.notify();
+        })
+    }
+
+    fn receive(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
+        match update {
+            Update::Agent(envelope) => self.on_agent(&envelope, window, cx),
+            Update::Lua { topic, data } => self.on_lua(&topic, data, window, cx),
+            Update::Question { input } => self.ask(&input, window, cx),
+            Update::Btw(event) => self.on_aside(event, cx),
             Update::Usage(report) => {
-                this.usage = Some(report);
+                self.usage = Some(report);
                 cx.notify();
             }
-        })
+        }
     }
 
     fn model_picker(
@@ -726,7 +927,7 @@ impl WorkspaceView {
     /// A run of the main agent ended: carry a goal on, and reopen the session
     /// if providers changed while it ran.
     fn after_run(&mut self, cancelled: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.reload_pending {
+        if self.reload_pending && !self.busy() {
             return self.reload_session(window, cx);
         }
         let Some(goal) = &mut self.goal else {
@@ -786,14 +987,14 @@ impl WorkspaceView {
     fn reload_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_pending = false;
         let resume = self.current_session().map(str::to_owned);
-        self.start(resume, window, cx);
+        self.start(resume, true, window, cx);
     }
 
     fn providers_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.phase, Phase::Ready { .. }) {
             return;
         }
-        match self.transcript.working {
+        match self.busy() {
             true => self.reload_pending = true,
             false => self.reload_session(window, cx),
         }
@@ -1351,7 +1552,7 @@ impl WorkspaceView {
             PaletteAction::ToggleDark => toggle_dark(self.gui_dir.as_deref(), window, cx),
             PaletteAction::Mode(mode) => self.set_mode(mode),
             PaletteAction::Trust => match self.project.clone().map(|p| self.engine.trust(&p)) {
-                Some(Ok(())) => self.start(None, window, cx),
+                Some(Ok(())) => self.start(None, true, window, cx),
                 Some(Err(e)) => self.transcript.notice(format!("{e:#}"), Level::Error),
                 None => {}
             },
@@ -1528,6 +1729,12 @@ impl WorkspaceView {
         for session in sessions {
             let id = session.id.to_string();
             let active = current && self.current_session() == Some(id.as_str());
+            let parked = self.parked.get(&id).filter(|_| current);
+            let waiting = parked.is_some_and(|p| !p.pending.is_empty());
+            let working = match active {
+                true => self.transcript.working,
+                false => parked.is_some_and(|p| p.transcript.working),
+            };
             let project = path.to_path_buf();
             let resume = id.clone();
             let doomed = (path.to_path_buf(), id.clone(), title_of(&session.title));
@@ -1557,6 +1764,18 @@ impl WorkspaceView {
                             .truncate()
                             .child(title_of(&session.title)),
                     )
+                    .when(waiting, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .size(px(SESSION_DOT_SIZE))
+                                .rounded_full()
+                                .bg(cx.theme().warning),
+                        )
+                    })
+                    .when(working && !waiting, |row| {
+                        row.child(Spinner::new().xsmall())
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -2061,12 +2280,9 @@ impl WorkspaceView {
                         .text_color(cx.theme().danger)
                         .child(error.clone()),
                 )
-                .child(
-                    Button::new("retry")
-                        .outline()
-                        .label("Try again")
-                        .on_click(cx.listener(|this, _, window, cx| this.start(None, window, cx))),
-                )
+                .child(Button::new("retry").outline().label("Try again").on_click(
+                    cx.listener(|this, _, window, cx| this.start(None, true, window, cx)),
+                ))
                 .into_any_element(),
             Phase::Ready { boot, .. } => {
                 let empty = self.transcript.items.is_empty();
@@ -3374,6 +3590,63 @@ fn preview(text: &str, lines: usize) -> String {
 }
 
 /// A `/btw` side question and its answer as it streams in.
+/// A session switched away from: it keeps running, and its updates land
+/// here until it is on screen again.
+struct Parked {
+    boot: Boot,
+    commands: Sender<Command>,
+    transcript: Transcript,
+    ext: Extensions,
+    aside: Option<Aside>,
+    goal: Option<Goal>,
+    usage: Option<UsageReport>,
+    model_picker: Option<Entity<ModelPicker>>,
+    expanded: HashSet<String>,
+    /// What needs the window: permission prompts, questions, panels.
+    pending: Vec<Update>,
+    /// A run that ended out of sight, and whether it was cancelled: a goal
+    /// carries on once the session is back on screen.
+    run_ended: Option<bool>,
+    _task: Task<()>,
+}
+
+impl Parked {
+    /// Takes an update in, holding back what needs the window. `true` when
+    /// a run ended.
+    fn receive(&mut self, update: Update) -> bool {
+        let envelope = match update {
+            Update::Agent(envelope) => envelope,
+            Update::Usage(report) => {
+                self.usage = Some(report);
+                return false;
+            }
+            other => {
+                self.pending.push(other);
+                return false;
+            }
+        };
+        if matches!(envelope.event, AgentEvent::PermissionRequest { .. }) {
+            self.pending.push(Update::Agent(envelope));
+            return false;
+        }
+        self.transcript.apply(&envelope);
+        if envelope.subagent.is_some() {
+            return false;
+        }
+        match &envelope.event {
+            AgentEvent::Done { reason, .. } => {
+                self.run_ended = Some(reason.to_string() == CANCELLED_REASON);
+                true
+            }
+            AgentEvent::Error { .. } => {
+                self.goal = None;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
 struct Aside {
     question: String,
     answer: String,
@@ -3677,9 +3950,77 @@ impl Render for QuestionForm {
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::DoneReason;
+    use maki_providers::TokenUsage;
     use test_case::test_case;
 
     use super::*;
+
+    const REPLY: &str = "done";
+
+    fn parked() -> Parked {
+        let (commands, _) = flume::unbounded();
+        Parked {
+            boot: Boot {
+                session_id: String::new(),
+                model: String::new(),
+                models: Vec::new(),
+                context_window: 0,
+                thinking: StoredThinking::Off,
+                tools: Vec::new(),
+                warnings: Vec::new(),
+                history: Vec::new(),
+                slash_commands: Vec::new(),
+                trusted: true,
+                yolo: false,
+            },
+            commands,
+            transcript: Transcript::default(),
+            ext: Extensions::default(),
+            aside: None,
+            goal: None,
+            usage: None,
+            model_picker: None,
+            expanded: HashSet::new(),
+            pending: Vec::new(),
+            run_ended: None,
+            _task: Task::ready(()),
+        }
+    }
+
+    fn agent(event: AgentEvent) -> Update {
+        Update::Agent(Box::new(maki_agent::Envelope {
+            event,
+            subagent: None,
+            run_id: 0,
+        }))
+    }
+
+    #[test]
+    fn a_parked_session_keeps_its_transcript_and_holds_back_questions() {
+        let mut session = parked();
+        session.receive(agent(AgentEvent::TextDelta { text: REPLY.into() }));
+        session.receive(Update::Question { input: Value::Null });
+        assert!(matches!(&session.transcript.items[..], [Item::Assistant(text)] if text == REPLY));
+        assert!(matches!(&session.pending[..], [Update::Question { .. }]));
+    }
+
+    #[test_case(DoneReason::EndTurn, false ; "finished")]
+    #[test_case(DoneReason::Cancelled, true ; "cancelled")]
+    fn a_parked_run_that_ends_is_remembered(reason: DoneReason, cancelled: bool) {
+        let mut session = parked();
+        let ended = session.receive(agent(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason,
+        }));
+        assert!(ended);
+        assert_eq!(session.run_ended, Some(cancelled));
+    }
 
     #[test_case("anthropic/claude-opus-5-5", "claude-opus-5-5" ; "provider_prefix")]
     #[test_case("local", "local" ; "bare")]

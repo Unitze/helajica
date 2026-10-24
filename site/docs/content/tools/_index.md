@@ -25,6 +25,14 @@ Commands run in the session's working directory (see Environment) by default.
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
+### `bash_stop` {#bash_stop}
+
+Stop a shell started with bash `background` before it exits, and return its last output.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job` | integer | yes | The job id bash returned |
+
 ### `list` {#list}
 
 List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
@@ -226,13 +234,3 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
-
-## Additional tools
-
-### `bash_stop` {#bash_stop}
-
-Stop a shell started with bash `background` before it exits, and return its last output.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `job` | integer | yes | The job id bash returned |

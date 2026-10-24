@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::thread::{self, JoinHandle};
 
 use clap::Parser;
@@ -17,7 +17,7 @@ use maki_agent::agent::live_history;
 use maki_agent::command::CustomCommand;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::TaggedAnswer;
+use maki_agent::permissions::{PluginRuleStore, TaggedAnswer};
 use maki_agent::tools::{LocalTool, QUESTION_TOOL_NAME, ToolAudience, ToolRegistry, local_tool};
 use maki_agent::{
     AgentEvent, AgentInput, AgentMode, Envelope, InputSource, SessionEndReason, UNAVAILABLE_RESULT,
@@ -25,15 +25,15 @@ use maki_agent::{
 };
 use maki_config::project::{self, TrustAnswer, TrustMode};
 use maki_config::{
-    DEFAULT_BUILTINS, ModelPolicy, OPTIONAL_BUILTINS, PROVIDER_BUILTINS, PluginOverlay,
-    SessionDefaults, load_env_files,
+    AgentConfig, DEFAULT_BUILTINS, ModelPolicy, OPTIONAL_BUILTINS, PROVIDER_BUILTINS,
+    PermissionsConfig, PluginOverlay, ProjectConfig, SessionDefaults, load_env_files,
 };
 use maki_gui::{
     Boot, BtwEvent, Command, Engine, PluginInfo, PluginKind, Session, SlashCommand, Update,
     UsageReport,
 };
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
-use maki_lua::{GuiMessage, Interaction};
+use maki_lua::{EventHandle, GuiMessage, Interaction};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, from_model};
 use maki_providers::{ProviderEvent, RequestOptions, Timeouts, adapt_images_for_model};
@@ -45,7 +45,7 @@ use maki_ui::app::btw::{BTW_FALLBACK_SYSTEM, btw_question};
 use serde_json::Value;
 use tracing::warn;
 
-use super::tui::{Launch, build_stack};
+use super::tui::{Launch, Stack, build_stack};
 use crate::cli::Cli;
 use crate::{provider_scripts, resume, setup};
 
@@ -83,10 +83,38 @@ struct Flags {
     yolo: bool,
 }
 
+impl Flags {
+    fn cli(&self, resume: Option<String>) -> Cli {
+        let mut cli = Cli::parse_from([BIN_NAME]);
+        cli.model.clone_from(&self.model);
+        cli.no_plugins = self.no_plugins;
+        cli.no_jit = self.no_jit;
+        cli.no_commands = self.no_commands;
+        cli.yolo = self.yolo;
+        cli.resume = resume;
+        cli
+    }
+}
+
 struct Running {
-    session_id: String,
     commands: WeakSender<Command>,
     thread: JoinHandle<()>,
+}
+
+type RunningSessions = Arc<Mutex<HashMap<String, Running>>>;
+
+/// The project whose stack is built, and the thread that owns it.
+struct Host {
+    project: PathBuf,
+    /// The plugin settings it was built with: a change rebuilds it.
+    overlay: PluginOverlay,
+    requests: Sender<OpenRequest>,
+    thread: JoinHandle<()>,
+}
+
+struct OpenRequest {
+    resume: Option<String>,
+    ready: Sender<Result<Session>>,
 }
 
 struct MakiEngine {
@@ -94,20 +122,23 @@ struct MakiEngine {
     storage: StateDir,
     /// Where the window keeps its settings, the plugin switches among them.
     gui_dir: Option<PathBuf>,
-    running: Mutex<Option<Running>>,
-    /// Where `maki.gui.emit` lands: the open session's update channel.
-    lua_route: Arc<Mutex<Option<Sender<Update>>>>,
+    host: Mutex<Option<Host>>,
+    sessions: RunningSessions,
+    /// Where `maki.gui.emit` lands: the focused session's update channel.
+    lua_route: LuaRoute,
 }
+
+type LuaRoute = Arc<Mutex<Option<Sender<Update>>>>;
 
 impl MakiEngine {
     fn new(cli: &Cli, storage: StateDir, gui_dir: Option<PathBuf>) -> Self {
-        let lua_route: Arc<Mutex<Option<Sender<Update>>>> = Arc::default();
+        let lua_route: LuaRoute = Arc::default();
         let (lua_tx, lua_rx) = flume::unbounded::<GuiMessage>();
         maki_lua::attach_gui(lua_tx);
         let route = Arc::clone(&lua_route);
         thread::spawn(move || {
             for GuiMessage { topic, data } in lua_rx {
-                if let Some(updates) = route.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                if let Some(updates) = lock(&route).as_ref() {
                     let _ = updates.send(Update::Lua { topic, data });
                 }
             }
@@ -122,68 +153,118 @@ impl MakiEngine {
             },
             storage,
             gui_dir,
-            running: Mutex::new(None),
+            host: Mutex::new(None),
+            sessions: RunningSessions::default(),
             lua_route,
         }
     }
 
-    /// The agent reads the process cwd and the tool registry is global, so a
-    /// session must be fully gone before the next one starts building.
-    fn close_running(&self) {
-        let running = self
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(Running {
-            commands, thread, ..
-        }) = running
+    fn close_session(&self, id: &str) {
+        let running = lock(&self.sessions).remove(id);
+        if let Some(running) = running {
+            stop(running);
+        }
+    }
+
+    /// The agent reads the process cwd and the tool registry is global, so
+    /// every session of a project must be gone before another project builds.
+    fn close_host(&self, host: &mut Option<Host>) {
+        let running: Vec<Running> = lock(&self.sessions).drain().map(|(_, r)| r).collect();
+        running.into_iter().for_each(stop);
+        if let Some(Host {
+            requests, thread, ..
+        }) = host.take()
         {
-            if let Some(commands) = commands.upgrade() {
-                let _ = commands.send(Command::Close);
-            }
+            drop(requests);
             if thread.join().is_err() {
-                warn!("gui session thread panicked");
+                warn!("gui project thread panicked");
             }
         }
+    }
+
+    fn start_host(&self, project: &Path, overlay: PluginOverlay) -> Result<Host> {
+        let (built_tx, built_rx) = flume::bounded::<Result<()>>(1);
+        let (requests, requests_rx) = flume::unbounded::<OpenRequest>();
+        let flags = self.flags.clone();
+        let storage = self.storage.clone();
+        let lua_route = Arc::clone(&self.lua_route);
+        let sessions = Arc::clone(&self.sessions);
+        let thread = thread::Builder::new()
+            .name("maki-project".into())
+            .spawn({
+                let project = project.to_path_buf();
+                let overlay = overlay.clone();
+                move || {
+                    host_project(
+                        flags,
+                        storage,
+                        &project,
+                        &overlay,
+                        lua_route,
+                        &sessions,
+                        &built_tx,
+                        &requests_rx,
+                    )
+                }
+            })
+            .context("spawn project thread")?;
+        let built = built_rx
+            .recv()
+            .map_err(|_| eyre!("project thread exited before building"));
+        if let Err(e) = built.and_then(|built| built) {
+            let _ = thread.join();
+            return Err(e);
+        }
+        Ok(Host {
+            project: project.to_path_buf(),
+            overlay,
+            requests,
+            thread,
+        })
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn stop(Running { commands, thread }: Running) {
+    if let Some(commands) = commands.upgrade() {
+        let _ = commands.send(Command::Close);
+    }
+    if thread.join().is_err() {
+        warn!("gui session thread panicked");
     }
 }
 
 impl Engine for MakiEngine {
     fn open(&self, project: &Path, resume: Option<String>) -> Result<Session> {
-        self.close_running();
-        let (ready_tx, ready_rx) = flume::bounded::<Result<Session>>(1);
-        let flags = self.flags.clone();
-        let storage = self.storage.clone();
-        let project = project.to_path_buf();
-        let plugin_overlay = maki_gui::plugin_overlay(self.gui_dir.as_deref());
-        let lua_route = Arc::clone(&self.lua_route);
-        let thread = thread::Builder::new()
-            .name("maki-session".into())
-            .spawn(move || {
-                let fail = ready_tx.clone();
-                if let Err(e) = run_project(
-                    &flags,
-                    &storage,
-                    &project,
-                    resume,
-                    &plugin_overlay,
-                    &lua_route,
-                    ready_tx,
-                ) {
-                    let _ = fail.send(Err(e));
-                }
-            })
-            .context("spawn session thread")?;
-        let session = ready_rx
+        if let Some(id) = &resume {
+            self.close_session(id);
+        }
+        let overlay = maki_gui::plugin_overlay(self.gui_dir.as_deref());
+        let mut host = lock(&self.host);
+        if host
+            .as_ref()
+            .is_some_and(|h| h.project != project || h.overlay != overlay)
+        {
+            self.close_host(&mut host);
+        }
+        if host.is_none() {
+            *host = Some(self.start_host(project, overlay)?);
+        }
+        let (ready, ready_rx) = flume::bounded::<Result<Session>>(1);
+        let requests = &host.as_ref().expect("host started above").requests;
+        requests
+            .send(OpenRequest { resume, ready })
+            .map_err(|_| eyre!("project thread is gone"))?;
+        ready_rx
             .recv()
-            .map_err(|_| eyre!("session thread exited before starting"))??;
-        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
-            session_id: session.boot.session_id.clone(),
-            commands: session.commands.downgrade(),
-            thread,
-        });
-        Ok(session)
+            .map_err(|_| eyre!("session thread exited before starting"))?
+    }
+
+    fn reload(&self) {
+        self.close_host(&mut lock(&self.host));
     }
 
     fn sessions(&self, project: &Path) -> Vec<SessionSummary> {
@@ -194,15 +275,7 @@ impl Engine for MakiEngine {
         let parsed: MakiId = id
             .parse()
             .map_err(|e| eyre!("invalid session id {id:?}: {e}"))?;
-        let open = self
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|r| r.session_id == id);
-        if open {
-            self.close_running();
-        }
+        self.close_session(id);
         // Claiming refuses a session another maki is writing, rather than
         // unlinking the file it keeps appending to.
         let claim = SessionClaim::acquire(parsed, &self.storage).context("claim session")?;
@@ -245,35 +318,108 @@ impl Engine for MakiEngine {
     }
 }
 
-/// Builds the project's stack, hands the session back through `ready`, then
-/// serves it until the window lets go of it.
-fn run_project(
-    flags: &Flags,
-    storage: &StateDir,
+/// What every session of a project shares, taken from its stack.
+#[derive(Clone)]
+struct ProjectBase {
+    flags: Flags,
+    storage: StateDir,
+    cwd: PathBuf,
+    model: Model,
+    agent: AgentConfig,
+    permissions: PermissionsConfig,
+    timeouts: Timeouts,
+    defaults: SessionDefaults,
+    always_yolo: bool,
+    model_policy: Arc<ModelPolicy>,
+    plugin_rules: Arc<PluginRuleStore>,
+    project_config: ProjectConfig,
+    commands: Arc<[CustomCommand]>,
+    lua_handle: EventHandle,
+    trusted: bool,
+    lua_route: LuaRoute,
+}
+
+/// Builds the project's stack, then starts a session on it for every
+/// request, until the engine lets go of the project.
+#[allow(clippy::too_many_arguments)]
+fn host_project(
+    flags: Flags,
+    storage: StateDir,
     project: &Path,
-    resume: Option<String>,
-    plugin_overlay: &PluginOverlay,
-    lua_route: &Mutex<Option<Sender<Update>>>,
-    ready: Sender<Result<Session>>,
-) -> Result<()> {
+    overlay: &PluginOverlay,
+    lua_route: LuaRoute,
+    sessions: &RunningSessions,
+    built: &Sender<Result<()>>,
+    requests: &Receiver<OpenRequest>,
+) {
+    let (stack, warnings, base) = match build_project(flags, storage, project, overlay, lua_route) {
+        Ok(built) => built,
+        Err(e) => {
+            let _ = built.send(Err(e));
+            return;
+        }
+    };
+    let _ = built.send(Ok(()));
+    // The stack's warnings are said once, in the first session.
+    let mut warnings = Some(warnings);
+    for OpenRequest { resume, ready } in requests.iter() {
+        let base = base.clone();
+        let warnings = warnings.take().unwrap_or_default();
+        let (started_tx, started_rx) = flume::bounded::<Result<Session>>(1);
+        let spawned = thread::Builder::new()
+            .name("maki-session".into())
+            .spawn(move || {
+                let fail = started_tx.clone();
+                if let Err(e) = serve_session(&base, resume, warnings, started_tx) {
+                    let _ = fail.send(Err(e));
+                }
+            });
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(e) => {
+                let _ = ready.send(Err(eyre!("spawn session thread: {e}")));
+                continue;
+            }
+        };
+        let started = started_rx
+            .recv()
+            .unwrap_or_else(|_| Err(eyre!("session thread exited before starting")));
+        if let Ok(session) = &started {
+            let mut sessions = lock(sessions);
+            sessions.retain(|_, running| !running.thread.is_finished());
+            sessions.insert(
+                session.boot.session_id.clone(),
+                Running {
+                    commands: session.commands.downgrade(),
+                    thread,
+                },
+            );
+        }
+        let _ = ready.send(started);
+    }
+    let mut stack = stack;
+    stack.plugin_host.begin_shutdown();
+    ToolRegistry::global().clear_lua();
+}
+
+fn build_project(
+    flags: Flags,
+    storage: StateDir,
+    project: &Path,
+    overlay: &PluginOverlay,
+    lua_route: LuaRoute,
+) -> Result<(Stack, Vec<String>, ProjectBase)> {
     env::set_current_dir(project).with_context(|| format!("enter {}", project.display()))?;
     let cwd = env::current_dir().unwrap_or_else(|_| project.to_path_buf());
-    let mut cli = Cli::parse_from([BIN_NAME]);
-    cli.model.clone_from(&flags.model);
-    cli.no_plugins = flags.no_plugins;
-    cli.no_jit = flags.no_jit;
-    cli.no_commands = flags.no_commands;
-    cli.yolo = flags.yolo;
-    cli.resume = resume;
-
-    let trust = project::resolve(storage, &cwd, TrustMode::Consult);
+    let cli = flags.cli(None);
+    let trust = project::resolve(&storage, &cwd, TrustMode::Consult);
     load_env_files(&trust.project_config);
     let launch = Launch {
         cli: &cli,
         cwd: &cwd,
-        storage,
+        storage: &storage,
         interaction: Interaction::None,
-        plugin_overlay,
+        plugin_overlay: overlay,
     };
     let (stack, mut warnings) = build_stack(&launch, &trust, None)?;
     warnings.extend(trust.state.restricted_warning());
@@ -283,44 +429,72 @@ fn run_project(
         setup::init_telemetry(&stack.config.telemetry);
         setup::install_panic_log_hook();
     });
+    let base = ProjectBase {
+        flags,
+        storage,
+        cwd,
+        model: stack.model.clone(),
+        agent: stack.config.agent.clone(),
+        permissions: stack.config.permissions.clone(),
+        timeouts: stack.timeouts(),
+        defaults: stack.config.session_defaults,
+        always_yolo: stack.config.always_yolo,
+        model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+        plugin_rules: stack.plugin_host.plugin_rules(),
+        project_config: trust.project_config.clone(),
+        commands: stack.commands.clone().into(),
+        lua_handle: stack.plugin_host.event_handle(),
+        trusted: trust.state.restricted_warning().is_none(),
+        lua_route,
+    };
+    Ok((stack, warnings, base))
+}
 
+/// Starts one session on the project's stack, hands it back through
+/// `ready`, then serves it until the window lets go of it.
+fn serve_session(
+    base: &ProjectBase,
+    resume: Option<String>,
+    warnings: Vec<String>,
+    ready: Sender<Result<Session>>,
+) -> Result<()> {
+    let cli = base.flags.cli(resume);
+    let cwd = &base.cwd;
     let cwd_str = cwd.to_string_lossy().into_owned();
-    let resolved = resume::resolve(&cli, &cwd_str, storage)?;
+    let resolved = resume::resolve(&cli, &cwd_str, &base.storage)?;
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
     let (resumed, claim) = resolved.into_resumed();
     let history = resumed.history.clone();
 
     let (mcp_handle, mcp_errors) =
-        smol::block_on(mcp::start_connected(&cwd, trust.project_config.clone()));
+        smol::block_on(mcp::start_connected(cwd, base.project_config.clone()));
+    let mut warnings = warnings;
     if !mcp_errors.is_empty() {
         warnings.push(format!("MCP config error: {mcp_errors}"));
     }
 
     let (updates_tx, updates_rx) = flume::unbounded::<Update>();
     let (commands_tx, commands_rx) = flume::unbounded::<Command>();
-    let model_policy = Arc::new(stack.config.provider.model_policy.clone());
-    let timeouts = stack.timeouts();
-    let lua_handle = stack.plugin_host.event_handle();
-    let startup_model = stack.model.clone();
+    let lua_handle = &base.lua_handle;
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
-        model: stack.model.clone(),
-        config: stack.config.agent.clone(),
-        permissions_config: stack.config.permissions.clone(),
-        timeouts,
+        model: base.model.clone(),
+        config: base.agent.clone(),
+        permissions_config: base.permissions.clone(),
+        timeouts: base.timeouts,
         prompt_slots: Arc::new(lua_handle.collect_prompt_slots()),
         excluded_tools: Vec::new(),
         mcp_handle,
         initial_wd: cwd.clone(),
         resumed,
         claim,
-        storage: storage.clone(),
-        yolo: cli.yolo || stack.config.always_yolo,
+        storage: base.storage.clone(),
+        yolo: cli.yolo || base.always_yolo,
         system_prompt_override: None,
         append_system_prompt: None,
-        defaults: stack.config.session_defaults,
-        model_policy: Arc::clone(&model_policy),
-        plugin_rules: stack.plugin_host.plugin_rules(),
-        project_config: trust.project_config.clone(),
+        defaults: base.defaults,
+        model_policy: Arc::clone(&base.model_policy),
+        plugin_rules: Arc::clone(&base.plugin_rules),
+        project_config: base.project_config.clone(),
         local_tools: Arc::new(HashMap::from([(
             QUESTION_TOOL_NAME.to_owned(),
             question_tool(updates_tx.downgrade()),
@@ -329,20 +503,30 @@ fn run_project(
 
     let plan = Arc::new(AtomicBool::new(false));
     let snapshot = HeadlessSnapshot::default();
-    let snapshot_plan = Arc::clone(&plan);
-    snapshot.install(
-        &lua_handle,
-        HeadlessMeta {
-            id: handle.session_id.to_string(),
-            cwd: cwd_str,
-            model: startup_model.spec(),
-        },
-        move || match snapshot_plan.load(Ordering::Relaxed) {
-            true => MODE_PLAN,
-            false => MODE_BUILD,
-        },
-    );
     let session_id = handle.session_id.to_string();
+    let focus = {
+        let snapshot = snapshot.clone();
+        let plan = Arc::clone(&plan);
+        let meta = HeadlessMeta {
+            id: session_id.clone(),
+            cwd: cwd_str,
+            model: base.model.spec(),
+        };
+        let updates = updates_tx.clone();
+        let route = Arc::clone(&base.lua_route);
+        let lua_handle = lua_handle.clone();
+        move || {
+            let plan = Arc::clone(&plan);
+            snapshot.install(&lua_handle, meta.clone(), move || {
+                match plan.load(Ordering::Relaxed) {
+                    true => MODE_PLAN,
+                    false => MODE_BUILD,
+                }
+            });
+            *lock(&route) = Some(updates.clone());
+        }
+    };
+    focus();
     let pump = smol::spawn({
         let updates = updates_tx.clone();
         let lua_handle = lua_handle.clone();
@@ -364,22 +548,16 @@ fn run_project(
         }
     });
 
-    *lua_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(updates_tx.clone());
-    drop(updates_tx);
     let boot = Boot {
-        session_id: session_id.clone(),
-        model: startup_model.spec(),
-        models: available_model_specs(&model_policy),
-        context_window: startup_model.context_window,
-        thinking: stack
-            .config
-            .session_defaults
-            .thinking
-            .unwrap_or(StoredThinking::Off),
+        session_id,
+        model: base.model.spec(),
+        models: available_model_specs(&base.model_policy),
+        context_window: base.model.context_window,
+        thinking: base.defaults.thinking.unwrap_or(StoredThinking::Off),
         tools: handle.tool_names.clone(),
         warnings,
         history,
-        slash_commands: stack
+        slash_commands: base
             .commands
             .iter()
             .map(|c| SlashCommand {
@@ -387,18 +565,14 @@ fn run_project(
                 description: c.description.clone(),
             })
             .collect(),
-        trusted: trust.state.restricted_warning().is_none(),
+        trusted: base.trusted,
         yolo: handle.permissions.is_yolo(),
     };
     let aside = Aside {
-        model: startup_model,
-        timeouts,
+        model: base.model.clone(),
+        timeouts: base.timeouts,
         session: handle.session_id.clone(),
-        updates: lua_route
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(Sender::downgrade),
+        updates: Some(updates_tx.downgrade()),
     };
     let sent = ready.send(Ok(Session {
         boot,
@@ -409,16 +583,23 @@ fn run_project(
         serve(
             &commands_rx,
             &handle,
-            &stack.commands,
-            stack.config.session_defaults,
-            &model_policy,
-            &cwd,
+            &base.commands,
+            base.defaults,
+            &base.model_policy,
+            cwd,
             &plan,
             aside,
+            focus,
         );
     }
 
-    *lua_route.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    {
+        let mut route = lock(&base.lua_route);
+        if route.as_ref().is_some_and(|r| r.same_channel(&updates_tx)) {
+            *route = None;
+        }
+    }
+    drop(updates_tx);
     let InteractiveHandle {
         input_tx,
         cancel_tx,
@@ -433,10 +614,6 @@ fn run_project(
         headless::await_shutdown(task).await;
     });
     lua_handle.end_sessions_blocking([session_ref.id()], SessionEndReason::Completed);
-    let mut stack = stack;
-    stack.plugin_host.begin_shutdown();
-    ToolRegistry::global().clear_lua();
-    drop(stack);
     Ok(())
 }
 
@@ -460,6 +637,7 @@ fn serve(
     cwd: &Path,
     plan: &AtomicBool,
     mut aside: Aside,
+    focus: impl Fn(),
 ) {
     for command in commands.iter() {
         match command {
@@ -526,6 +704,7 @@ fn serve(
                     handle.permissions.toggle_yolo();
                 }
             }
+            Command::Focus => focus(),
             Command::Close => return,
         }
     }

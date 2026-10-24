@@ -638,7 +638,7 @@ impl RawConfig {
 
 /// Plugins switched on or off, and options set, by something other than a
 /// config file, such as the desktop app. See [`RawConfig::overlay_plugins`].
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PluginOverlay {
     pub switches: BTreeMap<String, bool>,
     pub options: BTreeMap<String, JsonMap<String, JsonValue>>,

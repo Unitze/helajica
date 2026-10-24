@@ -62,6 +62,7 @@ pub struct SessionQueueSnapshot {
 }
 
 /// What a headless driver knows about its session before it runs.
+#[derive(Clone)]
 pub struct HeadlessMeta {
     pub id: String,
     pub cwd: String,

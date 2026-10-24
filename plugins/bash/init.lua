@@ -353,10 +353,12 @@ maki.api.register_tool({
       workdir = { type = "string", description = "Working directory (default: cwd)" },
       tail = { type = "integer", description = "Return only the last N lines" },
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
-      background = opts.allow_background and {
-        type = "boolean",
-        description = "Run without waiting, for servers, watchers and long builds or tests. Returns a job id at once; its exit code and last output arrive later in a notice.",
-      } or nil,
+      background = opts.allow_background
+          and {
+            type = "boolean",
+            description = "Run without waiting, for servers, watchers and long builds or tests. Returns a job id at once; its exit code and last output arrive later in a notice.",
+          }
+        or nil,
     },
   },
   permission = "run",
