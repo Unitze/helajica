@@ -5,13 +5,19 @@ use std::fmt::Write as _;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use maki_agent::types::TodoItem;
 use maki_agent::{AgentEvent, Envelope, ToolOutput};
 use maki_providers::{ContentBlock, ImageSource, Message, MessageKind, Role, TokenUsage};
+use serde::Deserialize as _;
 use serde_json::Value;
 use similar::TextDiff;
 
 const DIFF_CONTEXT_LINES: usize = 3;
 const CANCELLED: &str = "Cancelled";
+const TODO_TOOL: &str = "todo_write";
+/// How a tool result that returned an image is captioned in the history.
+const IMAGE_CAPTION_PREFIX: &str = "[image: ";
+const TODOS_FIELD: &str = "todos";
 const TEXT_BLOCK_SEPARATOR: &str = "\n";
 /// Input fields that say what a call was pointed at, most telling first.
 const TARGET_FIELDS: [&str; 8] = [
@@ -43,6 +49,8 @@ pub struct ToolCall {
     /// When it ran, for calls seen live; a resumed session has no times.
     pub started: Option<Instant>,
     pub finished: Option<Instant>,
+    /// The picture a call read, such as a screenshot it looked at.
+    pub image: Option<ImageSource>,
 }
 
 impl ToolCall {
@@ -98,6 +106,8 @@ pub struct Totals {
 pub struct Transcript {
     pub items: Vec<Item>,
     pub working: bool,
+    /// When the agent last started working, for the live status line.
+    pub turn_started: Option<Instant>,
     pub totals: Totals,
 }
 
@@ -122,6 +132,13 @@ impl Transcript {
     }
 
     fn push_message(&mut self, message: &Message) {
+        let results = message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+        if results {
+            return self.push_results(message);
+        }
         if message.role == Role::User {
             let images: Vec<ImageSource> = message
                 .content
@@ -131,17 +148,10 @@ impl Transcript {
                     _ => None,
                 })
                 .collect();
-            let text = message.display_text.clone().unwrap_or_else(|| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(TEXT_BLOCK_SEPARATOR)
-            });
+            let text = message
+                .display_text
+                .clone()
+                .unwrap_or_else(|| joined_text(message));
             if !text.is_empty() || !images.is_empty() {
                 self.items.push(Item::User { text, images });
             }
@@ -168,26 +178,71 @@ impl Transcript {
                     status: ToolStatus::Done,
                     started: None,
                     finished: None,
+                    image: None,
                 })),
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    ..
-                } => {
-                    if let Some(call) = self.tool_mut(tool_use_id) {
-                        call.output = content.clone();
-                        call.status = status(*is_error);
-                    }
-                }
                 _ => {}
             }
         }
     }
 
+    /// Tool results carry the pictures they returned after all of them, in
+    /// the order of the results captioned as images.
+    fn push_results(&mut self, message: &Message) {
+        let mut images = message.content.iter().filter_map(|block| match block {
+            ContentBlock::Image { source } => Some(source),
+            _ => None,
+        });
+        for block in &message.content {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            let image = content
+                .starts_with(IMAGE_CAPTION_PREFIX)
+                .then(|| images.next().cloned())
+                .flatten();
+            if let Some(call) = self.tool_mut(tool_use_id) {
+                call.output = content.clone();
+                call.status = status(*is_error);
+                call.image = image;
+            }
+        }
+        let text = joined_text(message);
+        if !text.is_empty() {
+            self.items.push(Item::User {
+                text,
+                images: Vec::new(),
+            });
+        }
+    }
+
     pub fn push_user(&mut self, text: String, images: Vec<ImageSource>) {
         self.items.push(Item::User { text, images });
+        self.begin_turn();
+    }
+
+    pub fn begin_turn(&mut self) {
         self.working = true;
+        self.turn_started = Some(Instant::now());
+    }
+
+    /// The list the agent's latest `todo_write` set since the user last spoke.
+    pub fn todos(&self) -> Vec<TodoItem> {
+        self.items
+            .iter()
+            .rev()
+            .take_while(|item| !matches!(item, Item::User { .. }))
+            .find_map(|item| match item {
+                Item::Tool(call) if call.name == TODO_TOOL => call.input.as_ref(),
+                _ => None,
+            })
+            .and_then(|input| Vec::<TodoItem>::deserialize(&input[TODOS_FIELD]).ok())
+            .unwrap_or_default()
     }
 
     pub fn notice(&mut self, text: impl Into<String>, level: Level) {
@@ -221,6 +276,9 @@ impl Transcript {
                 call.name = done.tool.to_string();
                 call.output = output_text(&done.output);
                 call.status = status(done.is_error);
+                if let ToolOutput::Image { source, .. } = done.output.as_ref() {
+                    call.image = Some(source.clone());
+                }
                 call.finished = Some(Instant::now());
             }),
             AgentEvent::TurnComplete(turn) => {
@@ -308,6 +366,7 @@ impl Transcript {
             status: ToolStatus::Running,
             started: Some(Instant::now()),
             finished: None,
+            image: None,
         };
         update(&mut call);
         self.items.push(Item::Tool(call));
@@ -408,6 +467,18 @@ fn add_usage(total: &mut TokenUsage, add: &TokenUsage) {
     total.cache_creation += add.cache_creation;
 }
 
+fn joined_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(TEXT_BLOCK_SEPARATOR)
+}
+
 pub fn output_text(output: &ToolOutput) -> String {
     match output {
         ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text) => {
@@ -439,6 +510,7 @@ pub fn output_text(output: &ToolOutput) -> String {
         ToolOutput::WriteCode {
             path, byte_count, ..
         } => format!("Wrote {byte_count} bytes to {path}"),
+        ToolOutput::Image { text, .. } => text.clone(),
         ToolOutput::TodoList(items) => items.iter().fold(String::new(), |mut out, item| {
             let _ = writeln!(out, "{} {}", item.status.marker(), item.content);
             out
@@ -460,12 +532,21 @@ mod tests {
     use std::sync::Arc;
 
     use maki_agent::ToolDoneEvent;
+    use maki_providers::ImageMediaType;
     use test_case::test_case;
 
     use super::*;
 
     const TOOL_ID: &str = "t1";
     const TOOL_NAME: &str = "bash";
+    const OTHER_TOOL_ID: &str = "t2";
+    const PIXELS: &str = "aGVsbG8=";
+    const TEXT_RESULT: &str = "ok";
+    const IMAGE_RESULT: &str = "[image: shot.png 1KB]";
+    const NO_USER_ITEM: &str = "tool results are not a user message";
+    const ONE_TODO: &str = r#"[{"content":"a","status":"pending"}]"#;
+    const TWO_TODOS: &str =
+        r#"[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]"#;
 
     fn envelope(event: AgentEvent) -> Envelope {
         Envelope {
@@ -523,6 +604,7 @@ mod tests {
             status: ToolStatus::Done,
             started: None,
             finished: None,
+            image: None,
         })
     }
 
@@ -538,6 +620,72 @@ mod tests {
         call.summary = summary.into();
         call.input = input.map(|json| serde_json::from_str(json).unwrap());
         assert_eq!(call.target(), expected);
+    }
+
+    fn todo_call(list: &str) -> Item {
+        let Item::Tool(mut call) = tool() else {
+            unreachable!()
+        };
+        call.name = TODO_TOOL.into();
+        call.input =
+            Some(serde_json::json!({ TODOS_FIELD: serde_json::from_str::<Value>(list).unwrap() }));
+        Item::Tool(call)
+    }
+
+    #[test_case(&[], 0 ; "no_list")]
+    #[test_case(&[ONE_TODO], 1 ; "one_list")]
+    #[test_case(&[ONE_TODO, TWO_TODOS], 2 ; "the_latest_list_wins")]
+    fn todos_come_from_the_latest_todo_write(lists: &[&str], expected: usize) {
+        let mut transcript = Transcript::default();
+        transcript.push_user(String::new(), Vec::new());
+        transcript
+            .items
+            .extend(lists.iter().map(|list| todo_call(list)));
+        assert_eq!(transcript.todos().len(), expected);
+    }
+
+    #[test]
+    fn a_new_prompt_clears_the_todos() {
+        let mut transcript = Transcript::default();
+        transcript.items.push(todo_call(ONE_TODO));
+        transcript.push_user(String::new(), Vec::new());
+        assert!(transcript.todos().is_empty());
+    }
+
+    #[test]
+    fn a_resumed_image_result_keeps_its_picture_on_the_call() {
+        let pixels = ImageSource::new(ImageMediaType::Png, PIXELS.into());
+        let history = [
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::tool_use(TOOL_ID, TOOL_NAME, Value::Null),
+                    ContentBlock::tool_use(OTHER_TOOL_ID, TOOL_NAME, Value::Null),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::tool_result(OTHER_TOOL_ID, TEXT_RESULT, false),
+                    ContentBlock::tool_result(TOOL_ID, IMAGE_RESULT, false),
+                    ContentBlock::Image {
+                        source: pixels.clone(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ];
+        let transcript = Transcript::from_history(&history);
+        let images: Vec<_> = transcript
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Tool(call) => call.image.as_ref().map(|image| image.data.clone()),
+                _ => panic!("{NO_USER_ITEM}"),
+            })
+            .collect();
+        assert_eq!(images, [Some(pixels.data), None]);
     }
 
     #[test_case(0, None ; "a_reply_is_no_step")]

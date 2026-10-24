@@ -1,5 +1,6 @@
 //! The projects in the sidebar: folders the user opened or created,
-//! most recent first, persisted next to the rest of the GUI config.
+//! in the order they were added unless the user drags them elsewhere,
+//! persisted next to the rest of the GUI config.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,11 +51,30 @@ impl ProjectStore {
         &self.projects
     }
 
-    /// Moves `path` to the front, adding it if new.
+    /// Records that `path` was opened, adding it at the end if new. Opening
+    /// never moves a project: only [`Self::reorder`] does.
     pub fn touch(&mut self, path: &Path, now: u64) {
-        self.projects.retain(|p| p.path != path);
+        match self.projects.iter_mut().find(|p| p.path == path) {
+            Some(project) => project.last_opened = now,
+            None => self.projects.push(Project::new(path.to_path_buf(), now)),
+        }
+        self.save();
+    }
+
+    /// The project opened most recently, which is where the app starts.
+    pub fn last_opened(&self) -> Option<&Project> {
         self.projects
-            .insert(0, Project::new(path.to_path_buf(), now));
+            .iter()
+            .filter(|p| p.path.is_dir())
+            .max_by_key(|p| p.last_opened)
+    }
+
+    pub fn reorder(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.projects.len() || to >= self.projects.len() {
+            return;
+        }
+        let project = self.projects.remove(from);
+        self.projects.insert(to, project);
         self.save();
     }
 
@@ -77,26 +97,42 @@ impl ProjectStore {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
-    const FIRST: &str = "alpha";
-    const SECOND: &str = "beta";
+    const NAMES: [&str; 3] = ["alpha", "beta", "gamma"];
+
+    fn names(store: &ProjectStore) -> Vec<&str> {
+        store.projects().iter().map(|p| p.name.as_str()).collect()
+    }
+
+    fn store_with_all(dir: &Path) -> ProjectStore {
+        let mut store = ProjectStore::load(Some(dir));
+        for (opened, name) in NAMES.iter().enumerate() {
+            store.touch(&dir.join(name), opened as u64);
+        }
+        store
+    }
 
     #[test]
-    fn touch_moves_to_front_and_persists() {
+    fn opening_keeps_the_order_projects_were_added_in() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = ProjectStore::load(Some(dir.path()));
-        store.touch(&dir.path().join(FIRST), 1);
-        store.touch(&dir.path().join(SECOND), 2);
-        store.touch(&dir.path().join(FIRST), 3);
+        let mut store = store_with_all(dir.path());
+        store.touch(&dir.path().join(NAMES[0]), 10);
 
         let reloaded = ProjectStore::load(Some(dir.path()));
-        let names: Vec<_> = reloaded
-            .projects()
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect();
-        assert_eq!(names, [FIRST, SECOND]);
-        assert_eq!(reloaded.projects()[0].last_opened, 3);
+        assert_eq!(names(&reloaded), NAMES);
+        assert_eq!(reloaded.projects()[0].last_opened, 10);
+    }
+
+    #[test_case(0, 2, ["beta", "gamma", "alpha"] ; "down_to_the_end")]
+    #[test_case(2, 0, ["gamma", "alpha", "beta"] ; "up_to_the_top")]
+    #[test_case(1, 1, NAMES ; "onto_itself")]
+    #[test_case(0, 5, NAMES ; "out_of_range")]
+    fn reorder_moves_one_project_and_persists(from: usize, to: usize, expected: [&str; 3]) {
+        let dir = tempfile::tempdir().unwrap();
+        store_with_all(dir.path()).reorder(from, to);
+        assert_eq!(names(&ProjectStore::load(Some(dir.path()))), expected);
     }
 }

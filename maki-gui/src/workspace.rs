@@ -33,10 +33,11 @@ use gpui_kit::{
     ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
     Task, WeakEntity, Window, actions, div, ease_out_quint, img, list, prelude::FluentBuilder as _,
-    px,
+    px, rgb,
 };
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
+use maki_agent::types::{TodoItem, TodoStatus};
 use maki_storage::now_epoch;
 use maki_storage::sessions::{Effort, SessionSummary, StoredThinking};
 use serde_json::Value;
@@ -72,6 +73,15 @@ const TOOL_PREVIEW_LINES: usize = 12;
 /// Lines the step card sits in from its header, past the status icon.
 const STEP_INDENT: f32 = 22.;
 const THOUGHT_LABEL: &str = "Thought";
+/// The `dots` spinner from sindresorhus/cli-spinners.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+const SPINNER_COLOR: u32 = 0xd97757;
+const THINKING_ACTIVITY: &str = "Thinking…";
+const WRITING_ACTIVITY: &str = "Writing…";
+const WORKING_ACTIVITY: &str = "Working…";
+/// In `expanded`, this key marks the todo card as folded: it starts open.
+const TODOS_FOLDED_KEY: &str = "todos-folded";
 const THINKING_PREVIEW_LINES: usize = 3;
 const LIST_OVERDRAW: f32 = 800.;
 const TURN_TICK_WIDTH: f32 = 10.;
@@ -100,8 +110,10 @@ const MENU_HEIGHT: f32 = 360.;
 const UNTITLED: &str = "Untitled session";
 const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline, / for commands";
 const THUMB_SIZE: f32 = 56.;
+const COMPOSER_THUMB_SIZE: f32 = 120.;
 const FILE_CHIP_WIDTH: f32 = 220.;
 const MESSAGE_THUMB_SIZE: f32 = 120.;
+const STEP_THUMB_SIZE: f32 = 28.;
 const SUGGESTION_KEYS: [&str; 5] = ["up", "down", "tab", "enter", "escape"];
 const PASTE_KEY: &str = "v";
 const ATTACH_PROMPT: &str = "Attach";
@@ -213,13 +225,7 @@ impl WorkspaceView {
         let thinking = Settings::load(gui_dir.as_deref())
             .thinking
             .and_then(|t| StoredThinking::parse_setting(&t).ok());
-        let initial = project.or_else(|| {
-            store
-                .projects()
-                .iter()
-                .map(|p| p.path.clone())
-                .find(|p| p.is_dir())
-        });
+        let initial = project.or_else(|| store.last_opened().map(|p| p.path.clone()));
         let list = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW));
         let mut this = Self {
             engine,
@@ -642,20 +648,32 @@ impl WorkspaceView {
         self.send(Command::Thinking(thinking));
     }
 
-    /// Decodes the images of user messages not drawn yet.
     fn refresh_thumbs(&mut self) {
-        for (index, item) in self.transcript.items.iter().enumerate() {
-            if let Item::User { images, .. } = item
-                && !images.is_empty()
-                && !self.thumbs.contains_key(&index)
-            {
-                let thumbs = images
-                    .iter()
-                    .filter_map(Attachment::from_source)
-                    .map(|a| a.image)
-                    .collect();
-                self.thumbs.insert(index, thumbs);
+        for index in 0..self.transcript.items.len() {
+            self.refresh_thumb(index);
+        }
+    }
+
+    /// Decodes the pictures of one item, a prompt's or what a tool read, once:
+    /// drawing straight from base64 would decode them every frame.
+    fn refresh_thumb(&mut self, index: usize) {
+        if self.thumbs.contains_key(&index) {
+            return;
+        }
+        let thumbs: Vec<_> = match &self.transcript.items[index] {
+            Item::User { images, .. } => {
+                images.iter().filter_map(Attachment::from_source).collect()
             }
+            Item::Tool(call) => call
+                .image
+                .iter()
+                .filter_map(Attachment::from_source)
+                .collect(),
+            _ => return,
+        };
+        if !thumbs.is_empty() {
+            self.thumbs
+                .insert(index, thumbs.into_iter().map(|a| a.image).collect());
         }
     }
 
@@ -702,7 +720,7 @@ impl WorkspaceView {
             Next::Continue(prompt) => {
                 let note = format!("Goal: continuing (run {} of {})", goal.runs, goal::MAX_RUNS);
                 self.transcript.notice(note, Level::Info);
-                self.transcript.working = true;
+                self.transcript.begin_turn();
                 self.send(Command::Prompt {
                     text: prompt,
                     plan: self.mode == Mode::Plan,
@@ -916,6 +934,7 @@ impl WorkspaceView {
             Change::None => {}
             Change::Appended => cx.notify(),
             Change::Updated(index) => {
+                self.refresh_thumb(index);
                 self.list.remeasure_items(index..index + 1);
                 cx.notify();
             }
@@ -1439,6 +1458,10 @@ impl WorkspaceView {
         let toggle = path.to_path_buf();
         let fresh = path.to_path_buf();
         let forget = path.to_path_buf();
+        let dragged = ProjectDrag {
+            index,
+            name: name.to_owned().into(),
+        };
         let group = SharedString::from(format!("project-row-{index}"));
         let mut rows = Vec::with_capacity(sessions.len().max(1));
         if open && sessions.is_empty() {
@@ -1525,6 +1548,12 @@ impl WorkspaceView {
                     .cursor_pointer()
                     .text_sm()
                     .hover(|style| style.bg(cx.theme().sidebar_accent))
+                    .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                    .drag_over::<ProjectDrag>(|style, _, _, cx| style.bg(cx.theme().sidebar_accent))
+                    .on_drop(cx.listener(move |this, dragged: &ProjectDrag, _, cx| {
+                        this.store.reorder(dragged.index, index);
+                        cx.notify();
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_project(&toggle, cx)))
                     .child(
                         Icon::new(match open {
@@ -1817,6 +1846,13 @@ impl WorkspaceView {
                         })
                         .xsmall()
                         .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(div().flex_1())
+                    .children(
+                        run.clone()
+                            .filter_map(|i| self.thumbs.get(&i))
+                            .flatten()
+                            .map(|image| thumbnail(image, STEP_THUMB_SIZE, cx)),
                     ),
             )
             .children(row)
@@ -1903,6 +1939,25 @@ impl WorkspaceView {
                         .xsmall()
                         .text_color(cx.theme().muted_foreground),
                     ),
+            )
+            .when_some(
+                open.then(|| self.thumbs.get(&index)).flatten(),
+                |this, thumbs| {
+                    this.child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .px_3()
+                            .py_2()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .children(
+                                thumbs
+                                    .iter()
+                                    .map(|image| thumbnail(image, MESSAGE_THUMB_SIZE, cx)),
+                            ),
+                    )
+                },
             )
             .children(body)
     }
@@ -2032,6 +2087,7 @@ impl WorkspaceView {
             && self.attachments.is_empty()
             && self.files.is_empty();
         let suggestions = self.suggestions(cx);
+        let todos = self.transcript.todos();
         div().px_6().pb_3().child(
             v_flex()
                 .w(px(TRANSCRIPT_WIDTH))
@@ -2043,6 +2099,10 @@ impl WorkspaceView {
                         div().child(self.render_aside(aside, cx)),
                         "aside-in",
                     ))
+                })
+                .when(working, |this| this.child(self.render_activity(cx)))
+                .when(!todos.is_empty(), |this| {
+                    this.child(self.render_todos(&todos, cx))
                 })
                 .child(
                     div()
@@ -2117,6 +2177,121 @@ impl WorkspaceView {
         )
     }
 
+    /// What the agent is doing right now, from the newest thing in the turn.
+    fn activity(&self) -> String {
+        let mut turn = self
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .take_while(|item| !matches!(item, Item::User { .. }));
+        let running = turn.clone().find_map(|item| match item {
+            Item::Tool(call) if call.status == ToolStatus::Running => Some(call),
+            _ => None,
+        });
+        match (running, turn.next()) {
+            (Some(call), _) => step_label(call),
+            (None, Some(Item::Thinking(_))) => THINKING_ACTIVITY.into(),
+            (None, Some(Item::Assistant(_))) => WRITING_ACTIVITY.into(),
+            _ => WORKING_ACTIVITY.into(),
+        }
+    }
+
+    fn render_activity(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = SharedString::from(self.activity());
+        let started = self.transcript.turn_started;
+        let muted = cx.theme().muted_foreground;
+        let cycle = SPINNER_INTERVAL * SPINNER_FRAMES.len() as u32;
+        h_flex()
+            .gap_2()
+            .px_3()
+            .text_sm()
+            .text_color(muted)
+            .with_animation(
+                "activity",
+                Animation::new(cycle).repeat(),
+                move |row, delta| {
+                    let frame = (delta * SPINNER_FRAMES.len() as f32) as usize;
+                    let elapsed = started.map(|started| short_duration(started.elapsed()));
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(SPINNER_COLOR))
+                            .child(SPINNER_FRAMES[frame.min(SPINNER_FRAMES.len() - 1)]),
+                    )
+                    .child(div().min_w_0().truncate().child(label.clone()))
+                    .children(elapsed.map(|elapsed| div().flex_none().child(elapsed)))
+                },
+            )
+    }
+
+    fn render_todos(&self, todos: &[TodoItem], cx: &mut Context<Self>) -> impl IntoElement {
+        let open = !self.expanded.contains(TODOS_FOLDED_KEY);
+        let done = todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Completed)
+            .count();
+        let muted = cx.theme().muted_foreground;
+        v_flex()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .text_sm()
+            .child(
+                h_flex()
+                    .id("todos")
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle(TODOS_FOLDED_KEY, cx)))
+                    .child(Icon::new(Lucide::ListTodo).xsmall().text_color(muted))
+                    .child(div().font_medium().child("Todos"))
+                    .child(
+                        div()
+                            .text_color(muted)
+                            .child(format!("{done}/{}", todos.len())),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Icon::new(match open {
+                            true => IconName::ChevronDown,
+                            false => IconName::ChevronRight,
+                        })
+                        .xsmall()
+                        .text_color(muted),
+                    ),
+            )
+            .when(open, |this| {
+                this.children(todos.iter().map(|todo| {
+                    let (icon, color) = match todo.status {
+                        TodoStatus::Completed => (Lucide::CircleCheck, muted),
+                        TodoStatus::InProgress => (Lucide::CircleDot, cx.theme().foreground),
+                        TodoStatus::Pending => (Lucide::Circle, muted),
+                        TodoStatus::Cancelled => (Lucide::CircleX, muted),
+                    };
+                    let struck =
+                        matches!(todo.status, TodoStatus::Completed | TodoStatus::Cancelled);
+                    h_flex()
+                        .gap_2()
+                        .pl_0p5()
+                        .text_color(color)
+                        .child(Icon::new(icon).xsmall())
+                        .child(
+                            div()
+                                .min_w_0()
+                                .when(struck, |this| this.line_through())
+                                .when(todo.status == TodoStatus::InProgress, |this| {
+                                    this.font_medium()
+                                })
+                                .child(todo.content.clone()),
+                        )
+                }))
+            })
+    }
+
     fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let files = self.files.iter().enumerate().map(|(i, path)| {
             let name = path.file_name().map_or_else(
@@ -2161,7 +2336,7 @@ impl WorkspaceView {
                 div()
                     .relative()
                     .group(SharedString::from(format!("attachment-{i}")))
-                    .child(thumbnail(&attachment.image, THUMB_SIZE, cx))
+                    .child(thumbnail(&attachment.image, COMPOSER_THUMB_SIZE, cx))
                     .child(
                         div().absolute().top_0p5().right_0p5().child(
                             Button::new(("remove-attachment", i))
@@ -2385,14 +2560,6 @@ impl WorkspaceView {
                             this.goal = None;
                             cx.notify();
                         })),
-                )
-            })
-            .when(self.transcript.working, |this| {
-                this.child(
-                    h_flex()
-                        .gap_1()
-                        .child(Spinner::new().xsmall())
-                        .child("Working…"),
                 )
             })
             .child(div().flex_1())
@@ -2789,6 +2956,7 @@ fn welcome(name: &str, cx: &mut Context<WorkspaceView>) -> impl IntoElement {
 fn thumbnail(image: &Arc<Image>, size: f32, cx: &App) -> impl IntoElement {
     img(image.clone())
         .size(px(size))
+        .flex_none()
         .object_fit(ObjectFit::Cover)
         .rounded(cx.theme().radius)
         .border_1()
@@ -3299,5 +3467,33 @@ in detail",
     #[test]
     fn past_reset_is_hidden() {
         assert_eq!(resets_in(1_000_000, 1_000), None);
+    }
+}
+
+/// A sidebar project being dragged to a new place in the list.
+#[derive(Clone)]
+struct ProjectDrag {
+    index: usize,
+    name: SharedString,
+}
+
+impl Render for ProjectDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1p5()
+            .px_2()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .shadow_md()
+            .text_sm()
+            .child(
+                Icon::new(Lucide::Folder)
+                    .small()
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(self.name.clone())
     }
 }

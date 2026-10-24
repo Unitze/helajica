@@ -35,6 +35,8 @@ const PROVIDER_PRIORITY: &[&str] = &[
     "regolo",
 ];
 const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
+/// Started on when nothing was saved or configured, if its provider is set up.
+const PREFERRED_MODEL: &str = "openai/gpt-6-luna";
 
 /// The model to start on, plus a warning when the saved one had to be skipped.
 /// Logging is not up this early, so the caller has to show the warning.
@@ -88,7 +90,7 @@ fn fallback_model(provider_config: &ProviderConfig) -> Result<Model> {
         }
         return from_spec_or_warm_catalog(spec).context("invalid default_model in config");
     }
-    auto_detect_model(policy).ok_or_else(|| {
+    preferred_model(policy).or_else(|| auto_detect_model(policy)).ok_or_else(|| {
         let policy_note = if policy.is_restrictive() {
             "\nnote: an allowed_models/excluded_models policy is active and may exclude every candidate"
         } else {
@@ -133,6 +135,11 @@ fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
         bail!(hint);
     }
     Ok(result?)
+}
+
+fn preferred_model(policy: &ModelPolicy) -> Option<Model> {
+    let model = Model::from_spec(PREFERRED_MODEL).ok()?;
+    (policy.allows(PREFERRED_MODEL) && provider_ready(&model.provider).is_ok()).then_some(model)
 }
 
 fn auto_detect_model(policy: &ModelPolicy) -> Option<Model> {
