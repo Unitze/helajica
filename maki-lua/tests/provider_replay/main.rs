@@ -35,6 +35,9 @@ const HOME_VARS: &[&str] = &[
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
 ];
 
 const HOST_FAILED: &str = "the plugin host did not start";

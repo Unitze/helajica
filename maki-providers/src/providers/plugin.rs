@@ -1840,6 +1840,9 @@ mod tests {
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_CACHE_HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
         ] {
             unsafe { std::env::set_var(var, home.path()) };
         }

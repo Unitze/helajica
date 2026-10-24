@@ -178,6 +178,9 @@ fn isolated_state() -> TempDir {
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
     ] {
         unsafe { std::env::set_var(var, dir.path()) };
     }

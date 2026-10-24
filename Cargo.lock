@@ -5191,6 +5191,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

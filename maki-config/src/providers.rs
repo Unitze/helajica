@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::debug;
 
-use maki_storage::paths;
 use maki_storage::sessions::Effort;
+use maki_storage::{atomic_write, paths};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 const PROVIDERS_FILE: &str = "providers.toml";
+const SET_ASIDE_SUFFIX: &str = ".broken";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
@@ -388,6 +389,21 @@ impl ProvidersConfig {
         Self::read().unwrap_or_default()
     }
 
+    /// For an app with no console to show [`Self::load`]'s error on: renames
+    /// a file that would not parse to `providers.toml.broken`, so startup goes
+    /// on without it. Returns where it went and why it was refused.
+    pub fn set_aside_if_broken() -> Option<(PathBuf, String)> {
+        let error = Self::read().err()?;
+        let path = providers_file_path();
+        let mut aside = path.clone().into_os_string();
+        aside.push(SET_ASIDE_SUFFIX);
+        let aside = PathBuf::from(aside);
+        fs::rename(&path, &aside)
+            .inspect_err(|e| tracing::warn!(path = %path.display(), error = %e, "cannot set providers.toml aside"))
+            .ok()?;
+        Some((aside, error))
+    }
+
     fn read() -> Result<Self, String> {
         let path = providers_file_path();
         let meta = match fs::metadata(&path) {
@@ -430,7 +446,7 @@ impl ProvidersConfig {
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        fs::write(&path, content)?;
+        atomic_write(&path, content.as_bytes()).map_err(std::io::Error::other)?;
         // A write the cache cannot distinguish from what it holds (same length
         // inside one mtime tick) would otherwise serve the old parse.
         *PARSED.lock().unwrap_or_else(|e| e.into_inner()) = None;
