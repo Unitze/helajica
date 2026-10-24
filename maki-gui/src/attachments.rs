@@ -3,6 +3,7 @@
 //! any other file reaches it as a path for its tools to read.
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,11 +23,18 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    /// `None` for a format no provider takes, such as BMP or SVG.
+    /// A format no provider takes, such as the BMP Windows hands over for a
+    /// copied bitmap, is converted to PNG; `None` if it cannot be decoded.
     pub fn from_image(image: &Image) -> Option<Self> {
+        if let Some(media) = media_of(image.format) {
+            return Some(Self {
+                media,
+                image: Arc::new(image.clone()),
+            });
+        }
         Some(Self {
-            media: media_of(image.format)?,
-            image: Arc::new(image.clone()),
+            media: ImageMediaType::Png,
+            image: Arc::new(Image::from_bytes(ImageFormat::Png, to_png(&image.bytes)?)),
         })
     }
 
@@ -96,6 +104,15 @@ fn media_of(format: ImageFormat) -> Option<ImageMediaType> {
     }
 }
 
+fn to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let mut png = Vec::new();
+    decoded
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
+}
+
 fn format_of(media: ImageMediaType) -> ImageFormat {
     match media {
         ImageMediaType::Png => ImageFormat::Png,
@@ -112,6 +129,7 @@ mod tests {
     use super::*;
 
     const PIXELS: &[u8] = b"\x89PNG not really";
+    const BITMAP_SIDE: u32 = 2;
 
     #[test_case("shot.PNG", true ; "upper_case_png")]
     #[test_case("photo.jpeg", true ; "jpeg")]
@@ -143,7 +161,21 @@ mod tests {
     }
 
     #[test]
-    fn refuses_formats_providers_do_not_take() {
+    fn refuses_what_cannot_be_decoded() {
         assert!(Attachment::from_image(&Image::from_bytes(ImageFormat::Bmp, Vec::new())).is_none());
+    }
+
+    #[test]
+    fn a_copied_bitmap_becomes_a_png() {
+        let mut bmp = Vec::new();
+        image::RgbImage::new(BITMAP_SIDE, BITMAP_SIDE)
+            .write_to(&mut Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+            .unwrap();
+        let attachment = Attachment::from_image(&Image::from_bytes(ImageFormat::Bmp, bmp)).unwrap();
+        assert_eq!(attachment.media, ImageMediaType::Png);
+        assert_eq!(
+            image::guess_format(&attachment.image.bytes).unwrap(),
+            image::ImageFormat::Png
+        );
     }
 }

@@ -28,12 +28,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Anchor, Animation, AnimationExt as _, AnyWindowHandle, App, AppContext as _,
-    AsyncWindowContext, ClipboardEntry, Context, Entity, ExternalPaths, FocusHandle, Focusable,
-    FollowMode, Image, InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent,
+    AsyncWindowContext, ClipboardEntry, Context, Div, Entity, ExternalPaths, FocusHandle,
+    Focusable, FollowMode, Image, InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent,
     ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
-    Task, WeakEntity, Window, actions, div, ease_out_quint, img, list, prelude::FluentBuilder as _,
-    px, rgb,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
+    Subscription, Task, WeakEntity, Window, actions, div, ease_out_quint, hsla, img, list,
+    prelude::FluentBuilder as _, px, relative, rgb,
 };
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
@@ -68,6 +68,7 @@ actions!(
 
 const KEY_CONTEXT: &str = "Workspace";
 const SIDEBAR_WIDTH: f32 = 264.;
+const MAIN_CORNER_RADIUS: f32 = 12.;
 const TRANSCRIPT_WIDTH: f32 = 820.;
 const TOOL_PREVIEW_LINES: usize = 12;
 /// Lines the step card sits in from its header, past the status icon.
@@ -110,10 +111,15 @@ const MENU_HEIGHT: f32 = 360.;
 const UNTITLED: &str = "Untitled session";
 const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline, / for commands";
 const THUMB_SIZE: f32 = 56.;
-const COMPOSER_THUMB_SIZE: f32 = 120.;
+const COMPOSER_THUMB_SIZE: f32 = 140.;
 const FILE_CHIP_WIDTH: f32 = 220.;
-const MESSAGE_THUMB_SIZE: f32 = 120.;
-const STEP_THUMB_SIZE: f32 = 28.;
+const MESSAGE_THUMB_SIZE: f32 = 200.;
+const STEP_THUMB_SIZE: f32 = 36.;
+/// How much of the window a clicked picture may fill.
+const IMAGE_VIEWER_SHARE: f32 = 0.9;
+const BACKDROP_ALPHA: f32 = 0.6;
+const SIDEBAR_SLIDE: Duration = Duration::from_millis(220);
+const ESCAPE_KEY: &str = "escape";
 const SUGGESTION_KEYS: [&str; 5] = ["up", "down", "tab", "enter", "escape"];
 const PASTE_KEY: &str = "v";
 const ATTACH_PROMPT: &str = "Attach";
@@ -177,6 +183,9 @@ pub struct WorkspaceView {
     mode: Mode,
     update: UpdateState,
     expanded: HashSet<String>,
+    sidebar_hidden: bool,
+    /// The picture open over the window, after a thumbnail was clicked.
+    viewing: Option<Arc<Image>>,
     list: ListState,
     scroller: Scroller,
     /// Items from here on arrived live and fade in; the loaded history does not.
@@ -253,6 +262,8 @@ impl WorkspaceView {
             mode: Mode::Ask,
             update: UpdateState::Idle,
             expanded: HashSet::new(),
+            sidebar_hidden: false,
+            viewing: None,
             scroller: Scroller::new(list.clone()),
             list,
             animate_from: 0,
@@ -1332,68 +1343,43 @@ impl WorkspaceView {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut groups = Vec::with_capacity(self.store.projects().len());
-        for (index, project) in self.store.projects().iter().enumerate() {
-            groups.push(
+        let groups: Vec<_> = self
+            .store
+            .projects()
+            .iter()
+            .enumerate()
+            .map(|(index, project)| {
                 self.render_project(index, &project.path, &project.name, cx)
-                    .into_any_element(),
-            );
-        }
+                    .into_any_element()
+            })
+            .collect();
         let empty = groups.is_empty();
         let commands = self.commands().cloned();
         v_flex()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_none()
-            .border_r_1()
-            .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
             .child(
-                v_flex().px_2().pt_3().pb_2().child(
-                    h_flex()
-                        .id("new-session")
-                        .gap_2()
-                        .px_2()
-                        .py_1p5()
-                        .rounded(cx.theme().radius)
-                        .cursor_pointer()
-                        .text_sm()
-                        .font_medium()
-                        .hover(|style| style.bg(cx.theme().sidebar_accent))
-                        .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx)))
-                        .child(Icon::new(Lucide::SquarePen).small())
-                        .child("New session"),
-                ),
-            )
-            .child(
-                h_flex()
-                    .pl_2()
-                    .pr_3()
-                    .justify_between()
-                    .child(section_label("Projects", cx))
+                v_flex()
+                    .px_2()
+                    .pt_1()
+                    .pb_4()
+                    .gap_0p5()
                     .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(
-                                Button::new("open-folder")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Icon::new(Lucide::FolderOpen))
-                                    .tooltip("Open folder")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_folder(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("new-project")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Icon::new(Lucide::FolderPlus))
-                                    .tooltip("New project")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.create_project(window, cx)
-                                    })),
-                            ),
+                        nav_item("new-session", Lucide::Plus, "New session", cx).on_click(
+                            cx.listener(|this, _, window, cx| this.new_session(window, cx)),
+                        ),
+                    )
+                    .child(
+                        nav_item("open-folder", Lucide::FolderOpen, "Open folder", cx).on_click(
+                            cx.listener(|this, _, window, cx| this.open_folder(window, cx)),
+                        ),
+                    )
+                    .child(
+                        nav_item("new-project", Lucide::FolderPlus, "New project", cx).on_click(
+                            cx.listener(|this, _, window, cx| this.create_project(window, cx)),
+                        ),
                     ),
             )
             .child(
@@ -1446,7 +1432,6 @@ impl WorkspaceView {
     ) -> impl IntoElement {
         let open = self.unfolded.contains(path);
         let current = self.project.as_deref() == Some(path);
-        let now = now_epoch();
         let sessions = match open {
             true => self
                 .sessions
@@ -1463,14 +1448,15 @@ impl WorkspaceView {
             name: name.to_owned().into(),
         };
         let group = SharedString::from(format!("project-row-{index}"));
+        let muted = cx.theme().muted_foreground;
         let mut rows = Vec::with_capacity(sessions.len().max(1));
         if open && sessions.is_empty() {
             rows.push(
                 div()
-                    .pl_7()
+                    .px_2()
                     .py_1()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(muted)
                     .child("No sessions yet")
                     .into_any_element(),
             );
@@ -1487,10 +1473,9 @@ impl WorkspaceView {
                     .id(SharedString::from(format!("session-{id}")))
                     .group(row.clone())
                     .gap_2()
-                    .pl_7()
-                    .pr_2()
-                    .py_1()
-                    .rounded(cx.theme().radius)
+                    .px_2()
+                    .py_1p5()
+                    .rounded(cx.theme().radius_lg)
                     .cursor_pointer()
                     .text_sm()
                     .when(active, |this| {
@@ -1507,13 +1492,6 @@ impl WorkspaceView {
                             .min_w_0()
                             .truncate()
                             .child(title_of(&session.title)),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(short_ago(now, session.updated_at)),
                     )
                     .child(
                         div()
@@ -1537,14 +1515,17 @@ impl WorkspaceView {
             );
         }
         v_flex()
+            .gap_0p5()
+            .when(open, |this| this.mb_2())
             .child(
                 h_flex()
                     .id(("project", index))
                     .group(group.clone())
-                    .gap_1p5()
-                    .px_2()
+                    .gap_1()
+                    .pl_2()
+                    .pr_1()
                     .py_1()
-                    .rounded(cx.theme().radius)
+                    .rounded(cx.theme().radius_lg)
                     .cursor_pointer()
                     .text_sm()
                     .hover(|style| style.bg(cx.theme().sidebar_accent))
@@ -1556,31 +1537,23 @@ impl WorkspaceView {
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_project(&toggle, cx)))
                     .child(
-                        Icon::new(match open {
-                            true => Lucide::ChevronDown,
-                            false => Lucide::ChevronRight,
-                        })
-                        .xsmall()
-                        .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
-                        Icon::new(match open {
-                            true => Lucide::FolderOpen,
-                            false => Lucide::Folder,
-                        })
-                        .small()
-                        .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .truncate()
-                            .when(current, |this| this.font_medium())
+                            .font_semibold()
                             .child(name.to_owned()),
                     )
                     .child(
-                        h_flex()
+                        Icon::new(match open {
+                            true => IconName::ChevronDown,
+                            false => IconName::ChevronRight,
+                        })
+                        .xsmall()
+                        .text_color(muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
                             .flex_none()
                             .invisible()
                             .group_hover(group, |style| style.visible())
@@ -1594,21 +1567,26 @@ impl WorkspaceView {
                                         cx.stop_propagation();
                                         this.forget_project(&forget, window, cx);
                                     })),
-                            )
-                            .child(
-                                Button::new(("project-new-session", index))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Icon::new(Lucide::Plus))
-                                    .tooltip("New session here")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.open_project(fresh.clone(), None, window, cx);
-                                    })),
                             ),
+                    )
+                    .child(
+                        Button::new(("project-new-session", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Lucide::Plus))
+                            .tooltip("New session here")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_project(fresh.clone(), None, window, cx);
+                            })),
                     ),
             )
-            .children(rows)
+            .when(open, |this| {
+                this.child(fade_in(
+                    v_flex().gap_0p5().children(rows),
+                    SharedString::from(format!("project-sessions-{index}")),
+                ))
+            })
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -1959,7 +1937,12 @@ impl WorkspaceView {
                     )
                 },
             )
-            .children(body)
+            .children(body.map(|body| {
+                fade_in(
+                    div().child(body),
+                    SharedString::from(format!("step-body-{index}")),
+                )
+            }))
     }
 
     fn tool_output(&self, call: &ToolCall, open: bool, cx: &App) -> impl IntoElement + use<> {
@@ -2100,9 +2083,17 @@ impl WorkspaceView {
                         "aside-in",
                     ))
                 })
-                .when(working, |this| this.child(self.render_activity(cx)))
+                .when(working, |this| {
+                    this.child(fade_in(
+                        div().child(self.render_activity(cx)),
+                        "activity-in",
+                    ))
+                })
                 .when(!todos.is_empty(), |this| {
-                    this.child(self.render_todos(&todos, cx))
+                    this.child(fade_in(
+                        div().child(self.render_todos(&todos, cx)),
+                        "todos-in",
+                    ))
                 })
                 .child(
                     div()
@@ -2815,22 +2806,37 @@ fn thinking_label(thinking: StoredThinking) -> String {
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.scroller.tick(window);
+        let hidden = self.sidebar_hidden;
         v_flex()
+            .relative()
             .size_full()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == ESCAPE_KEY && this.viewing.take().is_some() {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_folder(window, cx)))
             .on_action(
                 cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
             )
-            .bg(cx.theme().background)
+            .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
             .child({
                 let workspace = cx.entity().downgrade();
                 let settings: Handler = Rc::new(move |window, cx| {
                     let _ = workspace.update(cx, |this, cx| this.open_settings(window, cx));
+                });
+                let workspace = cx.entity().downgrade();
+                let sidebar: Handler = Rc::new(move |_, cx| {
+                    let _ = workspace.update(cx, |this, cx| {
+                        this.sidebar_hidden = !this.sidebar_hidden;
+                        cx.notify();
+                    });
                 });
                 let crumbs = self
                     .project_name()
@@ -2838,21 +2844,50 @@ impl Render for WorkspaceView {
                     .into_iter()
                     .collect();
                 let notice = self.render_update(cx);
-                title_bar(crumbs, self.gui_dir.clone(), Some(settings), notice, cx)
+                title_bar(
+                    crumbs,
+                    Some(sidebar),
+                    self.gui_dir.clone(),
+                    Some(settings),
+                    notice,
+                    cx,
+                )
             })
             .child(
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_sidebar(cx))
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_none()
+                            .overflow_hidden()
+                            .child(self.render_sidebar(cx))
+                            .with_animation(
+                                ("sidebar", usize::from(hidden)),
+                                Animation::new(SIDEBAR_SLIDE).with_easing(ease_out_quint()),
+                                move |sidebar, delta| {
+                                    let shown = if hidden { 1. - delta } else { delta };
+                                    sidebar.w(px(SIDEBAR_WIDTH * shown))
+                                },
+                            ),
+                    )
                     .child(
                         v_flex()
                             .flex_1()
                             .h_full()
                             .min_w_0()
+                            .overflow_hidden()
+                            .bg(cx.theme().background)
+                            .border_t_1()
+                            .border_color(cx.theme().sidebar_border)
+                            .when(!hidden, |this| {
+                                this.border_l_1().rounded_tl(px(MAIN_CORNER_RADIUS))
+                            })
                             .child(self.render_main(cx)),
                     ),
             )
+            .children(self.viewing.clone().map(|image| render_viewer(image, cx)))
     }
 }
 
@@ -2865,6 +2900,25 @@ fn action_item(
     PopupMenuItem::new(label).on_click(move |_, window, cx| {
         let _ = workspace.update(cx, |this, cx| this.run(action.clone(), window, cx));
     })
+}
+
+fn nav_item(
+    id: &'static str,
+    icon: Lucide,
+    label: &'static str,
+    cx: &Context<WorkspaceView>,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .gap_2p5()
+        .px_2()
+        .py_1p5()
+        .rounded(cx.theme().radius_lg)
+        .cursor_pointer()
+        .text_sm()
+        .hover(|style| style.bg(cx.theme().sidebar_accent))
+        .child(Icon::new(icon).small())
+        .child(label)
 }
 
 fn section_label(text: &str, cx: &Context<WorkspaceView>) -> impl IntoElement {
@@ -2953,14 +3007,57 @@ fn welcome(name: &str, cx: &mut Context<WorkspaceView>) -> impl IntoElement {
         )
 }
 
-fn thumbnail(image: &Arc<Image>, size: f32, cx: &App) -> impl IntoElement {
-    img(image.clone())
-        .size(px(size))
+/// A picture at `size`, opening over the window when clicked.
+fn thumbnail(image: &Arc<Image>, size: f32, cx: &Context<WorkspaceView>) -> impl IntoElement {
+    let full = image.clone();
+    div()
+        .id(("thumbnail", Arc::as_ptr(image) as usize))
         .flex_none()
-        .object_fit(ObjectFit::Cover)
-        .rounded(cx.theme().radius)
-        .border_1()
-        .border_color(cx.theme().border)
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.viewing = Some(full.clone());
+            cx.notify();
+        }))
+        .child(
+            img(image.clone())
+                .size(px(size))
+                .object_fit(ObjectFit::Cover)
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border),
+        )
+}
+
+/// The picture alone on a dimmed window; a click anywhere or Escape closes it.
+fn render_viewer(image: Arc<Image>, cx: &mut Context<WorkspaceView>) -> impl IntoElement {
+    div()
+        .id("image-viewer")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(hsla(0., 0., 0., BACKDROP_ALPHA))
+        .cursor_pointer()
+        .occlude()
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.viewing = None;
+            cx.notify();
+        }))
+        .child(
+            img(image)
+                .max_w(relative(IMAGE_VIEWER_SHARE))
+                .max_h(relative(IMAGE_VIEWER_SHARE))
+                .object_fit(ObjectFit::Contain)
+                .rounded(cx.theme().radius_lg)
+                .shadow_lg(),
+        )
+        .with_animation(
+            "image-viewer-in",
+            Animation::new(FADE_IN).with_easing(ease_out_quint()),
+            |viewer, delta| viewer.opacity(delta),
+        )
 }
 
 fn name_of(path: &Path) -> String {
@@ -3085,16 +3182,6 @@ fn preview(text: &str, lines: usize) -> String {
         out.push_str("\n…");
     }
     out
-}
-
-fn short_ago(now: u64, then: u64) -> String {
-    let elapsed = now.saturating_sub(then);
-    match elapsed {
-        0..60 => "now".into(),
-        60..3_600 => format!("{}m", elapsed / 60),
-        3_600..86_400 => format!("{}h", elapsed / 3_600),
-        _ => format!("{}d", elapsed / 86_400),
-    }
 }
 
 /// A `/btw` side question and its answer as it streams in.
@@ -3399,13 +3486,6 @@ mod tests {
     #[test_case("local", "local" ; "bare")]
     fn short_model_drops_the_provider(spec: &str, expected: &str) {
         assert_eq!(short_model(spec), expected);
-    }
-
-    #[test_case(30, "now" ; "seconds")]
-    #[test_case(120, "2m" ; "minutes")]
-    #[test_case(2 * 86_400, "2d" ; "days")]
-    fn ages_are_compact(elapsed: u64, expected: &str) {
-        assert_eq!(short_ago(1_000_000, 1_000_000 - elapsed), expected);
     }
 
     #[test_case(999, "999" ; "small")]

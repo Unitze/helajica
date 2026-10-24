@@ -5308,6 +5308,7 @@ dependencies = [
  "color-eyre",
  "flume",
  "gpui-kit",
+ "image",
  "isahc",
  "maki-agent",
  "maki-config",

@@ -1,5 +1,5 @@
 //! The window's own title bar, drawn by the app on every screen: borderless,
-//! on the page background, so the window reads as one surface.
+//! in the sidebar's colour, so the chrome and the sidebar read as one surface.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -21,6 +21,7 @@ pub type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 pub fn title_bar(
     crumbs: Vec<SharedString>,
+    sidebar: Option<Handler>,
     gui_dir: Option<PathBuf>,
     settings: Option<Handler>,
     notice: Option<AnyElement>,
@@ -30,13 +31,28 @@ pub fn title_bar(
     TitleBar::new()
         .h(px(HEIGHT))
         .border_b_0()
-        .bg(cx.theme().background)
+        .bg(cx.theme().sidebar)
         .child(
             h_flex()
                 .flex_1()
                 .min_w_0()
                 .gap_2()
                 .text_sm()
+                .when_some(sidebar, |this, sidebar| {
+                    this.child(
+                        div()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("titlebar-sidebar")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(Lucide::PanelLeft))
+                                    .tooltip("Toggle sidebar")
+                                    .on_click(move |_, window, cx| sidebar(window, cx)),
+                            ),
+                    )
+                })
                 .child(div().pl_1().font_semibold().child(APP_NAME))
                 .children(crumbs.into_iter().map(|crumb| {
                     h_flex()
