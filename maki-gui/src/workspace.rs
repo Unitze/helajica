@@ -2,7 +2,6 @@
 //! conversation in the middle, the composer under it, and whatever Lua
 //! plugins add around them.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -28,12 +27,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Anchor, Animation, AnimationExt as _, AnyWindowHandle, App, AppContext as _,
-    AsyncWindowContext, ClipboardEntry, Context, DispatchPhase, Entity, ExternalPaths, FocusHandle,
-    Focusable, FollowMode, HitboxBehavior, Image, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _,
-    PathPromptOptions, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, Subscription, Task, WeakEntity, Window, actions, canvas, div,
-    ease_out_quint, img, list, prelude::FluentBuilder as _, px,
+    AsyncWindowContext, ClipboardEntry, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    FollowMode, Image, InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent,
+    ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    Task, WeakEntity, Window, actions, div, ease_out_quint, img, list, prelude::FluentBuilder as _,
+    px,
 };
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
@@ -68,10 +67,6 @@ const TRANSCRIPT_WIDTH: f32 = 820.;
 const TOOL_PREVIEW_LINES: usize = 12;
 const THINKING_PREVIEW_LINES: usize = 3;
 const LIST_OVERDRAW: f32 = 800.;
-const SCROLL_LINE_HEIGHT: f32 = 40.;
-/// Share of the outstanding wheel distance covered each frame.
-const SCROLL_EASING: f32 = 0.35;
-const SCROLL_SETTLED: f32 = 0.5;
 const TURN_TICK_WIDTH: f32 = 10.;
 const TURN_TICK_ACTIVE_WIDTH: f32 = 18.;
 const TURN_TICK_HEIGHT: f32 = 1.5;
@@ -163,8 +158,6 @@ pub struct WorkspaceView {
     list: ListState,
     /// Items from here on arrived live and fade in; the loaded history does not.
     animate_from: usize,
-    /// Wheel distance not scrolled yet; eased out over the next frames.
-    scroll_pending: Rc<Cell<f32>>,
     focus: FocusHandle,
     _session: Option<Task<()>>,
     _subscription: Subscription,
@@ -242,7 +235,6 @@ impl WorkspaceView {
             update: UpdateState::Idle,
             expanded: HashSet::new(),
             list: ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW)),
-            scroll_pending: Rc::default(),
             animate_from: 0,
             focus: cx.focus_handle(),
             _session: None,
@@ -1589,46 +1581,6 @@ impl WorkspaceView {
         }
     }
 
-    /// Takes wheel input over the transcript before the list does, so
-    /// [`Self::ease_scroll`] can spread each notch over a few frames.
-    fn wheel_catcher(&self) -> impl IntoElement {
-        let pending = Rc::clone(&self.scroll_pending);
-        canvas(
-            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
-            move |_, hitbox, window, _| {
-                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                    let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
-                    if phase == DispatchPhase::Capture
-                        && hitbox.should_handle_scroll(window)
-                        && delta.y.abs() > delta.x.abs()
-                    {
-                        pending.set(pending.get() + f32::from(delta.y));
-                        cx.stop_propagation();
-                        window.refresh();
-                    }
-                });
-            },
-        )
-        .absolute()
-        .size_full()
-    }
-
-    fn ease_scroll(&self, window: &mut Window) {
-        let pending = self.scroll_pending.get();
-        if pending.abs() < SCROLL_SETTLED {
-            self.scroll_pending.set(0.);
-            return;
-        }
-        let step = if (pending * SCROLL_EASING).abs() < SCROLL_SETTLED {
-            pending
-        } else {
-            pending * SCROLL_EASING
-        };
-        self.list.scroll_by(px(-step));
-        self.scroll_pending.set(pending - step);
-        window.request_animation_frame();
-    }
-
     /// A tick per prompt down the side of the transcript; hovering one
     /// previews the turn, clicking it scrolls there.
     fn render_turn_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1924,7 +1876,6 @@ impl WorkspaceView {
                                     )
                                     .size_full(),
                                 )
-                                .child(self.wheel_catcher())
                                 .child(self.render_turn_rail(cx)),
                         )
                     })
@@ -2515,8 +2466,7 @@ fn thinking_label(thinking: StoredThinking) -> String {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ease_scroll(window);
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .key_context(KEY_CONTEXT)
