@@ -131,6 +131,18 @@ case("parse_output_rejects_text_that_is_not_a_listing", function()
   eq(parse_output("skill not found: x\n\n<available_skills>\n- a: b\n</available_skills>"), nil)
 end)
 
+-- ── builtin skill_install skill ──
+
+case("builtin_skill_install_names_where_skills_go", function()
+  local installer = require("skill_install")
+  eq(installer.name, "maki-skill-install")
+  assert(#installer.description > 0, "description should not be empty")
+  assert(
+    installer.content:find(installer.skills_dir_placeholder, 1, true),
+    "content should hold the skills dir placeholder"
+  )
+end)
+
 -- ── builtin plugin_dev skill ──
 
 case("builtin_plugin_dev_skill_loads", function()

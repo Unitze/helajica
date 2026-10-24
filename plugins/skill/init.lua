@@ -67,6 +67,7 @@ end
 
 local opts = maki.api.register_options({
   plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
+  skill_install = { default = true, desc = "Offer the builtin maki-skill-install skill for finding or writing skills." },
 })
 
 local ok, builtin, reference = pcall(function()
@@ -75,6 +76,16 @@ end)
 if not ok then
   maki.log.warn("builtin plugin_dev skill unavailable: " .. tostring(builtin))
   builtin = nil
+end
+
+local installer = require("skill_install")
+
+local function resolve_installer_content()
+  local config = maki.env.config_dir()
+  local dir = config and maki.fs.joinpath(config, "skills") or "~/.agents/skills"
+  return (installer.content:gsub(installer.skills_dir_placeholder, function()
+    return dir
+  end))
 end
 
 local function resolve_builtin_content()
@@ -107,6 +118,16 @@ local function discover_skills()
       content = builtin.content,
       location = "builtin:" .. builtin.name,
       resolve = resolve_builtin_content,
+    }
+  end
+
+  if opts.skill_install then
+    skills[installer.name] = {
+      name = installer.name,
+      description = installer.description,
+      content = installer.content,
+      location = "builtin:" .. installer.name,
+      resolve = resolve_installer_content,
     }
   end
 
