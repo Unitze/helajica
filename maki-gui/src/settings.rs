@@ -17,6 +17,10 @@ pub struct Settings {
     /// Add-ons switched on or off, by id. One missing here takes its default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub addons: BTreeMap<String, bool>,
+    /// Plugins switched on or off in Customize, by name. These win over the
+    /// config; one missing here follows it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, bool>,
     /// The thinking level picked by the composer, as maki's `/thinking` takes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
@@ -47,6 +51,7 @@ mod tests {
     const THEME: &str = "Ayu Light";
     const ADDON: &str = "openai-oauth";
     const THINKING: &str = "high";
+    const PLUGIN: &str = "websearch";
 
     #[test]
     fn round_trips_through_disk() {
@@ -55,6 +60,7 @@ mod tests {
             dark: true,
             theme: Some(THEME.into()),
             addons: BTreeMap::from([(ADDON.into(), true)]),
+            plugins: BTreeMap::from([(PLUGIN.into(), false)]),
             thinking: Some(THINKING.into()),
         };
         settings.save(Some(dir.path()));

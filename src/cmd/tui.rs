@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
@@ -85,16 +86,17 @@ fn load_config(
     init_files: InitFiles,
     project_config: &ProjectConfig,
     names: &super::KnownNames<'_>,
+    plugin_switches: &BTreeMap<String, bool>,
     warnings: &mut Vec<String>,
 ) -> Result<Config> {
     let raw_config = plugin_host
         .load_init_files(init_files, warnings)
         .context("load init.lua files")?;
 
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config(&names(plugin_host)?)
-        .context("invalid config")?;
+    let names = names(plugin_host)?;
+    let mut raw_config = raw_config.unwrap_or_default();
+    raw_config.switch_plugins(plugin_switches, &names);
+    let mut config = raw_config.into_config(&names).context("invalid config")?;
     config.permissions = load_permissions(project_config);
 
     if cli.yolo || config.always_yolo {
@@ -138,6 +140,8 @@ pub(super) struct Launch<'a> {
     pub(super) cwd: &'a Path,
     pub(super) storage: &'a StateDir,
     pub(super) interaction: Interaction,
+    /// Plugins the desktop app switched on or off, over the config.
+    pub(super) plugin_switches: &'a BTreeMap<String, bool>,
 }
 
 /// The one construction path for a generation: first startup passes
@@ -174,6 +178,7 @@ pub(super) fn build_stack(
                 InitFiles::resolve(&trust.project_config, cli.no_plugins),
                 &trust.project_config,
                 names,
+                launch.plugin_switches,
                 warnings,
             );
             config_or_fallback(loaded, fallback_config, warnings)
@@ -316,6 +321,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         cwd: &cwd,
         storage: &storage,
         interaction,
+        plugin_switches: &BTreeMap::new(),
     };
     let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None)?;
 
@@ -454,6 +460,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         cwd: &cwd,
         storage: &storage,
         interaction,
+        plugin_switches: &BTreeMap::new(),
     };
 
     loop {
@@ -703,6 +710,7 @@ mod tests {
             InitFiles::Disabled,
             &ProjectConfig::for_project(dir.path()),
             &no_names,
+            &BTreeMap::new(),
             &mut Vec::new(),
         )
         .expect("no-plugins must skip the broken init.lua and still load defaults");
@@ -744,6 +752,7 @@ mod tests {
             InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
             &ProjectConfig::for_project(dir.path()),
             &no_names,
+            &BTreeMap::new(),
             &mut Vec::new(),
         ) {
             Err(_) => {}

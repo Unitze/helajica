@@ -10,6 +10,7 @@ mod app;
 mod attachments;
 mod commands;
 mod custom_providers;
+mod customize;
 pub mod engine;
 mod ext;
 mod goal;
@@ -19,19 +20,23 @@ mod nodes;
 mod projects;
 mod scroller;
 mod settings;
-mod settings_window;
+mod settings_page;
 mod titlebar;
 mod transcript;
 mod update;
 mod workspace;
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 
-pub use engine::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update, UsageReport};
+pub use engine::{
+    Boot, BtwEvent, Command, Engine, PluginInfo, PluginKind, Session, SlashCommand, Update,
+    UsageReport,
+};
 
 const WINDOW_WIDTH: f32 = 1240.;
 const WINDOW_HEIGHT: f32 = 820.;
@@ -62,4 +67,10 @@ pub fn run(engine: Arc<dyn Engine>, gui_dir: Option<PathBuf>, project: Option<Pa
                 cx.quit();
             }
         });
+}
+
+/// The plugins the user switched on or off in the window, which a session
+/// opened from it applies over the config.
+pub fn plugin_switches(gui_dir: Option<&Path>) -> BTreeMap<String, bool> {
+    settings::Settings::load(gui_dir).plugins
 }

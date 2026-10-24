@@ -590,6 +590,21 @@ impl RawConfig {
         })
     }
 
+    /// Plugins switched on or off outside any config file, such as in the
+    /// desktop app, win over it. A name no plugin answers to is dropped rather
+    /// than failing validation: it is not a typo in a file the user can fix,
+    /// just a package removed since it was switched.
+    pub fn switch_plugins(&mut self, switches: &BTreeMap<String, bool>, packages: &[String]) {
+        for (name, &enabled) in switches {
+            if DEFAULT_BUILTINS.contains(&name.as_str())
+                || OPTIONAL_BUILTINS.contains(&name.as_str())
+                || packages.contains(name)
+            {
+                self.plugins.entry(name.clone()).or_default().enabled = Some(enabled);
+            }
+        }
+    }
+
     /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
     /// old config, so fail loudly instead of letting it silently drift.
     fn validate_plugin_tables(&self, packages: &[String]) -> Result<(), ConfigError> {
@@ -2830,6 +2845,25 @@ mod tests {
     /// the temp directory would decide the result.
     fn untrusted_project(root: &Path) -> ProjectConfig {
         ProjectConfig::rooted(root, root.parent())
+    }
+
+    const REMOVED_PACKAGE: &str = "gone_package";
+
+    #[test_case("websearch", false, &[], Some(false) ; "builtin_switched_off")]
+    #[test_case("completion", true, &[], Some(true) ; "optional_switched_on")]
+    #[test_case("my_pack", false, &["my_pack"], Some(false) ; "installed_package")]
+    #[test_case(REMOVED_PACKAGE, true, &[], Some(false) ; "removed_package_left_alone")]
+    fn switches_win_over_the_config(
+        name: &str,
+        enabled: bool,
+        packages: &[&str],
+        expected: Option<bool>,
+    ) {
+        let mut raw = RawConfig::default();
+        raw.plugins.insert(name.into(), plugin_enabled(!enabled));
+        let packages: Vec<String> = packages.iter().map(|p| (*p).to_owned()).collect();
+        raw.switch_plugins(&BTreeMap::from([(name.to_owned(), enabled)]), &packages);
+        assert_eq!(raw.plugins[name].enabled, expected);
     }
 
     fn plugin_enabled(enabled: bool) -> PluginFileConfig {

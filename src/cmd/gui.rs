@@ -2,7 +2,7 @@
 //! lives in `maki-gui`; this file is its [`Engine`]: per project, the same
 //! stack `cmd::tui` builds, and a session driven in-process.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +24,14 @@ use maki_agent::{
     close_dangling_tool_calls,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode};
-use maki_config::{ModelPolicy, SessionDefaults, load_env_files};
-use maki_gui::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update, UsageReport};
+use maki_config::{
+    DEFAULT_BUILTINS, ModelPolicy, OPTIONAL_BUILTINS, PROVIDER_BUILTINS, SessionDefaults,
+    load_env_files,
+};
+use maki_gui::{
+    Boot, BtwEvent, Command, Engine, PluginInfo, PluginKind, Session, SlashCommand, Update,
+    UsageReport,
+};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_lua::{GuiMessage, Interaction};
 use maki_providers::model::Model;
@@ -57,7 +63,7 @@ pub fn run(cli: &Cli, project: Option<PathBuf>) -> Result<()> {
     let gui_dir = maki_storage::paths::config_dir()
         .ok()
         .map(|dir| dir.join(GUI_DIR));
-    let engine = Arc::new(MakiEngine::new(cli, storage));
+    let engine = Arc::new(MakiEngine::new(cli, storage, gui_dir.clone()));
     let project = project.map(|p| p.canonicalize().unwrap_or(p));
     maki_gui::run(engine, gui_dir, project);
     Ok(())
@@ -83,13 +89,15 @@ struct Running {
 struct MakiEngine {
     flags: Flags,
     storage: StateDir,
+    /// Where the window keeps its settings, the plugin switches among them.
+    gui_dir: Option<PathBuf>,
     running: Mutex<Option<Running>>,
     /// Where `maki.gui.emit` lands: the open session's update channel.
     lua_route: Arc<Mutex<Option<Sender<Update>>>>,
 }
 
 impl MakiEngine {
-    fn new(cli: &Cli, storage: StateDir) -> Self {
+    fn new(cli: &Cli, storage: StateDir, gui_dir: Option<PathBuf>) -> Self {
         let lua_route: Arc<Mutex<Option<Sender<Update>>>> = Arc::default();
         let (lua_tx, lua_rx) = flume::unbounded::<GuiMessage>();
         maki_lua::attach_gui(lua_tx);
@@ -110,6 +118,7 @@ impl MakiEngine {
                 yolo: cli.yolo,
             },
             storage,
+            gui_dir,
             running: Mutex::new(None),
             lua_route,
         }
@@ -144,14 +153,21 @@ impl Engine for MakiEngine {
         let flags = self.flags.clone();
         let storage = self.storage.clone();
         let project = project.to_path_buf();
+        let plugin_switches = maki_gui::plugin_switches(self.gui_dir.as_deref());
         let lua_route = Arc::clone(&self.lua_route);
         let thread = thread::Builder::new()
             .name("maki-session".into())
             .spawn(move || {
                 let fail = ready_tx.clone();
-                if let Err(e) =
-                    run_project(&flags, &storage, &project, resume, &lua_route, ready_tx)
-                {
+                if let Err(e) = run_project(
+                    &flags,
+                    &storage,
+                    &project,
+                    resume,
+                    &plugin_switches,
+                    &lua_route,
+                    ready_tx,
+                ) {
                     let _ = fail.send(Err(e));
                 }
             })
@@ -198,6 +214,28 @@ impl Engine for MakiEngine {
             None => Ok(()),
         }
     }
+
+    fn plugins(&self) -> Vec<PluginInfo> {
+        let bundled = DEFAULT_BUILTINS.iter().map(|name| PluginInfo {
+            name: (*name).to_owned(),
+            kind: match PROVIDER_BUILTINS.contains(name) {
+                true => PluginKind::Provider,
+                false => PluginKind::Tool,
+            },
+        });
+        let optional = OPTIONAL_BUILTINS.iter().map(|name| PluginInfo {
+            name: (*name).to_owned(),
+            kind: PluginKind::Optional,
+        });
+        let packages = maki_lua::discover_installed(self.flags.no_plugins)
+            .packages
+            .into_iter()
+            .map(|package| PluginInfo {
+                name: package.name,
+                kind: PluginKind::Package,
+            });
+        bundled.chain(optional).chain(packages).collect()
+    }
 }
 
 /// Builds the project's stack, hands the session back through `ready`, then
@@ -207,6 +245,7 @@ fn run_project(
     storage: &StateDir,
     project: &Path,
     resume: Option<String>,
+    plugin_switches: &BTreeMap<String, bool>,
     lua_route: &Mutex<Option<Sender<Update>>>,
     ready: Sender<Result<Session>>,
 ) -> Result<()> {
@@ -227,6 +266,7 @@ fn run_project(
         cwd: &cwd,
         storage,
         interaction: Interaction::None,
+        plugin_switches,
     };
     let (stack, mut warnings) = build_stack(&launch, &trust, None)?;
     warnings.extend(trust.state.restricted_warning());

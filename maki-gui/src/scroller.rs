@@ -1,18 +1,21 @@
-//! Transcript scrolling the way browsers do it: a wheel notch glides to
-//! where it lands instead of jumping there, and a middle click starts
-//! autoscroll, faster the further the pointer moves from where it began.
-//! Touchpads already send smooth pixel deltas and go straight to the list.
+//! Scrolling the way browsers do it, for the transcript and every scrolling
+//! area in the app: a wheel notch glides to where it lands instead of jumping
+//! there, and a middle click starts autoscroll, faster the further the pointer
+//! moves from where it began. Touchpads already send smooth pixel deltas and
+//! go straight to the element.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::{
-    AnyElement, App, CursorStyle, DispatchPhase, EntityId, FollowMode, HitboxBehavior, IntoElement,
-    ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-    Pixels, Point, ScrollDelta, ScrollWheelEvent, Styled as _, Window, anchored, canvas, deferred,
+    AnyElement, App, Context, CursorStyle, DispatchPhase, Div, EntityId, FollowMode,
+    HitboxBehavior, IntoElement, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    Stateful, StatefulInteractiveElement as _, Styled as _, Window, anchored, canvas, deferred,
     div, point, px,
 };
 
@@ -34,8 +37,16 @@ const END_SLACK: f32 = 1.;
 
 #[derive(Clone)]
 pub struct Scroller {
-    list: ListState,
+    surface: Surface,
     state: Rc<RefCell<State>>,
+}
+
+#[derive(Clone)]
+enum Surface {
+    /// The transcript, which follows its tail.
+    List(ListState),
+    /// Any other element that scrolls, through [`SmoothScroll`].
+    Area(ScrollHandle),
 }
 
 #[derive(Default)]
@@ -54,7 +65,14 @@ struct Autoscroll {
 impl Scroller {
     pub fn new(list: ListState) -> Self {
         Self {
-            list,
+            surface: Surface::List(list),
+            state: Rc::default(),
+        }
+    }
+
+    pub fn area() -> Self {
+        Self {
+            surface: Surface::Area(ScrollHandle::new()),
             state: Rc::default(),
         }
     }
@@ -99,13 +117,27 @@ impl Scroller {
         }
     }
 
-    /// Takes wheel and middle-button input over the transcript before the
-    /// list does. Goes over the list, filling the same box.
+    /// Takes wheel and middle-button input before the element under it does.
+    /// Over the transcript it fills the list's box; in an area it takes the
+    /// box from the area's handle, since its own moves with the content.
     pub fn catcher(&self, view: EntityId) -> impl IntoElement {
         let this = self.clone();
+        let ticker = self.clone();
         canvas(
-            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |bounds, window, _| {
+                let bounds = match &ticker.surface {
+                    Surface::List(_) => bounds,
+                    Surface::Area(handle) => {
+                        ticker.tick(window);
+                        handle.bounds()
+                    }
+                };
+                window.insert_hitbox(bounds, HitboxBehavior::Normal)
+            },
             move |_, hitbox, window, _| {
+                if this.state.borrow().autoscroll.is_some() {
+                    window.set_cursor_style(CursorStyle::ResizeUpDown, &hitbox);
+                }
                 let wheel = this.clone();
                 let wheel_hitbox = hitbox.clone();
                 window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -173,33 +205,27 @@ impl Scroller {
         .size_full()
     }
 
-    /// The mark autoscroll started from, and its cursor over the transcript.
+    /// The mark autoscroll started from, drawn over everything.
     pub fn autoscroll_mark(&self, cx: &App) -> Option<AnyElement> {
         let origin = self.state.borrow().autoscroll.as_ref()?.origin;
         let half = px(AUTOSCROLL_MARK_SIZE / 2.);
         Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .cursor(CursorStyle::ResizeUpDown)
-                .child(deferred(
-                    anchored().position(origin - point(half, half)).child(
-                        div()
-                            .size(px(AUTOSCROLL_MARK_SIZE))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().background)
-                            .shadow_sm()
-                            .child(Icon::new(Lucide::ChevronsUpDown).small()),
-                    ),
-                ))
-                .into_any_element(),
+            deferred(
+                anchored().position(origin - point(half, half)).child(
+                    div()
+                        .size(px(AUTOSCROLL_MARK_SIZE))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .shadow_sm()
+                        .child(Icon::new(Lucide::ChevronsUpDown).small()),
+                ),
+            )
+            .into_any_element(),
         )
     }
 
@@ -213,23 +239,54 @@ impl Scroller {
         if distance == 0. {
             return;
         }
-        self.list.scroll_by(px(distance));
-        if distance > 0. && self.position() >= self.max() - END_SLACK {
-            self.list.set_follow_mode(FollowMode::Tail);
+        match &self.surface {
+            Surface::List(list) => {
+                list.scroll_by(px(distance));
+                if distance > 0. && self.position() >= self.max() - END_SLACK {
+                    list.set_follow_mode(FollowMode::Tail);
+                }
+            }
+            Surface::Area(handle) => {
+                let y = (self.position() + distance).clamp(0., self.max());
+                handle.set_offset(point(handle.offset().x, px(-y)));
+            }
         }
     }
 
     /// Pixels scrolled from the top. While following the tail the list keeps
     /// its offset past the end, so that reads as the bottom.
     fn position(&self) -> f32 {
-        match self.list.is_following_tail() {
-            true => self.max(),
-            false => -f32::from(self.list.scroll_px_offset_for_scrollbar().y),
+        match &self.surface {
+            Surface::List(list) if list.is_following_tail() => self.max(),
+            Surface::List(list) => -f32::from(list.scroll_px_offset_for_scrollbar().y),
+            Surface::Area(handle) => -f32::from(handle.offset().y),
         }
     }
 
     fn max(&self) -> f32 {
-        f32::from(self.list.max_offset_for_scrollbar().y)
+        f32::from(match &self.surface {
+            Surface::List(list) => list.max_offset_for_scrollbar().y,
+            Surface::Area(handle) => handle.max_offset().y,
+        })
+    }
+}
+
+/// Vertical scrolling with a scrollbar, the glide and middle-click
+/// autoscroll included. In place of `overflow_y_scrollbar`.
+pub trait SmoothScroll {
+    fn smooth_scroll<V: 'static>(self, scroller: &Scroller, cx: &Context<V>) -> Self;
+}
+
+impl SmoothScroll for Stateful<Div> {
+    fn smooth_scroll<V: 'static>(self, scroller: &Scroller, cx: &Context<V>) -> Self {
+        let Surface::Area(handle) = &scroller.surface else {
+            return self;
+        };
+        self.track_scroll(handle)
+            .overflow_y_scroll()
+            .vertical_scrollbar(handle)
+            .child(scroller.catcher(cx.entity_id()))
+            .children(scroller.autoscroll_mark(cx))
     }
 }
 

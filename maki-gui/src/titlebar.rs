@@ -23,7 +23,6 @@ pub fn title_bar(
     crumbs: Vec<SharedString>,
     sidebar: Option<Handler>,
     gui_dir: Option<PathBuf>,
-    settings: Option<Handler>,
     notice: Option<AnyElement>,
     cx: &App,
 ) -> TitleBar {
@@ -94,16 +93,6 @@ pub fn title_bar(
                             false => "Dark mode",
                         })
                         .on_click(move |_, window, cx| toggle_dark(gui_dir.as_deref(), window, cx)),
-                )
-                .when_some(settings, |this, settings| {
-                    this.child(
-                        Button::new("titlebar-settings")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(Lucide::Settings))
-                            .tooltip("Settings")
-                            .on_click(move |_, window, cx| settings(window, cx)),
-                    )
-                }),
+                ),
         )
 }

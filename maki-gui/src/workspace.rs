@@ -18,7 +18,6 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::progress::{Progress, ProgressCircle};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::tooltip::Tooltip;
@@ -27,13 +26,13 @@ use gpui_kit::component::{
     WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    Anchor, Animation, AnimationExt as _, AnyWindowHandle, App, AppContext as _,
-    AsyncWindowContext, ClipboardEntry, Context, Div, Entity, ExternalPaths, FocusHandle,
-    Focusable, FollowMode, Image, InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent,
-    ListAlignment, ListOffset, ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
-    Subscription, Task, WeakEntity, Window, actions, div, ease_out_quint, hsla, img, list,
-    prelude::FluentBuilder as _, px, relative, rgb,
+    Anchor, Animation, AnimationExt as _, App, AppContext as _, AsyncWindowContext, ClipboardEntry,
+    Context, Div, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, Image,
+    InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, ListAlignment, ListOffset,
+    ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, WeakEntity,
+    Window, actions, div, ease_out_quint, hsla, img, list, prelude::FluentBuilder as _, px,
+    relative, rgb,
 };
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
@@ -45,6 +44,7 @@ use serde_json::Value;
 use crate::app::{apply_theme_message, toggle_dark};
 use crate::attachments::{self, Attachment};
 use crate::commands::{self, Builtin, Suggestion};
+use crate::customize::{CustomizeView, PluginsChanged};
 use crate::engine::{Boot, BtwEvent, Command, Engine, Update, UsageReport};
 use crate::ext::{COMMAND_TOPIC_PREFIX, Effect, Extensions, NotifyLevel};
 use crate::goal::{self, Goal, Next};
@@ -52,9 +52,9 @@ use crate::model_picker::{ModelPicker, OnPick};
 use crate::new_project::{self, OnProject};
 use crate::nodes;
 use crate::projects::ProjectStore;
-use crate::scroller::Scroller;
+use crate::scroller::{Scroller, SmoothScroll as _};
 use crate::settings::Settings;
-use crate::settings_window;
+use crate::settings_page::{self, SettingsView};
 use crate::titlebar::{Handler, title_bar};
 use crate::transcript::{
     Change, Item, Level, ToolCall, ToolStatus, Transcript, run_elapsed, step_run,
@@ -112,6 +112,7 @@ const UNTITLED: &str = "Untitled session";
 const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline, / for commands";
 const THUMB_SIZE: f32 = 56.;
 const COMPOSER_THUMB_SIZE: f32 = 140.;
+const PALETTE_HEIGHT: f32 = 360.;
 const FILE_CHIP_WIDTH: f32 = 220.;
 const MESSAGE_THUMB_SIZE: f32 = 200.;
 const STEP_THUMB_SIZE: f32 = 36.;
@@ -172,7 +173,8 @@ pub struct WorkspaceView {
     suggestions_dismissed: bool,
     aside: Option<Aside>,
     goal: Option<Goal>,
-    settings_window: Option<AnyWindowHandle>,
+    /// Shown in the main pane in place of the session until one is picked.
+    page: Option<MainPage>,
     model_picker: Option<Entity<ModelPicker>>,
     /// The thinking level picked here, over the config's.
     thinking: Option<StoredThinking>,
@@ -188,6 +190,9 @@ pub struct WorkspaceView {
     viewing: Option<Arc<Image>>,
     list: ListState,
     scroller: Scroller,
+    sidebar_scroller: Scroller,
+    suggestions_scroller: Scroller,
+    aside_scroller: Scroller,
     /// Items from here on arrived live and fade in; the loaded history does not.
     animate_from: usize,
     focus: FocusHandle,
@@ -254,7 +259,7 @@ impl WorkspaceView {
             suggestions_dismissed: false,
             aside: None,
             goal: None,
-            settings_window: None,
+            page: None,
             model_picker: None,
             thinking,
             usage: None,
@@ -265,6 +270,9 @@ impl WorkspaceView {
             sidebar_hidden: false,
             viewing: None,
             scroller: Scroller::new(list.clone()),
+            sidebar_scroller: Scroller::area(),
+            suggestions_scroller: Scroller::area(),
+            aside_scroller: Scroller::area(),
             list,
             animate_from: 0,
             focus: cx.focus_handle(),
@@ -398,6 +406,7 @@ impl WorkspaceView {
             );
             return cx.notify();
         }
+        self.page = None;
         self.store.touch(&project, now_epoch());
         self.unfolded.insert(project.clone());
         self.refresh_sessions(&project);
@@ -779,17 +788,41 @@ impl WorkspaceView {
         }
     }
 
+    fn open_customize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|_| {
+            CustomizeView::new(
+                self.engine.as_ref(),
+                self.gui_dir.clone(),
+                self.project.as_deref(),
+            )
+        });
+        let subscription =
+            cx.subscribe_in(&view, window, |this, _, _: &PluginsChanged, window, cx| {
+                this.providers_changed(window, cx)
+            });
+        self.page = Some(MainPage::Customize {
+            view,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = cx.entity().downgrade();
         let main = window.window_handle();
-        let on_change: settings_window::OnChange = Rc::new(move |cx| {
+        let on_change: settings_page::OnChange = Rc::new(move |cx| {
             let workspace = workspace.clone();
             let _ = main.update(cx, |_, window, cx| {
                 let _ = workspace.update(cx, |this, cx| this.providers_changed(window, cx));
             });
         });
-        self.settings_window =
-            settings_window::open(self.settings_window, self.gui_dir.clone(), on_change, cx);
+        if matches!(self.page, Some(MainPage::Settings(_))) {
+            return;
+        }
+        let gui_dir = self.gui_dir.clone();
+        let view = cx.new(|cx| SettingsView::new(gui_dir, on_change, window, cx));
+        self.page = Some(MainPage::Settings(view));
+        cx.notify();
     }
 
     fn attach(&mut self, attachment: Attachment, cx: &mut Context<Self>) {
@@ -1373,13 +1406,23 @@ impl WorkspaceView {
                         nav_item("new-project", Lucide::FolderPlus, "New project", cx).on_click(
                             cx.listener(|this, _, window, cx| this.create_project(window, cx)),
                         ),
+                    )
+                    .child(
+                        nav_item("customize", Lucide::Blocks, "Customize", cx)
+                            .when(
+                                matches!(self.page, Some(MainPage::Customize { .. })),
+                                |this| this.bg(cx.theme().sidebar_accent),
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_customize(window, cx)),
+                            ),
                     ),
             )
             .child(
                 div()
                     .id("sidebar-scroll")
                     .flex_1()
-                    .overflow_y_scrollbar()
+                    .smooth_scroll(&self.sidebar_scroller, cx)
                     .child(
                         v_flex()
                             .px_2()
@@ -1413,6 +1456,17 @@ impl WorkspaceView {
                                     }))
                             })),
                     ),
+            )
+            .child(
+                div().px_2().py_2().child(
+                    nav_item("settings", Lucide::Settings, "Settings", cx)
+                        .when(matches!(self.page, Some(MainPage::Settings(_))), |this| {
+                            this.bg(cx.theme().sidebar_accent)
+                        })
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
+                        ),
+                ),
             )
     }
 
@@ -2356,7 +2410,7 @@ impl WorkspaceView {
                 v_flex()
                     .id("suggestions")
                     .max_h(px(SUGGESTIONS_HEIGHT))
-                    .overflow_y_scrollbar()
+                    .smooth_scroll(&self.suggestions_scroller, cx)
                     .p_1()
                     .rounded(cx.theme().radius_lg)
                     .border_1()
@@ -2449,7 +2503,7 @@ impl WorkspaceView {
                     div()
                         .id("aside-answer")
                         .max_h(px(ASIDE_HEIGHT))
-                        .overflow_y_scrollbar()
+                        .smooth_scroll(&self.aside_scroller, cx)
                         .text_sm()
                         .child(TextView::markdown("aside-text", aside.answer.clone())),
                 )
@@ -2821,10 +2875,6 @@ impl Render for WorkspaceView {
             .text_color(cx.theme().foreground)
             .child({
                 let workspace = cx.entity().downgrade();
-                let settings: Handler = Rc::new(move |window, cx| {
-                    let _ = workspace.update(cx, |this, cx| this.open_settings(window, cx));
-                });
-                let workspace = cx.entity().downgrade();
                 let sidebar: Handler = Rc::new(move |_, cx| {
                     let _ = workspace.update(cx, |this, cx| {
                         this.sidebar_hidden = !this.sidebar_hidden;
@@ -2837,14 +2887,7 @@ impl Render for WorkspaceView {
                     .into_iter()
                     .collect();
                 let notice = self.render_update(cx);
-                title_bar(
-                    crumbs,
-                    Some(sidebar),
-                    self.gui_dir.clone(),
-                    Some(settings),
-                    notice,
-                    cx,
-                )
+                title_bar(crumbs, Some(sidebar), self.gui_dir.clone(), notice, cx)
             })
             .child(
                 h_flex()
@@ -2877,7 +2920,13 @@ impl Render for WorkspaceView {
                             .when(!hidden, |this| {
                                 this.border_l_1().rounded_tl(px(MAIN_CORNER_RADIUS))
                             })
-                            .child(self.render_main(cx)),
+                            .child(match &self.page {
+                                Some(MainPage::Customize { view, .. }) => {
+                                    view.clone().into_any_element()
+                                }
+                                Some(MainPage::Settings(view)) => view.clone().into_any_element(),
+                                None => self.render_main(cx),
+                            }),
                     ),
             )
             .children(self.viewing.clone().map(|image| render_viewer(image, cx)))
@@ -3026,20 +3075,18 @@ fn thumbnail(image: &Arc<Image>, size: f32, cx: &Context<WorkspaceView>) -> impl
     div()
         .id(("thumbnail", Arc::as_ptr(image) as usize))
         .flex_none()
+        .size(px(size))
+        .overflow_hidden()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
             this.viewing = Some(full.clone());
             cx.notify();
         }))
-        .child(
-            img(image.clone())
-                .size(px(size))
-                .object_fit(ObjectFit::Cover)
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(cx.theme().border),
-        )
+        .child(img(image.clone()).size_full().object_fit(ObjectFit::Cover))
 }
 
 /// The picture alone on a dimmed window; a click anywhere or Escape closes it.
@@ -3269,6 +3316,14 @@ enum PaletteAction {
     Lua(String),
 }
 
+enum MainPage {
+    Customize {
+        view: Entity<CustomizeView>,
+        _subscription: Subscription,
+    },
+    Settings(Entity<SettingsView>),
+}
+
 #[derive(Clone)]
 struct PaletteEntry {
     title: SharedString,
@@ -3295,6 +3350,7 @@ struct Palette {
     entries: Vec<PaletteEntry>,
     query: Entity<gpui_kit::component::input::InputState>,
     workspace: WeakEntity<WorkspaceView>,
+    scroller: Scroller,
     _subscription: Subscription,
 }
 
@@ -3326,6 +3382,7 @@ impl Palette {
             entries,
             query,
             workspace,
+            scroller: Scroller::area(),
             _subscription: subscription,
         }
     }
@@ -3356,8 +3413,8 @@ impl Render for Palette {
             .child(
                 div()
                     .id("palette-list")
-                    .max_h(px(360.))
-                    .overflow_y_scrollbar()
+                    .max_h(px(PALETTE_HEIGHT))
+                    .smooth_scroll(&self.scroller, cx)
                     .child(
                         v_flex()
                             .gap_0p5()

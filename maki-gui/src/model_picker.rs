@@ -6,7 +6,6 @@ use std::rc::Rc;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::PopoverState;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, v_flex,
 };
@@ -15,6 +14,8 @@ use gpui_kit::{
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _, px,
 };
+
+use crate::scroller::{Scroller, SmoothScroll as _};
 
 const PROVIDER_SEPARATOR: char = '/';
 const LIST_HEIGHT: f32 = 360.;
@@ -31,6 +32,7 @@ pub struct ModelPicker {
     on_pick: OnPick,
     /// The popover showing this picker, closed once a model is picked.
     popover: Option<WeakEntity<PopoverState>>,
+    scroller: Scroller,
     _subscription: Subscription,
 }
 
@@ -64,6 +66,7 @@ impl ModelPicker {
             query,
             on_pick,
             popover: None,
+            scroller: Scroller::area(),
             _subscription: subscription,
         }
     }
@@ -169,7 +172,7 @@ impl Render for ModelPicker {
                 div()
                     .id("model-list")
                     .max_h(px(LIST_HEIGHT))
-                    .overflow_y_scrollbar()
+                    .smooth_scroll(&self.scroller, cx)
                     .child(v_flex().children(rows))
                     .when(empty, |this| {
                         this.child(

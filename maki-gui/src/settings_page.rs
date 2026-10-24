@@ -1,6 +1,6 @@
-//! The Settings window: appearance, the providers the user connected, and
-//! add-ons. Changes that affect sessions are reported through `on_change`, so
-//! the main window can pick them up.
+//! The Settings page, shown in the main pane: appearance, the providers the
+//! user connected, and add-ons. Changes that affect sessions are reported
+//! through `on_change`, so the open session can pick them up.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -10,17 +10,13 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _, StyledExt as _, TitleBar, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::{
-    Anchor, AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowBounds,
-    WindowOptions, div, prelude::FluentBuilder as _, px, size,
+    Anchor, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 use maki_config::providers::Protocol;
 use maki_providers::openai_auth;
@@ -31,15 +27,12 @@ use crate::app::set_dark;
 use crate::custom_providers::{
     self, Connected, Draft, PROTOCOLS, ProviderModel, parse_tokens, protocol_label,
 };
+use crate::scroller::{Scroller, SmoothScroll as _};
 use crate::settings::Settings;
 use crate::titlebar::APP_NAME;
 use crate::update;
 
-const WIDTH: f32 = 820.;
-const HEIGHT: f32 = 620.;
-const NAV_WIDTH: f32 = 200.;
 const CONTENT_WIDTH: f32 = 560.;
-const TITLE_BAR_HEIGHT: f32 = 40.;
 const MENU_WIDTH: f32 = 220.;
 const MODEL_LIST_HEIGHT: f32 = 280.;
 const CONTEXT_INPUT_WIDTH: f32 = 110.;
@@ -70,36 +63,6 @@ impl Page {
             Self::General => Lucide::Settings,
             Self::Providers => Lucide::Plug,
             Self::Addons => Lucide::Puzzle,
-        }
-    }
-}
-
-/// Brings the window forward if it is open, otherwise opens it.
-pub fn open(
-    existing: Option<AnyWindowHandle>,
-    gui_dir: Option<PathBuf>,
-    on_change: OnChange,
-    cx: &mut App,
-) -> Option<AnyWindowHandle> {
-    if let Some(handle) = existing
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
-        return Some(handle);
-    }
-    let bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        ..TitleBar::window_options()
-    };
-    match gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| SettingsView::new(gui_dir, on_change, window, cx))
-    }) {
-        Ok((handle, _)) => Some(handle),
-        Err(e) => {
-            tracing::error!(error = %e, "open settings window");
-            None
         }
     }
 }
@@ -213,7 +176,7 @@ impl ProviderForm {
     }
 }
 
-struct SettingsView {
+pub struct SettingsView {
     gui_dir: Option<PathBuf>,
     storage: Option<StateDir>,
     on_change: OnChange,
@@ -222,11 +185,13 @@ struct SettingsView {
     form: ProviderForm,
     error: Option<SharedString>,
     signing_in: bool,
+    page_scroller: Scroller,
+    models_scroller: Scroller,
     _subscription: Subscription,
 }
 
 impl SettingsView {
-    fn new(
+    pub fn new(
         gui_dir: Option<PathBuf>,
         on_change: OnChange,
         window: &mut Window,
@@ -253,6 +218,8 @@ impl SettingsView {
             form,
             error: None,
             signing_in: false,
+            page_scroller: Scroller::area(),
+            models_scroller: Scroller::area(),
             _subscription: subscription,
         }
     }
@@ -409,7 +376,7 @@ impl SettingsView {
                             div()
                                 .id("provider-models")
                                 .max_h(px(MODEL_LIST_HEIGHT))
-                                .overflow_y_scrollbar()
+                                .smooth_scroll(&self.models_scroller, cx)
                                 .child(v_flex().children(shown.iter().map(|&i| {
                                     let row = &self.form.models[i];
                                     h_flex()
@@ -508,15 +475,11 @@ impl SettingsView {
     }
 
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .w(px(NAV_WIDTH))
-            .h_full()
-            .flex_none()
-            .p_2()
-            .gap_0p5()
-            .border_r_1()
-            .border_color(cx.theme().sidebar_border)
-            .bg(cx.theme().sidebar)
+        h_flex()
+            .gap_1()
+            .p_1()
+            .rounded(cx.theme().radius_lg)
+            .bg(cx.theme().muted)
             .children(Page::ALL.into_iter().map(|page| {
                 let current = page == self.page;
                 h_flex()
@@ -527,12 +490,14 @@ impl SettingsView {
                     .rounded(cx.theme().radius)
                     .cursor_pointer()
                     .text_sm()
+                    .text_color(cx.theme().muted_foreground)
                     .when(current, |this| {
-                        this.bg(cx.theme().sidebar_accent)
+                        this.bg(cx.theme().background)
                             .font_medium()
-                            .text_color(cx.theme().sidebar_accent_foreground)
+                            .text_color(cx.theme().foreground)
+                            .shadow_xs()
                     })
-                    .hover(|style| style.bg(cx.theme().sidebar_accent))
+                    .hover(|style| style.text_color(cx.theme().foreground))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.page = page;
                         this.error = None;
@@ -826,43 +791,26 @@ impl Render for SettingsView {
             Page::Providers => self.render_providers(cx).into_any_element(),
             Page::Addons => self.render_addons(cx).into_any_element(),
         };
-        v_flex()
-            .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+        div()
+            .id("settings-page")
+            .flex_1()
+            .min_h_0()
+            .smooth_scroll(&self.page_scroller, cx)
             .child(
-                TitleBar::new()
-                    .h(px(TITLE_BAR_HEIGHT))
-                    .border_b_0()
-                    .bg(cx.theme().background)
-                    .child(div().pl_1().text_sm().font_semibold().child("Settings")),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
+                v_flex()
+                    .w(px(CONTENT_WIDTH))
+                    .max_w_full()
+                    .mx_auto()
+                    .px_6()
+                    .py_8()
+                    .gap_8()
                     .child(self.render_nav(cx))
-                    .child(
-                        div()
-                            .id("settings-page")
-                            .flex_1()
-                            .h_full()
-                            .overflow_y_scrollbar()
-                            .child(
-                                div()
-                                    .w(px(CONTENT_WIDTH))
-                                    .max_w_full()
-                                    .mx_auto()
-                                    .px_6()
-                                    .py_8()
-                                    .child(page),
-                            ),
-                    ),
+                    .child(page),
             )
     }
 }
 
-fn heading(title: &str, description: &str, cx: &App) -> impl IntoElement {
+pub(crate) fn heading(title: &str, description: &str, cx: &App) -> impl IntoElement {
     v_flex()
         .gap_1()
         .child(div().text_xl().font_semibold().child(title.to_owned()))
@@ -874,7 +822,7 @@ fn heading(title: &str, description: &str, cx: &App) -> impl IntoElement {
         )
 }
 
-fn card(cx: &App) -> gpui_kit::Div {
+pub(crate) fn card(cx: &App) -> gpui_kit::Div {
     v_flex()
         .rounded(cx.theme().radius_lg)
         .border_1()
@@ -882,7 +830,7 @@ fn card(cx: &App) -> gpui_kit::Div {
         .bg(cx.theme().background)
 }
 
-fn divider(cx: &App) -> impl IntoElement {
+pub(crate) fn divider(cx: &App) -> impl IntoElement {
     div().h(px(1.)).w_full().bg(cx.theme().border)
 }
 

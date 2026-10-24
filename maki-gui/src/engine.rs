@@ -26,6 +26,32 @@ pub trait Engine: Send + Sync + 'static {
     /// Records the user's trust in `project`, so its `.maki` config, plugins
     /// and GUI extensions load on the next [`Engine::open`].
     fn trust(&self, project: &Path) -> Result<()>;
+
+    /// Every plugin a session could load: bundled ones and installed packages.
+    fn plugins(&self) -> Vec<PluginInfo>;
+}
+
+pub struct PluginInfo {
+    pub name: String,
+    pub kind: PluginKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PluginKind {
+    /// Bundled, adds tools.
+    Tool,
+    /// Bundled, adds a model provider.
+    Provider,
+    /// Bundled, off unless switched on.
+    Optional,
+    /// Installed by the user.
+    Package,
+}
+
+impl PluginKind {
+    pub fn on_by_default(self) -> bool {
+        self != Self::Optional
+    }
 }
 
 pub struct Session {
