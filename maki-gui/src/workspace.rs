@@ -3,10 +3,11 @@
 //! plugins add around them.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flume::Sender;
 use gpui_kit::assets::IconName as Lucide;
@@ -54,7 +55,9 @@ use crate::scroller::Scroller;
 use crate::settings::Settings;
 use crate::settings_window;
 use crate::titlebar::{Handler, title_bar};
-use crate::transcript::{Change, Item, Level, ToolCall, ToolStatus, Transcript};
+use crate::transcript::{
+    Change, Item, Level, ToolCall, ToolStatus, Transcript, run_elapsed, step_run,
+};
 use crate::update::{self, Release};
 
 actions!(
@@ -66,6 +69,9 @@ const KEY_CONTEXT: &str = "Workspace";
 const SIDEBAR_WIDTH: f32 = 264.;
 const TRANSCRIPT_WIDTH: f32 = 820.;
 const TOOL_PREVIEW_LINES: usize = 12;
+/// Lines the step card sits in from its header, past the status icon.
+const STEP_INDENT: f32 = 22.;
+const THOUGHT_LABEL: &str = "Thought";
 const THINKING_PREVIEW_LINES: usize = 3;
 const LIST_OVERDRAW: f32 = 800.;
 const TURN_TICK_WIDTH: f32 = 10.;
@@ -1583,14 +1589,22 @@ impl WorkspaceView {
         let len = self.transcript.items.len();
         let last = index + 1 == len;
         let fresh = index >= self.animate_from && index + 2 >= len;
+        let run = step_run(&self.transcript.items, index);
+        let joined = run.as_ref().is_some_and(|run| index > run.start);
+        let content = match run {
+            Some(run) => self.render_step(index, run, cx),
+            None => self.render_item(index, item, cx),
+        };
         let row = h_flex().w_full().justify_center().child(
             div()
                 .w(px(TRANSCRIPT_WIDTH))
                 .max_w_full()
                 .px_6()
-                .pt(px(if index == 0 { 24. } else { 16. }))
+                .when(!joined, |this| {
+                    this.pt(px(if index == 0 { 24. } else { 16. }))
+                })
                 .when(last, |this| this.pb_6())
-                .child(self.render_item(index, item, cx)),
+                .child(content),
         );
         match fresh {
             true => fade_in(row, ("row-in", index)).into_any_element(),
@@ -1710,7 +1724,7 @@ impl WorkspaceView {
                     .child(TextView::markdown(text_id, shown))
                     .into_any_element()
             }
-            Item::Tool(call) => self.render_tool(call, cx).into_any_element(),
+            Item::Tool(call) => self.tool_output(call, true, cx).into_any_element(),
             Item::Notice { text, level } => {
                 let color = match level {
                     Level::Info => cx.theme().muted_foreground,
@@ -1729,78 +1743,184 @@ impl WorkspaceView {
         }
     }
 
-    fn render_tool(&self, call: &ToolCall, cx: &mut Context<Self>) -> impl IntoElement {
-        let key = format!("tool-{}", call.id);
-        let open = self.expanded.contains(&key);
-        let status = match call.status {
-            ToolStatus::Running => Spinner::new().xsmall().into_any_element(),
-            ToolStatus::Done => Icon::new(IconName::Check)
-                .xsmall()
-                .text_color(cx.theme().success)
-                .into_any_element(),
-            ToolStatus::Failed => Icon::new(IconName::Close)
+    /// One row of a run of tool calls: the run's header and card top on its
+    /// first row, a line of the card on the others. A folded run keeps only
+    /// its header.
+    fn render_step(
+        &self,
+        index: usize,
+        run: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let steps = &self.transcript.items[run.clone()];
+        let calls = || {
+            steps.iter().filter_map(|item| match item {
+                Item::Tool(call) => Some(call),
+                _ => None,
+            })
+        };
+        let running = calls().any(|c| c.status == ToolStatus::Running);
+        let key = format!("steps-{}", run.start);
+        let open = self.expanded.contains(&key) != running;
+        let first = index == run.start;
+        let row = open.then(|| self.render_step_row(index, &run, cx));
+        if !first {
+            return row.map_or_else(|| div().into_any_element(), IntoElement::into_any_element);
+        }
+        let failed = calls().any(|c| c.status == ToolStatus::Failed);
+        let icon = match (running, failed) {
+            (true, _) => Spinner::new().xsmall().into_any_element(),
+            (false, true) => Icon::new(IconName::Close)
                 .xsmall()
                 .text_color(cx.theme().danger)
                 .into_any_element(),
+            (false, false) => Icon::new(IconName::Check)
+                .xsmall()
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element(),
         };
-        let has_output = !call.output.is_empty();
+        let title = calls().next_back().map(step_label).unwrap_or_default();
+        let elapsed = run_elapsed(steps, Instant::now()).map(short_duration);
+        let toggled = run.clone();
+        v_flex()
+            .gap_1p5()
+            .child(
+                h_flex()
+                    .id(SharedString::from(key.clone()))
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.list.remeasure_items(toggled.clone());
+                        this.toggle(&key, cx)
+                    }))
+                    .child(
+                        div()
+                            .w(px(STEP_INDENT - 8.))
+                            .flex()
+                            .justify_center()
+                            .child(icon),
+                    )
+                    .child(div().min_w_0().truncate().text_sm().child(title))
+                    .when_some(elapsed, |this, elapsed| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(elapsed),
+                        )
+                    })
+                    .child(
+                        Icon::new(match open {
+                            true => IconName::ChevronDown,
+                            false => IconName::ChevronRight,
+                        })
+                        .xsmall()
+                        .text_color(cx.theme().muted_foreground),
+                    ),
+            )
+            .children(row)
+            .into_any_element()
+    }
+
+    fn render_step_row(
+        &self,
+        index: usize,
+        run: &Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let item = &self.transcript.items[index];
+        let key = format!("step-{index}");
+        let open = self.expanded.contains(&key);
+        let (label, color) = match item {
+            Item::Tool(call) => (
+                step_label(call),
+                match call.status {
+                    ToolStatus::Failed => cx.theme().danger,
+                    ToolStatus::Running => cx.theme().foreground,
+                    ToolStatus::Done => cx.theme().muted_foreground,
+                },
+            ),
+            _ => (THOUGHT_LABEL.to_owned(), cx.theme().muted_foreground),
+        };
+        let body = match item {
+            Item::Tool(call) if open && !call.output.is_empty() => {
+                Some(self.tool_output(call, true, cx).into_any_element())
+            }
+            Item::Thinking(text) if open => Some(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(TextView::markdown(
+                        SharedString::from(format!("{key}-text")),
+                        text.clone(),
+                    ))
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
         let toggle = key.clone();
         v_flex()
-            .rounded(cx.theme().radius_lg)
-            .border_1()
+            .ml(px(STEP_INDENT))
+            .border_x_1()
+            .border_t_1()
             .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .overflow_hidden()
+            .when(index == run.start, |this| this.rounded_t_lg())
+            .when(index + 1 == run.end, |this| {
+                this.border_b_1().rounded_b_lg()
+            })
             .child(
                 h_flex()
                     .id(SharedString::from(key))
-                    .gap_2()
+                    .gap_1()
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .cursor_pointer()
                     .hover(|style| style.bg(cx.theme().accent))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(&toggle, cx)))
-                    .child(status)
-                    .child(div().text_sm().font_medium().child(call.name.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.list.remeasure_items(index..index + 1);
+                        this.toggle(&toggle, cx)
+                    }))
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
                             .truncate()
-                            .child(call.summary.clone()),
+                            .text_sm()
+                            .text_color(color)
+                            .child(label),
                     )
-                    .when(has_output, |this| {
-                        this.child(
-                            Icon::new(match open {
-                                true => IconName::ChevronUp,
-                                false => IconName::ChevronDown,
-                            })
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground),
-                        )
-                    }),
+                    .child(
+                        Icon::new(match open {
+                            true => IconName::ChevronDown,
+                            false => IconName::ChevronRight,
+                        })
+                        .xsmall()
+                        .text_color(cx.theme().muted_foreground),
+                    ),
             )
-            .when(
-                has_output && (open || call.status == ToolStatus::Failed),
-                |this| {
-                    this.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().muted)
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_xs()
-                            .whitespace_normal()
-                            .child(match open {
-                                true => call.output.clone(),
-                                false => preview(&call.output, TOOL_PREVIEW_LINES),
-                            }),
-                    )
-                },
-            )
+            .children(body)
+    }
+
+    fn tool_output(&self, call: &ToolCall, open: bool, cx: &App) -> impl IntoElement + use<> {
+        div()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_xs()
+            .whitespace_normal()
+            .child(match open {
+                true => call.output.clone(),
+                false => preview(&call.output, TOOL_PREVIEW_LINES),
+            })
     }
 
     fn toggle(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -2767,6 +2887,30 @@ fn turn_card(prompt: &SharedString, reply: &SharedString, cx: &App) -> gpui_kit:
         .into_any_element()
 }
 
+/// What a call did, in a line: the tool and what it was pointed at.
+fn step_label(call: &ToolCall) -> String {
+    match call.target() {
+        "" => call.name.clone(),
+        target => format!("{} {target}", call.name),
+    }
+}
+
+/// `39s`, `2m 5s`, `1h 3m`.
+fn short_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs {
+        s if s < SECONDS_PER_MINUTE => format!("{s}s"),
+        s if s < SECONDS_PER_HOUR => {
+            format!("{}m {}s", s / SECONDS_PER_MINUTE, s % SECONDS_PER_MINUTE)
+        }
+        s => format!(
+            "{}h {}m",
+            s / SECONDS_PER_HOUR,
+            s % SECONDS_PER_HOUR / SECONDS_PER_MINUTE
+        ),
+    }
+}
+
 fn preview(text: &str, lines: usize) -> String {
     let mut out: String = text.lines().take(lines).collect::<Vec<_>>().join("\n");
     if text.lines().nth(lines).is_some() {
@@ -3110,6 +3254,13 @@ mod tests {
     fn reset_times_are_relative(left: u64, expected: Option<&str>) {
         let now = 1_000_000;
         assert_eq!(resets_in(now, (now + left) * 1_000).as_deref(), expected);
+    }
+
+    #[test_case(39, "39s" ; "seconds")]
+    #[test_case(125, "2m 5s" ; "minutes")]
+    #[test_case(3_780, "1h 3m" ; "hours")]
+    fn durations_are_short(secs: u64, expected: &str) {
+        assert_eq!(short_duration(Duration::from_secs(secs)), expected);
     }
 
     #[test]

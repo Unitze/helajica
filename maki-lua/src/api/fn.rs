@@ -15,6 +15,7 @@ use maki_config::ShellPreference;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
+use maki_storage::process::hide_console;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
 
@@ -293,7 +294,7 @@ impl JobStore {
             on_exit,
         } = spec;
         let mut command = cmd.build();
-        strip_provider_keys(&mut command)
+        hide_console(strip_provider_keys(&mut command))
             .stdout(stdout.stdio()?)
             .stderr(stderr.stdio()?)
             .stdin(Stdio::null());
@@ -804,7 +805,7 @@ fn kill_job(job: &JobMeta) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = hide_console(&mut Command::new("taskkill"))
             .args(["/T", "/F", "/PID", &job.pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

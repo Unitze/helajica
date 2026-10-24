@@ -13,6 +13,7 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, PathPromptOptions,
     Render, SharedString, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
+use maki_storage::process::hide_console;
 
 const TITLE: &str = "New project";
 const PICK_FOLDER_PROMPT: &str = "Open";
@@ -109,7 +110,10 @@ impl NewProjectForm {
         std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
         if self.git {
             // Best effort: a missing git still leaves a usable folder.
-            let _ = Process::new(GIT).arg("init").current_dir(&path).output();
+            let _ = hide_console(&mut Process::new(GIT))
+                .arg("init")
+                .current_dir(&path)
+                .output();
         }
         Ok(path)
     }

@@ -7,6 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
+use maki_storage::process::hide_console;
+
 /// Peels whatever a ref names down to a commit.
 const COMMIT_PEEL: &str = "^{commit}";
 const PLUGIN_MANIFEST: &str = "plugin.toml";
@@ -231,7 +233,7 @@ pub async fn run(args: Vec<String>, cwd: PathBuf) -> Result<GitOutput, GitError>
     let display = redact(&args.join(" "));
     let output = smol::unblock(move || {
         let mut cmd = std::process::Command::new("git");
-        cmd.args(&args);
+        hide_console(&mut cmd).args(&args);
         cmd.current_dir(cwd);
         for (key, value) in hardening_env() {
             cmd.env(key, value);

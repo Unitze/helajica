@@ -2,6 +2,8 @@
 //! free of GPUI so the folding is testable on its own.
 
 use std::fmt::Write as _;
+use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use maki_agent::{AgentEvent, Envelope, ToolOutput};
 use maki_providers::{ContentBlock, ImageSource, Message, MessageKind, Role, TokenUsage};
@@ -11,6 +13,17 @@ use similar::TextDiff;
 const DIFF_CONTEXT_LINES: usize = 3;
 const CANCELLED: &str = "Cancelled";
 const TEXT_BLOCK_SEPARATOR: &str = "\n";
+/// Input fields that say what a call was pointed at, most telling first.
+const TARGET_FIELDS: [&str; 8] = [
+    "description",
+    "command",
+    "path",
+    "file_path",
+    "pattern",
+    "url",
+    "query",
+    "code",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -27,6 +40,28 @@ pub struct ToolCall {
     pub input: Option<Value>,
     pub output: String,
     pub status: ToolStatus,
+    /// When it ran, for calls seen live; a resumed session has no times.
+    pub started: Option<Instant>,
+    pub finished: Option<Instant>,
+}
+
+impl ToolCall {
+    /// The summary the agent gave, or, for a call from a resumed session that
+    /// has none, the first line of its most telling input field.
+    pub fn target(&self) -> &str {
+        if !self.summary.is_empty() {
+            return &self.summary;
+        }
+        self.input
+            .as_ref()
+            .and_then(|input| {
+                TARGET_FIELDS
+                    .iter()
+                    .find_map(|field| input[*field].as_str())
+            })
+            .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+            .map_or("", str::trim)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +166,8 @@ impl Transcript {
                     input: Some(input.clone()),
                     output: String::new(),
                     status: ToolStatus::Done,
+                    started: None,
+                    finished: None,
                 })),
                 ContentBlock::ToolResult {
                     tool_use_id,
@@ -184,6 +221,7 @@ impl Transcript {
                 call.name = done.tool.to_string();
                 call.output = output_text(&done.output);
                 call.status = status(done.is_error);
+                call.finished = Some(Instant::now());
             }),
             AgentEvent::TurnComplete(turn) => {
                 add_usage(&mut self.totals.usage, &turn.usage);
@@ -268,6 +306,8 @@ impl Transcript {
             input: None,
             output: String::new(),
             status: ToolStatus::Running,
+            started: Some(Instant::now()),
+            finished: None,
         };
         update(&mut call);
         self.items.push(Item::Tool(call));
@@ -302,9 +342,49 @@ impl Transcript {
                 && call.status == ToolStatus::Running
             {
                 call.status = ToolStatus::Failed;
+                call.finished = Some(Instant::now());
             }
         }
     }
+}
+
+/// The tool calls around `index`, with the thinking between them, that read
+/// as one piece of work. `None` when `index` is not part of one.
+pub fn step_run(items: &[Item], index: usize) -> Option<Range<usize>> {
+    let is_step = |item: &Item| matches!(item, Item::Tool(_) | Item::Thinking(_));
+    if !items.get(index).is_some_and(is_step) {
+        return None;
+    }
+    let start = items[..index]
+        .iter()
+        .rposition(|item| !is_step(item))
+        .map_or(0, |i| i + 1);
+    let end = items[index..]
+        .iter()
+        .position(|item| !is_step(item))
+        .map_or(items.len(), |i| index + i);
+    items[start..end]
+        .iter()
+        .any(|item| matches!(item, Item::Tool(_)))
+        .then_some(start..end)
+}
+
+/// From the first call starting to the last one finishing, or to `now` while
+/// one still runs. `None` when the calls were not seen live.
+pub fn run_elapsed(steps: &[Item], now: Instant) -> Option<Duration> {
+    let mut calls = steps.iter().filter_map(|item| match item {
+        Item::Tool(call) => Some(call),
+        _ => None,
+    });
+    let started = calls.next()?.started?;
+    let finished = steps
+        .iter()
+        .filter_map(|item| match item {
+            Item::Tool(call) => Some(call.finished.unwrap_or(now)),
+            _ => None,
+        })
+        .max()?;
+    Some(finished.saturating_duration_since(started))
 }
 
 fn status(is_error: bool) -> ToolStatus {
@@ -377,8 +457,10 @@ pub fn output_text(output: &ToolOutput) -> String {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::ToolDoneEvent;
     use std::sync::Arc;
+
+    use maki_agent::ToolDoneEvent;
+    use test_case::test_case;
 
     use super::*;
 
@@ -429,6 +511,73 @@ mod tests {
             (call.status, call.output.as_str()),
             (ToolStatus::Done, "ok")
         );
+    }
+
+    fn tool() -> Item {
+        Item::Tool(ToolCall {
+            id: TOOL_ID.into(),
+            name: TOOL_NAME.into(),
+            summary: String::new(),
+            input: None,
+            output: String::new(),
+            status: ToolStatus::Done,
+            started: None,
+            finished: None,
+        })
+    }
+
+    #[test_case("ran it", None, "ran it" ; "summary_wins")]
+    #[test_case("", Some(r#"{"command":"cargo build","path":"x"}"#), "cargo build" ; "command")]
+    #[test_case("", Some(r#"{"code":"\n  import os\nprint(1)"}"#), "import os" ; "first_code_line")]
+    #[test_case("", Some(r#"{"other":1}"#), "" ; "nothing_telling")]
+    #[test_case("", None, "" ; "no_input")]
+    fn calls_say_what_they_were_pointed_at(summary: &str, input: Option<&str>, expected: &str) {
+        let Item::Tool(mut call) = tool() else {
+            unreachable!()
+        };
+        call.summary = summary.into();
+        call.input = input.map(|json| serde_json::from_str(json).unwrap());
+        assert_eq!(call.target(), expected);
+    }
+
+    #[test_case(0, None ; "a_reply_is_no_step")]
+    #[test_case(1, Some(1..4) ; "first_call")]
+    #[test_case(2, Some(1..4) ; "thinking_between_calls")]
+    #[test_case(3, Some(1..4) ; "last_call")]
+    #[test_case(5, None ; "thinking_alone")]
+    fn calls_run_together_until_a_reply(index: usize, expected: Option<Range<usize>>) {
+        let items = [
+            Item::Assistant("looking".into()),
+            tool(),
+            Item::Thinking("hmm".into()),
+            tool(),
+            Item::Assistant("done".into()),
+            Item::Thinking("later".into()),
+        ];
+        assert_eq!(step_run(&items, index), expected);
+    }
+
+    #[test]
+    fn a_run_lasts_from_first_start_to_last_finish() {
+        let start = Instant::now();
+        let timed = |from: u64, to: Option<u64>| {
+            let Item::Tool(mut call) = tool() else {
+                unreachable!()
+            };
+            call.started = Some(start + Duration::from_secs(from));
+            call.finished = to.map(|to| start + Duration::from_secs(to));
+            Item::Tool(call)
+        };
+        let now = start + Duration::from_secs(60);
+        assert_eq!(
+            run_elapsed(&[timed(0, Some(5)), timed(6, Some(39))], now),
+            Some(Duration::from_secs(39))
+        );
+        assert_eq!(
+            run_elapsed(&[timed(0, Some(5)), timed(6, None)], now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(run_elapsed(&[tool()], now), None);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use maki_providers::plugin;
 use maki_providers::spec::ProviderRegistry;
 use maki_storage::paths::{self, tilde};
+use maki_storage::process::hide_console;
 use maki_storage::{StateDir, model, version};
 
 use crate::update;
@@ -75,7 +76,7 @@ impl Reference {
 /// scripts, and so can run the porting agent and show what the scripts served.
 fn old_maki() -> Option<PathBuf> {
     let path = update::backup_path().ok()?;
-    let output = Command::new(&path)
+    let output = hide_console(&mut Command::new(&path))
         .arg(VERSION_FLAG)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
