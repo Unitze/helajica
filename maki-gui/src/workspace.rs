@@ -23,10 +23,11 @@ use gpui_kit::component::{
     WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    Anchor, App, AppContext as _, AsyncWindowContext, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity,
-    Window, actions, div, prelude::FluentBuilder as _, px,
+    Anchor, AnyWindowHandle, App, AppContext as _, AsyncWindowContext, ClipboardEntry, Context,
+    Entity, ExternalPaths, FocusHandle, Focusable, Image, InteractiveElement as _, IntoElement,
+    KeyBinding, KeyDownEvent, ObjectFit, ParentElement as _, PathPromptOptions, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
+    Subscription, Task, WeakEntity, Window, actions, div, img, prelude::FluentBuilder as _, px,
 };
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
@@ -35,16 +36,23 @@ use maki_storage::sessions::SessionSummary;
 use serde_json::Value;
 
 use crate::app::{apply_theme_message, toggle_dark};
-use crate::engine::{Boot, Command, Engine, Update};
+use crate::attachments::{self, Attachment};
+use crate::commands::{self, Builtin, Suggestion};
+use crate::engine::{Boot, BtwEvent, Command, Engine, Update};
 use crate::ext::{COMMAND_TOPIC_PREFIX, Effect, Extensions, NotifyLevel};
+use crate::goal::{self, Goal, Next};
 use crate::new_project::{self, OnProject};
 use crate::nodes;
 use crate::projects::ProjectStore;
-use crate::titlebar::{PaletteHandler, title_bar};
+use crate::settings_window;
+use crate::titlebar::{Handler, title_bar};
 use crate::transcript::{Change, Item, Level, ToolCall, ToolStatus, Transcript};
 use crate::update::{self, Release};
 
-actions!(maki_gui, [OpenPalette, NewSession, OpenFolder]);
+actions!(
+    maki_gui,
+    [OpenPalette, NewSession, OpenFolder, OpenSettings]
+);
 
 const KEY_CONTEXT: &str = "Workspace";
 const SIDEBAR_WIDTH: f32 = 264.;
@@ -57,13 +65,24 @@ const CONTEXT_RING_SIZE: f32 = 14.;
 const MENU_WIDTH: f32 = 240.;
 const MENU_HEIGHT: f32 = 360.;
 const UNTITLED: &str = "Untitled session";
-const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline";
+const COMPOSER_PLACEHOLDER: &str = "Enter to send, Shift+Enter for a newline, / for commands";
+const THUMB_SIZE: f32 = 56.;
+const MESSAGE_THUMB_SIZE: f32 = 120.;
+const SUGGESTION_KEYS: [&str; 5] = ["up", "down", "tab", "enter", "escape"];
+const PASTE_KEY: &str = "v";
+const ATTACH_PROMPT: &str = "Attach";
+const GOAL_STOP_WORDS: [&str; 3] = ["clear", "stop", "off"];
+const ASIDE_HEIGHT: f32 = 240.;
+const SUGGESTIONS_HEIGHT: f32 = 320.;
+const MODEL_QUERY: &str = "Model: ";
+const CANCELLED_REASON: &str = "cancelled";
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-k", OpenPalette, Some(KEY_CONTEXT)),
         KeyBinding::new("secondary-n", NewSession, Some(KEY_CONTEXT)),
         KeyBinding::new("secondary-o", OpenFolder, Some(KEY_CONTEXT)),
+        KeyBinding::new("secondary-,", OpenSettings, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -90,6 +109,17 @@ pub struct WorkspaceView {
     transcript: Transcript,
     ext: Extensions,
     composer: Entity<TextareaState>,
+    attachments: Vec<Attachment>,
+    /// Images of the user messages in the transcript, by item index.
+    thumbs: HashMap<usize, Vec<Arc<Image>>>,
+    /// The highlighted suggestion while a `/command` is being typed.
+    suggestion: usize,
+    suggestions_dismissed: bool,
+    aside: Option<Aside>,
+    goal: Option<Goal>,
+    settings_window: Option<AnyWindowHandle>,
+    /// Providers changed mid-run; the session reopens once the run ends.
+    reload_pending: bool,
     mode: Mode,
     update: UpdateState,
     expanded: HashSet<String>,
@@ -126,7 +156,11 @@ impl WorkspaceView {
                 window,
                 |this, _, event, window, cx| match event {
                     InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
-                    InputEvent::Change => cx.notify(),
+                    InputEvent::Change => {
+                        this.suggestion = 0;
+                        this.suggestions_dismissed = false;
+                        cx.notify();
+                    }
                     _ => {}
                 },
             );
@@ -149,6 +183,14 @@ impl WorkspaceView {
             transcript: Transcript::default(),
             ext: Extensions::default(),
             composer,
+            attachments: Vec::new(),
+            thumbs: HashMap::new(),
+            suggestion: 0,
+            suggestions_dismissed: false,
+            aside: None,
+            goal: None,
+            settings_window: None,
+            reload_pending: false,
             mode: Mode::Ask,
             update: UpdateState::Idle,
             expanded: HashSet::new(),
@@ -364,7 +406,11 @@ impl WorkspaceView {
         };
         self.phase = Phase::Loading;
         self.transcript = Transcript::default();
+        self.thumbs.clear();
         self.ext = Extensions::default();
+        self.aside = None;
+        self.goal = None;
+        self.reload_pending = false;
         self._session = None;
         cx.notify();
 
@@ -389,6 +435,7 @@ impl WorkspaceView {
             let updates = session.updates;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.transcript = Transcript::from_history(&session.boot.history);
+                this.refresh_thumbs();
                 for warning in &session.boot.warnings {
                     this.transcript.notice(warning.clone(), Level::Warning);
                 }
@@ -423,7 +470,260 @@ impl WorkspaceView {
             Update::Agent(envelope) => this.on_agent(&envelope, window, cx),
             Update::Lua { topic, data } => this.on_lua(&topic, data, window, cx),
             Update::Question { input } => this.ask(&input, window, cx),
+            Update::Btw(event) => this.on_aside(event, cx),
         })
+    }
+
+    /// Decodes the images of user messages not drawn yet.
+    fn refresh_thumbs(&mut self) {
+        for (index, item) in self.transcript.items.iter().enumerate() {
+            if let Item::User { images, .. } = item
+                && !images.is_empty()
+                && !self.thumbs.contains_key(&index)
+            {
+                let thumbs = images
+                    .iter()
+                    .filter_map(Attachment::from_source)
+                    .map(|a| a.image)
+                    .collect();
+                self.thumbs.insert(index, thumbs);
+            }
+        }
+    }
+
+    fn on_aside(&mut self, event: BtwEvent, cx: &mut Context<Self>) {
+        let Some(aside) = &mut self.aside else {
+            return;
+        };
+        match event {
+            BtwEvent::Delta(text) => aside.answer.push_str(&text),
+            BtwEvent::Done => aside.done = true,
+            BtwEvent::Failed(error) => {
+                aside.done = true;
+                aside.error = Some(error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A run of the main agent ended: carry a goal on, and reopen the session
+    /// if providers changed while it ran.
+    fn after_run(&mut self, cancelled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reload_pending {
+            return self.reload_session(window, cx);
+        }
+        let Some(goal) = &mut self.goal else {
+            return;
+        };
+        if cancelled {
+            self.goal = None;
+            return self.transcript.notice("Goal stopped.", Level::Info);
+        }
+        let reply = self
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .take_while(|item| !matches!(item, Item::User { .. }))
+            .find_map(|item| match item {
+                Item::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        match goal.after_run(reply) {
+            Next::Continue(prompt) => {
+                let note = format!("Goal: continuing (run {} of {})", goal.runs, goal::MAX_RUNS);
+                self.transcript.notice(note, Level::Info);
+                self.transcript.working = true;
+                self.send(Command::Prompt {
+                    text: prompt,
+                    plan: self.mode == Mode::Plan,
+                    images: Vec::new(),
+                });
+            }
+            Next::Achieved => {
+                self.goal = None;
+                window.push_notification(
+                    Notification::new()
+                        .message("Goal achieved")
+                        .with_type(NotificationType::Success),
+                    cx,
+                );
+            }
+            Next::Blocked => {
+                self.goal = None;
+                self.transcript
+                    .notice("Goal paused: the agent needs you.", Level::Warning);
+            }
+            Next::OutOfRuns => {
+                self.goal = None;
+                self.transcript.notice(
+                    format!("Goal stopped after {} runs.", goal::MAX_RUNS),
+                    Level::Warning,
+                );
+            }
+        }
+    }
+
+    /// Reopens the current session so it sees changed providers and models.
+    fn reload_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_pending = false;
+        let resume = self.current_session().map(str::to_owned);
+        self.start(resume, window, cx);
+    }
+
+    fn providers_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Ready { .. }) {
+            return;
+        }
+        match self.transcript.working {
+            true => self.reload_pending = true,
+            false => self.reload_session(window, cx),
+        }
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity().downgrade();
+        let main = window.window_handle();
+        let on_change: settings_window::OnChange = Rc::new(move |cx| {
+            let workspace = workspace.clone();
+            let _ = main.update(cx, |_, window, cx| {
+                let _ = workspace.update(cx, |this, cx| this.providers_changed(window, cx));
+            });
+        });
+        self.settings_window =
+            settings_window::open(self.settings_window, self.gui_dir.clone(), on_change, cx);
+    }
+
+    fn attach(&mut self, attachment: Attachment, cx: &mut Context<Self>) {
+        self.attachments.push(attachment);
+        cx.notify();
+    }
+
+    fn attach_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        for path in paths.iter().filter(|p| attachments::is_image(p)) {
+            match Attachment::from_path(path) {
+                Ok(attachment) => self.attach(attachment, cx),
+                Err(e) => window.push_notification(
+                    Notification::new()
+                        .message(format!("{e:#}"))
+                        .with_type(NotificationType::Error),
+                    cx,
+                ),
+            }
+        }
+    }
+
+    fn pick_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(ATTACH_PROMPT.into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| this.attach_paths(&paths, window, cx));
+        })
+        .detach();
+    }
+
+    /// Takes images off the clipboard. `false` leaves the paste to the
+    /// input, for text.
+    fn paste_images(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let mut pasted = false;
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    if let Some(attachment) = Attachment::from_image(image) {
+                        self.attach(attachment, cx);
+                        pasted = true;
+                    }
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    if paths.paths().iter().any(|p| attachments::is_image(p)) {
+                        self.attach_paths(paths.paths(), window, cx);
+                        pasted = true;
+                    }
+                }
+                ClipboardEntry::String(_) => {}
+            }
+        }
+        pasted
+    }
+
+    fn suggestions(&self, cx: &App) -> Vec<Suggestion> {
+        let Phase::Ready { boot, .. } = &self.phase else {
+            return Vec::new();
+        };
+        if self.suggestions_dismissed {
+            return Vec::new();
+        }
+        let custom: Vec<(String, String)> = boot
+            .slash_commands
+            .iter()
+            .map(|c| (c.name.clone(), c.description.clone()))
+            .collect();
+        commands::suggest(self.composer.read(cx).value().as_ref(), &custom)
+    }
+
+    fn complete(&mut self, suggestion: &Suggestion, window: &mut Window, cx: &mut Context<Self>) {
+        let completion = suggestion.completion();
+        let typed = self.composer.read(cx).value().trim().to_owned();
+        if !suggestion.takes_args && typed == completion {
+            return self.submit(window, cx);
+        }
+        self.composer
+            .update(cx, |state, cx| state.set_value(completion, window, cx));
+        self.suggestions_dismissed = !suggestion.takes_args;
+        cx.notify();
+    }
+
+    /// Before the input sees a key: the suggestion list keys, and pasting
+    /// an image.
+    fn on_composer_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        if keystroke.key == PASTE_KEY
+            && keystroke.modifiers.secondary()
+            && self.paste_images(window, cx)
+        {
+            return cx.stop_propagation();
+        }
+        if keystroke.modifiers.modified() || !SUGGESTION_KEYS.contains(&keystroke.key.as_str()) {
+            return;
+        }
+        let suggestions = self.suggestions(cx);
+        if suggestions.is_empty() {
+            return;
+        }
+        cx.stop_propagation();
+        let last = suggestions.len() - 1;
+        match keystroke.key.as_str() {
+            "up" => self.suggestion = self.suggestion.checked_sub(1).unwrap_or(last),
+            "down" => {
+                self.suggestion = if self.suggestion >= last {
+                    0
+                } else {
+                    self.suggestion + 1
+                }
+            }
+            "escape" => self.suggestions_dismissed = true,
+            _ => {
+                let chosen = suggestions[self.suggestion.min(last)].clone();
+                return self.complete(&chosen, window, cx);
+            }
+        }
+        cx.notify();
     }
 
     fn on_agent(
@@ -445,11 +745,20 @@ impl WorkspaceView {
             }
             cx.notify();
         }
-        if matches!(envelope.event, AgentEvent::Done { .. })
-            && envelope.subagent.is_none()
-            && let Some(project) = self.project.clone()
-        {
-            self.refresh_sessions(&project);
+        if envelope.subagent.is_some() {
+            return;
+        }
+        match &envelope.event {
+            AgentEvent::Done { reason, .. } => {
+                if let Some(project) = self.project.clone() {
+                    self.refresh_sessions(&project);
+                }
+                let cancelled = reason.to_string() == CANCELLED_REASON;
+                self.after_run(cancelled, window, cx);
+                cx.notify();
+            }
+            AgentEvent::Error { .. } => self.goal = None,
+            _ => {}
         }
     }
 
@@ -484,18 +793,123 @@ impl WorkspaceView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_owned();
-        if text.is_empty() || self.commands().is_none() {
+        if (text.is_empty() && self.attachments.is_empty()) || self.commands().is_none() {
             return;
         }
         self.composer
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.transcript.push_user(text.clone());
+        if let Some((command, args)) = commands::builtin(&text) {
+            let args = args.to_owned();
+            return self.run_builtin(command, &args, &text, window, cx);
+        }
+        self.prompt(text.clone(), text, cx);
+    }
+
+    /// Sends `prompt` with the attached images, showing `shown` for it.
+    fn prompt(&mut self, shown: String, prompt: String, cx: &mut Context<Self>) {
+        let attachments = std::mem::take(&mut self.attachments);
+        let images: Vec<_> = attachments.iter().map(Attachment::source).collect();
+        self.transcript.push_user(shown, images.clone());
+        self.thumbs.insert(
+            self.transcript.items.len() - 1,
+            attachments.into_iter().map(|a| a.image).collect(),
+        );
         self.send(Command::Prompt {
-            text,
+            text: prompt,
             plan: self.mode == Mode::Plan,
+            images,
         });
         self.scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    fn run_builtin(
+        &mut self,
+        command: Builtin,
+        args: &str,
+        typed: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            Builtin::New => self.new_session(window, cx),
+            Builtin::Btw if args.is_empty() => self
+                .transcript
+                .notice("Usage: /btw <question>", Level::Warning),
+            Builtin::Btw => {
+                self.aside = Some(Aside::new(args));
+                self.send(Command::Btw(args.to_owned()));
+            }
+            Builtin::Goal if args.is_empty() => {
+                let status = match &self.goal {
+                    Some(goal) => format!(
+                        "Goal: {} (run {} of {})",
+                        goal.objective,
+                        goal.runs,
+                        goal::MAX_RUNS
+                    ),
+                    None => "No goal set. Usage: /goal <objective>".to_owned(),
+                };
+                self.transcript.notice(status, Level::Info);
+            }
+            Builtin::Goal if GOAL_STOP_WORDS.contains(&args.to_lowercase().as_str()) => {
+                if self.goal.take().is_some() {
+                    self.transcript.notice("Goal cleared.", Level::Info);
+                }
+            }
+            Builtin::Goal => {
+                let goal = Goal::new(args);
+                let kickoff = goal.kickoff();
+                self.goal = Some(goal);
+                self.prompt(typed.to_owned(), kickoff, cx);
+            }
+            Builtin::Model => self.switch_model(args, window, cx),
+            Builtin::Plan => self.set_mode(Mode::Plan),
+            Builtin::Ask => self.set_mode(Mode::Ask),
+            Builtin::Yolo => self.set_mode(match self.mode {
+                Mode::Bypass => Mode::Ask,
+                _ => Mode::Bypass,
+            }),
+            Builtin::Stop => {
+                self.goal = None;
+                self.send(Command::Cancel);
+            }
+            Builtin::Settings => self.open_settings(window, cx),
+            Builtin::Theme => toggle_dark(self.gui_dir.as_deref(), window, cx),
+            Builtin::Help => {
+                let help = Builtin::ALL
+                    .into_iter()
+                    .map(|b| format!("- `/{} {}` {}", b.name(), b.hint(), b.description()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.transcript.notice(help, Level::Info);
+            }
+            Builtin::Exit => cx.quit(),
+        }
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// `/model name` picks the model whose spec or id matches; bare `/model`
+    /// opens the palette on the model list.
+    fn switch_model(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Phase::Ready { boot, .. } = &self.phase else {
+            return;
+        };
+        if name.is_empty() {
+            return self.open_palette_with(MODEL_QUERY, window, cx);
+        }
+        let found = boot
+            .models
+            .iter()
+            .find(|spec| spec.as_str() == name || short_model(spec) == name)
+            .cloned();
+        match found {
+            Some(spec) => self.run(PaletteAction::Model(spec), window, cx),
+            None => self
+                .transcript
+                .notice(format!("No model named {name}"), Level::Warning),
+        }
     }
 
     fn ask_permission(
@@ -608,9 +1022,13 @@ impl WorkspaceView {
     }
 
     fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette_with("", window, cx);
+    }
+
+    fn open_palette_with(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         let entries = self.palette_entries();
         let workspace = cx.entity().downgrade();
-        let palette = cx.new(|cx| Palette::new(entries, workspace, window, cx));
+        let palette = cx.new(|cx| Palette::new(entries, query, workspace, window, cx));
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.w(px(560.)).p_0().child(palette.clone())
         });
@@ -621,6 +1039,8 @@ impl WorkspaceView {
             PaletteEntry::new("New session", PaletteAction::NewSession),
             PaletteEntry::new("Open folder…", PaletteAction::OpenFolder),
             PaletteEntry::new("New project…", PaletteAction::NewProject),
+            PaletteEntry::new("Settings", PaletteAction::Settings),
+            PaletteEntry::new("Attach images…", PaletteAction::AttachImages),
             PaletteEntry::new("Toggle dark mode", PaletteAction::ToggleDark),
             PaletteEntry::new("Mode: Ask before edits", PaletteAction::Mode(Mode::Ask)),
             PaletteEntry::new("Mode: Plan", PaletteAction::Mode(Mode::Plan)),
@@ -668,6 +1088,8 @@ impl WorkspaceView {
             PaletteAction::NewProject => self.create_project(window, cx),
             PaletteAction::Project(path) => self.open_project(path, None, window, cx),
             PaletteAction::Palette => self.open_palette(&OpenPalette, window, cx),
+            PaletteAction::Settings => self.open_settings(window, cx),
+            PaletteAction::AttachImages => self.pick_images(window, cx),
             PaletteAction::ToggleDark => toggle_dark(self.gui_dir.as_deref(), window, cx),
             PaletteAction::Mode(mode) => self.set_mode(mode),
             PaletteAction::Trust => match self.project.clone().map(|p| self.engine.trust(&p)) {
@@ -950,18 +1372,30 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         match item {
-            Item::User(text) => h_flex()
-                .justify_end()
-                .child(
-                    div()
-                        .max_w(px(TRANSCRIPT_WIDTH * 0.8))
-                        .px_4()
-                        .py_2p5()
-                        .rounded(cx.theme().radius_lg)
-                        .bg(cx.theme().secondary)
-                        .text_sm()
-                        .child(text.clone()),
-                )
+            Item::User { text, .. } => v_flex()
+                .items_end()
+                .gap_2()
+                .when_some(self.thumbs.get(&index), |this, thumbs| {
+                    this.child(
+                        h_flex().gap_2().flex_wrap().justify_end().children(
+                            thumbs
+                                .iter()
+                                .map(|image| thumbnail(image, MESSAGE_THUMB_SIZE, cx)),
+                        ),
+                    )
+                })
+                .when(!text.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .max_w(px(TRANSCRIPT_WIDTH * 0.8))
+                            .px_4()
+                            .py_2p5()
+                            .rounded(cx.theme().radius_lg)
+                            .bg(cx.theme().secondary)
+                            .text_sm()
+                            .child(text.clone()),
+                    )
+                })
                 .into_any_element(),
             Item::Assistant(text) => {
                 TextView::markdown(SharedString::from(format!("item-{index}")), text.clone())
@@ -971,20 +1405,21 @@ impl WorkspaceView {
             Item::Thinking(text) => {
                 let key = format!("thinking-{index}");
                 let open = self.expanded.contains(&key);
+                let shown = match open {
+                    true => text.clone(),
+                    false => preview(text, THINKING_PREVIEW_LINES),
+                };
+                let text_id = SharedString::from(format!("{key}-text"));
                 div()
                     .id(SharedString::from(key.clone()))
                     .pl_3()
                     .border_l_2()
                     .border_color(cx.theme().border)
                     .text_xs()
-                    .italic()
                     .text_color(cx.theme().muted_foreground)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle(&key, cx)))
-                    .child(match open {
-                        true => text.clone(),
-                        false => preview(text, THINKING_PREVIEW_LINES),
-                    })
+                    .child(TextView::markdown(text_id, shown))
                     .into_any_element()
             }
             Item::Tool(call) => self.render_tool(call, cx).into_any_element(),
@@ -997,7 +1432,10 @@ impl WorkspaceView {
                 div()
                     .text_xs()
                     .text_color(color)
-                    .child(text.clone())
+                    .child(TextView::markdown(
+                        SharedString::from(format!("notice-{index}")),
+                        text.clone(),
+                    ))
                     .into_any_element()
             }
         }
@@ -1177,53 +1615,229 @@ impl WorkspaceView {
     /// the left; plugin status, cost, model and context fill on the right.
     fn render_composer(&self, boot: &Boot, cx: &mut Context<Self>) -> impl IntoElement {
         let working = self.transcript.working;
-        let empty = self.composer.read(cx).value().trim().is_empty();
+        let empty = self.composer.read(cx).value().trim().is_empty() && self.attachments.is_empty();
+        let suggestions = self.suggestions(cx);
         div().px_6().pb_3().child(
             v_flex()
                 .w(px(TRANSCRIPT_WIDTH))
                 .max_w_full()
                 .mx_auto()
                 .gap_1p5()
+                .when_some(self.aside.as_ref(), |this, aside| {
+                    this.child(self.render_aside(aside, cx))
+                })
                 .child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1p5()
-                        .rounded(px(16.))
-                        .border_1()
-                        .border_color(cx.theme().input)
-                        .bg(cx.theme().background)
-                        .shadow_sm()
-                        .child(self.render_add_menu(boot, cx))
+                    div()
+                        .relative()
+                        .when(!suggestions.is_empty(), |this| {
+                            this.child(self.render_suggestions(&suggestions, cx))
+                        })
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Textarea::new(&self.composer).bordered(false)),
-                        )
-                        .child(match working {
-                            true => Button::new("stop")
-                                .primary()
-                                .small()
-                                .rounded(px(999.))
-                                .icon(Icon::new(Lucide::Square))
-                                .tooltip("Stop")
-                                .on_click(cx.listener(|this, _, _, _| this.send(Command::Cancel))),
-                            false => Button::new("send")
-                                .primary()
-                                .small()
-                                .rounded(px(999.))
-                                .icon(Icon::new(Lucide::ArrowUp))
-                                .tooltip("Send")
-                                .disabled(empty)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.submit(window, cx)),
+                            v_flex()
+                                .id("composer")
+                                .gap_1()
+                                .px_2()
+                                .py_1p5()
+                                .rounded(px(16.))
+                                .border_1()
+                                .border_color(cx.theme().input)
+                                .bg(cx.theme().background)
+                                .shadow_sm()
+                                .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                                    style.border_color(cx.theme().ring)
+                                })
+                                .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                                    this.attach_paths(paths.paths(), window, cx)
+                                }))
+                                .capture_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, window, cx| {
+                                        this.on_composer_key(event, window, cx)
+                                    },
+                                ))
+                                .when(!self.attachments.is_empty(), |this| {
+                                    this.child(self.render_attachments(cx))
+                                })
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(self.render_add_menu(boot, cx))
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Textarea::new(&self.composer).bordered(false),
+                                            ),
+                                        )
+                                        .child(match working {
+                                            true => Button::new("stop")
+                                                .primary()
+                                                .small()
+                                                .rounded(px(999.))
+                                                .icon(Icon::new(Lucide::Square))
+                                                .tooltip("Stop")
+                                                .on_click(cx.listener(|this, _, _, _| {
+                                                    this.send(Command::Cancel)
+                                                })),
+                                            false => Button::new("send")
+                                                .primary()
+                                                .small()
+                                                .rounded(px(999.))
+                                                .icon(Icon::new(Lucide::ArrowUp))
+                                                .tooltip("Send")
+                                                .disabled(empty)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.submit(window, cx)
+                                                })),
+                                        }),
                                 ),
-                        }),
+                        ),
                 )
                 .child(self.render_session_bar(boot, cx)),
         )
+    }
+
+    fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex().gap_2().px_1().pt_1().flex_wrap().children(
+            self.attachments.iter().enumerate().map(|(i, attachment)| {
+                div()
+                    .relative()
+                    .group(SharedString::from(format!("attachment-{i}")))
+                    .child(thumbnail(&attachment.image, THUMB_SIZE, cx))
+                    .child(
+                        div().absolute().top_0p5().right_0p5().child(
+                            Button::new(("remove-attachment", i))
+                                .xsmall()
+                                .rounded(px(999.))
+                                .icon(IconName::Close)
+                                .tooltip("Remove")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if i < this.attachments.len() {
+                                        this.attachments.remove(i);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+            }),
+        )
+    }
+
+    fn render_suggestions(
+        &self,
+        suggestions: &[Suggestion],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = self.suggestion.min(suggestions.len().saturating_sub(1));
+        div()
+            .absolute()
+            .bottom_full()
+            .left_0()
+            .right_0()
+            .pb_1p5()
+            .child(
+                v_flex()
+                    .id("suggestions")
+                    .max_h(px(SUGGESTIONS_HEIGHT))
+                    .overflow_y_scrollbar()
+                    .p_1()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().popover)
+                    .text_color(cx.theme().popover_foreground)
+                    .shadow_lg()
+                    .children(suggestions.iter().enumerate().map(|(i, suggestion)| {
+                        let chosen = suggestion.clone();
+                        h_flex()
+                            .id(("suggestion", i))
+                            .gap_3()
+                            .px_2()
+                            .py_1p5()
+                            .rounded(cx.theme().radius)
+                            .cursor_pointer()
+                            .text_sm()
+                            .when(i == selected, |this| this.bg(cx.theme().accent))
+                            .hover(|style| style.bg(cx.theme().accent))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.complete(&chosen, window, cx);
+                                this.composer.read(cx).focus_handle(cx).focus(window, cx);
+                            }))
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(
+                                        div().font_medium().child(format!("/{}", suggestion.name)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(suggestion.hint.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(suggestion.description.clone()),
+                            )
+                    })),
+            )
+    }
+
+    fn render_aside(&self, aside: &Aside, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .p_3()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(Lucide::MessageCircleQuestionMark)
+                            .small()
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .font_medium()
+                            .child(aside.question.clone()),
+                    )
+                    .when(!aside.done, |this| this.child(Spinner::new().xsmall()))
+                    .child(
+                        Button::new("close-aside")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.aside = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(!aside.answer.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("aside-answer")
+                        .max_h(px(ASIDE_HEIGHT))
+                        .overflow_y_scrollbar()
+                        .text_sm()
+                        .child(TextView::markdown("aside-text", aside.answer.clone())),
+                )
+            })
+            .when_some(aside.error.clone(), |this, error| {
+                this.child(div().text_sm().text_color(cx.theme().danger).child(error))
+            })
     }
 
     fn render_add_menu(&self, boot: &Boot, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1243,11 +1857,14 @@ impl WorkspaceView {
                     .min_w(px(MENU_WIDTH))
                     .max_h(px(MENU_HEIGHT))
                     .scrollable(true)
-                    .item(action_item(
-                        &workspace,
-                        "All commands…",
-                        PaletteAction::Palette,
-                    ))
+                    .item(
+                        action_item(&workspace, "Attach images…", PaletteAction::AttachImages)
+                            .icon(Icon::new(Lucide::ImagePlus)),
+                    )
+                    .item(
+                        action_item(&workspace, "All commands…", PaletteAction::Palette)
+                            .icon(Icon::new(Lucide::Command)),
+                    )
                     .separator()
                     .label("Commands");
                 for (name, _) in &slash {
@@ -1308,6 +1925,20 @@ impl WorkspaceView {
                             })
                     }),
             )
+            .when_some(self.goal.as_ref(), |this, goal| {
+                this.child(
+                    Button::new("goal")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(Lucide::Target))
+                        .label(format!("Goal {}/{}", goal.runs, goal::MAX_RUNS))
+                        .tooltip(format!("{} — click to clear", goal.objective))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.goal = None;
+                            cx.notify();
+                        })),
+                )
+            })
             .when(self.transcript.working, |this| {
                 this.child(
                     h_flex()
@@ -1366,13 +1997,15 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_session(window, cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.open_folder(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)),
+            )
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child({
                 let workspace = cx.entity().downgrade();
-                let palette: PaletteHandler = Rc::new(move |window, cx| {
-                    let _ = workspace
-                        .update(cx, |this, cx| this.open_palette(&OpenPalette, window, cx));
+                let settings: Handler = Rc::new(move |window, cx| {
+                    let _ = workspace.update(cx, |this, cx| this.open_settings(window, cx));
                 });
                 let crumbs = self
                     .project_name()
@@ -1380,7 +2013,7 @@ impl Render for WorkspaceView {
                     .into_iter()
                     .collect();
                 let notice = self.render_update(cx);
-                title_bar(crumbs, self.gui_dir.clone(), Some(palette), notice, cx)
+                title_bar(crumbs, self.gui_dir.clone(), Some(settings), notice, cx)
             })
             .child(
                 h_flex()
@@ -1491,8 +2124,17 @@ fn welcome(name: &str, cx: &mut Context<WorkspaceView>) -> impl IntoElement {
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("Describe a task to start. Press Ctrl+K for commands."),
+                .child("Describe a task to start. Type / for commands, or drop an image in."),
         )
+}
+
+fn thumbnail(image: &Arc<Image>, size: f32, cx: &App) -> impl IntoElement {
+    img(image.clone())
+        .size(px(size))
+        .object_fit(ObjectFit::Cover)
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
 }
 
 fn name_of(path: &Path) -> String {
@@ -1530,6 +2172,25 @@ fn short_ago(now: u64, then: u64) -> String {
         60..3_600 => format!("{}m", elapsed / 60),
         3_600..86_400 => format!("{}h", elapsed / 3_600),
         _ => format!("{}d", elapsed / 86_400),
+    }
+}
+
+/// A `/btw` side question and its answer as it streams in.
+struct Aside {
+    question: String,
+    answer: String,
+    done: bool,
+    error: Option<String>,
+}
+
+impl Aside {
+    fn new(question: &str) -> Self {
+        Self {
+            question: question.to_owned(),
+            answer: String::new(),
+            done: false,
+            error: None,
+        }
     }
 }
 
@@ -1575,6 +2236,8 @@ enum PaletteAction {
     NewProject,
     Project(PathBuf),
     Palette,
+    Settings,
+    AttachImages,
     ToggleDark,
     Mode(Mode),
     Trust,
@@ -1615,12 +2278,15 @@ struct Palette {
 impl Palette {
     fn new(
         entries: Vec<PaletteEntry>,
+        initial: &str,
         workspace: WeakEntity<WorkspaceView>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let query = cx.new(|cx| {
-            gpui_kit::component::input::InputState::new(window, cx).placeholder("Type a command…")
+            gpui_kit::component::input::InputState::new(window, cx)
+                .placeholder("Type a command…")
+                .default_value(initial.to_owned())
         });
         query.read(cx).focus_handle(cx).focus(window, cx);
         let subscription =

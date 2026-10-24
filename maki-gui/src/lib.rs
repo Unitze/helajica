@@ -5,13 +5,19 @@
 //! plugins draw panels, status items and palette commands through `maki.gui`
 //! (see [`ext`]), and themes are JSON files in the user's theme directory.
 
+mod addons;
 mod app;
+mod attachments;
+mod commands;
+mod custom_providers;
 pub mod engine;
 mod ext;
+mod goal;
 mod new_project;
 mod nodes;
 mod projects;
 mod settings;
+mod settings_window;
 mod titlebar;
 mod transcript;
 mod update;
@@ -23,7 +29,7 @@ use std::sync::Arc;
 use gpui_kit::component::TitleBar;
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
 
-pub use engine::{Boot, Command, Engine, Session, SlashCommand, Update};
+pub use engine::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update};
 
 const WINDOW_WIDTH: f32 = 1240.;
 const WINDOW_HEIGHT: f32 = 820.;
@@ -37,6 +43,10 @@ pub fn run(engine: Arc<dyn Engine>, gui_dir: Option<PathBuf>, project: Option<Pa
         .run(move |cx| {
             gpui_kit::init(cx);
             app::init(gui_dir.as_deref(), cx);
+            addons::apply_all(
+                &settings::Settings::load(gui_dir.as_deref()),
+                maki_storage::StateDir::resolve().ok().as_ref(),
+            );
             let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

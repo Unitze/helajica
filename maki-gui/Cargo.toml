@@ -9,6 +9,7 @@ description = "Native desktop app for maki built on GPUI"
 [dependencies]
 gpui-kit = { workspace = true }
 maki-agent = { workspace = true }
+maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 serde = { workspace = true }
@@ -20,6 +21,7 @@ similar = { workspace = true }
 isahc = { workspace = true }
 semver = { workspace = true }
 sha2 = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

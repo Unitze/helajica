@@ -13,22 +13,29 @@ use clap::Parser;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender, WeakSender};
+use maki_agent::agent::live_history;
 use maki_agent::command::CustomCommand;
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::TaggedAnswer;
 use maki_agent::tools::{LocalTool, QUESTION_TOOL_NAME, ToolAudience, ToolRegistry, local_tool};
-use maki_agent::{AgentEvent, AgentInput, AgentMode, Envelope, InputSource, SessionEndReason};
+use maki_agent::{
+    AgentEvent, AgentInput, AgentMode, Envelope, InputSource, SessionEndReason, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls,
+};
 use maki_config::project::{self, TrustAnswer, TrustMode};
 use maki_config::{ModelPolicy, SessionDefaults, load_env_files};
-use maki_gui::{Boot, Command, Engine, Session, SlashCommand, Update};
+use maki_gui::{Boot, BtwEvent, Command, Engine, Session, SlashCommand, Update};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_lua::{GuiMessage, Interaction};
 use maki_providers::model::Model;
-use maki_providers::provider::available_model_specs;
+use maki_providers::provider::{available_model_specs, from_model};
+use maki_providers::{ProviderEvent, RequestOptions, Timeouts, adapt_images_for_model};
 use maki_storage::StateDir;
+use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionSummary;
 use maki_ui::AppSession;
+use maki_ui::app::btw::{BTW_FALLBACK_SYSTEM, btw_question};
 use serde_json::Value;
 use tracing::warn;
 
@@ -306,6 +313,16 @@ fn run_project(
         trusted: trust.state.restricted_warning().is_none(),
         yolo: handle.permissions.is_yolo(),
     };
+    let aside = Aside {
+        model: startup_model,
+        timeouts,
+        session: handle.session_id.clone(),
+        updates: lua_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(Sender::downgrade),
+    };
     let sent = ready.send(Ok(Session {
         boot,
         commands: commands_tx,
@@ -320,6 +337,7 @@ fn run_project(
             &model_policy,
             &cwd,
             &plan,
+            aside,
         );
     }
 
@@ -345,7 +363,17 @@ fn run_project(
     Ok(())
 }
 
+/// What a `/btw` side question needs: the model the session is on now, and
+/// where its answer goes.
+struct Aside {
+    model: Model,
+    timeouts: Timeouts,
+    session: SessionRef,
+    updates: Option<WeakSender<Update>>,
+}
+
 /// Until the window drops its sender or the engine closes the session.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     commands: &Receiver<Command>,
     handle: &InteractiveHandle,
@@ -354,12 +382,14 @@ fn serve(
     model_policy: &ModelPolicy,
     cwd: &Path,
     plan: &AtomicBool,
+    mut aside: Aside,
 ) {
     for command in commands.iter() {
         match command {
             Command::Prompt {
                 text,
                 plan: wants_plan,
+                images,
             } => {
                 plan.store(wants_plan, Ordering::Relaxed);
                 let mode = match wants_plan {
@@ -369,7 +399,7 @@ fn serve(
                 let _ = handle.input_tx.send(AgentInput::from_defaults(
                     expand_command(slash_commands, text),
                     mode,
-                    Vec::new(),
+                    images,
                     defaults,
                     InputSource::Gui,
                 ));
@@ -388,8 +418,21 @@ fn serve(
                     .send(text.unwrap_or_else(|| NO_ANSWER.to_owned()));
             }
             Command::Lua { topic, data } => maki_lua::deliver_to_lua(&topic, data),
+            Command::Btw(question) => {
+                if let Some(updates) = aside.updates.clone() {
+                    smol::spawn(answer_aside(
+                        question,
+                        aside.model.clone(),
+                        aside.timeouts,
+                        aside.session.clone(),
+                        updates,
+                    ))
+                    .detach();
+                }
+            }
             Command::Model(spec) => match Model::from_spec_with_policy(&spec, model_policy) {
                 Ok(model) => {
+                    aside.model = model.clone();
                     let _ = handle.model_tx.send(model);
                 }
                 Err(e) => warn!(%spec, error = %e, "gui picked an unusable model"),
@@ -402,6 +445,66 @@ fn serve(
             Command::Close => return,
         }
     }
+}
+
+/// The TUI's `/btw`: the live transcript plus the question, no tools, and
+/// nothing written back to the session.
+async fn answer_aside(
+    question: String,
+    mut model: Model,
+    timeouts: Timeouts,
+    session: SessionRef,
+    updates: WeakSender<Update>,
+) {
+    let send = move |event: BtwEvent| {
+        updates
+            .upgrade()
+            .is_some_and(|u| u.send(Update::Btw(event)).is_ok())
+    };
+    let provider = match from_model(&mut model, timeouts) {
+        Ok(provider) => provider,
+        Err(e) => {
+            send(BtwEvent::Failed(e.to_string()));
+            return;
+        }
+    };
+    let mut messages = live_history(session.id())
+        .map(|m| Vec::clone(&m))
+        .unwrap_or_default();
+    close_dangling_tool_calls(&mut messages, UNAVAILABLE_RESULT);
+    messages.push(btw_question(&question));
+    let messages = adapt_images_for_model(&model, &messages).await;
+
+    let (events_tx, events_rx) = flume::unbounded();
+    let forward = smol::spawn({
+        let send = send.clone();
+        async move {
+            while let Ok(event) = events_rx.recv_async().await {
+                if let ProviderEvent::TextDelta { text } = event
+                    && !send(BtwEvent::Delta(text))
+                {
+                    return;
+                }
+            }
+        }
+    });
+    let result = provider
+        .stream_message(
+            &model,
+            &messages,
+            BTW_FALLBACK_SYSTEM,
+            &Value::Array(Vec::new()),
+            &events_tx,
+            RequestOptions::default(),
+            Some(&session),
+        )
+        .await;
+    drop(events_tx);
+    forward.await;
+    send(match result {
+        Ok(_) => BtwEvent::Done,
+        Err(e) => BtwEvent::Failed(e.to_string()),
+    });
 }
 
 /// Snapshots are terminal cells baked for the TUI; the window has nothing to

@@ -4,12 +4,13 @@
 use std::fmt::Write as _;
 
 use maki_agent::{AgentEvent, Envelope, ToolOutput};
-use maki_providers::{ContentBlock, Message, MessageKind, Role, TokenUsage};
+use maki_providers::{ContentBlock, ImageSource, Message, MessageKind, Role, TokenUsage};
 use serde_json::Value;
 use similar::TextDiff;
 
 const DIFF_CONTEXT_LINES: usize = 3;
 const CANCELLED: &str = "Cancelled";
+const TEXT_BLOCK_SEPARATOR: &str = "\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -37,11 +38,17 @@ pub enum Level {
 
 #[derive(Debug, Clone)]
 pub enum Item {
-    User(String),
+    User {
+        text: String,
+        images: Vec<ImageSource>,
+    },
     Assistant(String),
     Thinking(String),
     Tool(ToolCall),
-    Notice { text: String, level: Level },
+    Notice {
+        text: String,
+        level: Level,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -80,18 +87,38 @@ impl Transcript {
     }
 
     fn push_message(&mut self, message: &Message) {
-        if message.role == Role::User
-            && let Some(text) = &message.display_text
-        {
-            self.items.push(Item::User(text.clone()));
-            return;
+        if message.role == Role::User {
+            let images: Vec<ImageSource> = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Image { source } => Some(source.clone()),
+                    _ => None,
+                })
+                .collect();
+            let text = message.display_text.clone().unwrap_or_else(|| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(TEXT_BLOCK_SEPARATOR)
+            });
+            if !text.is_empty() || !images.is_empty() {
+                self.items.push(Item::User { text, images });
+            }
+            if message.display_text.is_some() {
+                return;
+            }
         }
         for block in &message.content {
             match block {
-                ContentBlock::Text { text } => self.items.push(match message.role {
-                    Role::User => Item::User(text.clone()),
-                    Role::Assistant => Item::Assistant(text.clone()),
-                }),
+                ContentBlock::Text { text } if message.role == Role::Assistant => {
+                    self.items.push(Item::Assistant(text.clone()))
+                }
                 ContentBlock::Thinking { thinking, .. } => {
                     self.items.push(Item::Thinking(thinking.clone()))
                 }
@@ -121,8 +148,8 @@ impl Transcript {
         }
     }
 
-    pub fn push_user(&mut self, text: String) {
-        self.items.push(Item::User(text));
+    pub fn push_user(&mut self, text: String, images: Vec<ImageSource>) {
+        self.items.push(Item::User { text, images });
         self.working = true;
     }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,9 @@ pub struct Settings {
     /// A theme from the bundled set or the user's `themes/` dir, by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Add-ons switched on or off, by id. One missing here takes its default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub addons: BTreeMap<String, bool>,
 }
 
 impl Settings {
@@ -38,6 +42,7 @@ mod tests {
     use super::*;
 
     const THEME: &str = "Ayu Light";
+    const ADDON: &str = "openai-oauth";
 
     #[test]
     fn round_trips_through_disk() {
@@ -45,6 +50,7 @@ mod tests {
         let settings = Settings {
             dark: true,
             theme: Some(THEME.into()),
+            addons: BTreeMap::from([(ADDON.into(), true)]),
         };
         settings.save(Some(dir.path()));
         assert_eq!(Settings::load(Some(dir.path())), settings);

@@ -8,7 +8,7 @@ use color_eyre::Result;
 use flume::{Receiver, Sender};
 use maki_agent::Envelope;
 use maki_agent::permissions::PermissionAnswer;
-use maki_providers::Message;
+use maki_providers::{ImageSource, Message};
 use maki_storage::sessions::SessionSummary;
 use serde_json::Value;
 
@@ -53,7 +53,12 @@ pub enum Command {
     Prompt {
         text: String,
         plan: bool,
+        images: Vec<ImageSource>,
     },
+    /// A side question answered from the conversation so far, with no tools
+    /// and nothing written to the session. The answer streams back as
+    /// [`Update::Btw`].
+    Btw(String),
     Cancel,
     Permission {
         id: String,
@@ -83,4 +88,11 @@ pub enum Update {
     Question {
         input: Value,
     },
+    Btw(BtwEvent),
+}
+
+pub enum BtwEvent {
+    Delta(String),
+    Done,
+    Failed(String),
 }

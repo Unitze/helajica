@@ -4,7 +4,7 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
-mod btw;
+pub mod btw;
 mod image_paste;
 pub(crate) mod mode;
 mod mouse;

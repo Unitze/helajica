@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{env, thread};
 
@@ -32,6 +33,10 @@ const POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
 const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Whether stored ChatGPT tokens count. The desktop app turns this off unless
+/// its ChatGPT sign-in add-on is on, leaving OpenAI to an API key.
+static OAUTH_ENABLED: AtomicBool = AtomicBool::new(true);
 
 #[derive(Deserialize)]
 struct DeviceCodeResponse {
@@ -289,12 +294,28 @@ pub(crate) fn build_coding_plan_resolved(tokens: &OAuthTokens) -> Result<Resolve
     Ok(ResolvedAuth::new(PROVIDER, headers)?.with_base_url(Some(CODING_PLAN_BASE_URL.into())))
 }
 
-pub(crate) fn is_oauth(dir: &StateDir) -> bool {
+pub fn set_oauth_enabled(enabled: bool) {
+    OAUTH_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Tokens are stored, whether or not they are in use.
+pub fn signed_in(dir: &StateDir) -> bool {
     load_tokens(dir, PROVIDER).is_some()
 }
 
+pub(crate) fn usable_tokens(dir: &StateDir) -> Option<OAuthTokens> {
+    OAUTH_ENABLED
+        .load(Ordering::Relaxed)
+        .then(|| load_tokens(dir, PROVIDER))
+        .flatten()
+}
+
+pub(crate) fn is_oauth(dir: &StateDir) -> bool {
+    usable_tokens(dir).is_some()
+}
+
 pub fn resolve(dir: &StateDir) -> Result<(ResolvedAuth, Option<OAuthTokens>), AgentError> {
-    if let Some(tokens) = load_tokens(dir, PROVIDER) {
+    if let Some(tokens) = usable_tokens(dir) {
         debug!("using OpenAI OAuth authentication");
         return Ok((build_oauth_resolved(&tokens)?, Some(tokens)));
     }
@@ -323,6 +344,17 @@ pub fn login(dir: &StateDir) -> Result<(), AgentError> {
     save_tokens(dir, PROVIDER, &tokens)?;
     println!("Authenticated successfully.");
     Ok(())
+}
+
+/// Browser login without the terminal's method prompt, for a window to call
+/// off its UI thread.
+pub fn browser_sign_in(dir: &StateDir) -> Result<(), AgentError> {
+    save_tokens(dir, PROVIDER, &into_oauth_tokens(browser_login()?))?;
+    Ok(())
+}
+
+pub fn sign_out(dir: &StateDir) -> Result<bool, AgentError> {
+    Ok(delete_tokens(dir, PROVIDER)?)
 }
 
 fn device_login() -> Result<TokenResponse, AgentError> {

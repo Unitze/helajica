@@ -11,6 +11,14 @@ efficiency and plugins as `maki` in a terminal.
   conversation in the middle, model, mode and context fill right by the
   input.
 - **Modes.** Ask before edits, Plan, or Bypass permissions (maki's yolo).
+- **Slash commands.** Type `/` for suggestions: `/btw` asks a side question
+  without tools or touching the session, `/goal` keeps the agent on an
+  objective until it is met, plus `/new`, `/model`, `/plan`, `/yolo` and
+  your own custom commands.
+- **Images.** Paste, drop or attach screenshots with the prompt.
+- **Settings.** Connect any OpenAI, Anthropic or Gemini-compatible provider
+  (saved to maki's `providers.toml`). ChatGPT sign-in for OpenAI is an
+  add-on you switch on there.
 - **Extensible from Lua.** Plugins draw sidebar panels, status items,
   palette commands, toasts and themes through `maki.gui` - see the
   [`helajica-gui` skill](.maki/skills/helajica-gui/SKILL.md) and

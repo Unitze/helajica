@@ -17,11 +17,11 @@ single response.\n- You have NO tools: you cannot read files, run commands, or t
 context.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If you don't know, \
 say so; do not offer to look it up.\n</system-reminder>";
 
-const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
+pub const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
 from the conversation context.";
 
 /// The reminder leads so the model treats the question as a quick aside, not a task to act on.
-pub(crate) fn btw_question(question: &str) -> Message {
+pub fn btw_question(question: &str) -> Message {
     Message::user(format!("{BTW_REMINDER}\n\n{question}"))
 }
 

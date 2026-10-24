@@ -428,7 +428,7 @@ impl OpenAi {
     fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
         // Prefer OAuth tokens for the ChatGPT Coding Plan backend.
         if let Some(storage) = self.storage.as_ref()
-            && let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER)
+            && let Some(tokens) = auth::usable_tokens(storage)
         {
             return auth::build_coding_plan_resolved(&tokens);
         }
