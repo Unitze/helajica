@@ -99,6 +99,8 @@ pub enum InputSource {
     Headless,
     /// A plugin prompting a session of its own, `task` subagents included.
     Plugin,
+    /// The desktop GUI, `maki --gui`.
+    Gui,
 }
 
 impl InputSource {
@@ -108,6 +110,7 @@ impl InputSource {
             Self::Acp => "acp",
             Self::Headless => "headless",
             Self::Plugin => "plugin",
+            Self::Gui => "gui",
         }
     }
 }

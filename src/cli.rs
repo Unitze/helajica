@@ -253,6 +253,11 @@ pub enum Command {
         #[arg(long)]
         yolo: bool,
     },
+    /// Open the desktop app
+    Gui {
+        /// Project folder to open right away
+        path: Option<PathBuf>,
+    },
     /// Show the rendered system prompt or tool definitions
     Prompt {
         /// Prompt variant: system (default), research, general

@@ -90,6 +90,11 @@ declare maki: {
     grep: @checked (pattern: string, opts: any) -> (any, string?),
     fuzzy_files: @checked (opts: any) -> (any, string?),
   },
+  gui: {
+    active: @checked () -> (boolean),
+    emit: @checked (topic: string, data: any) -> (boolean?, string?),
+    recv: @checked (topic: string) -> (any, string?),
+  },
   image: {
     probe: @checked (data: string | buffer) -> (any, string?),
     decode: @checked (data: string | buffer) -> (any, string?),

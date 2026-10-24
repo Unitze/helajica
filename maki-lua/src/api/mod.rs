@@ -5,6 +5,7 @@ pub(crate) mod base64;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
+pub(crate) mod gui;
 pub(crate) mod image;
 pub(crate) mod interpreter;
 pub(crate) mod json;
@@ -89,6 +90,7 @@ pub(crate) fn create_maki_global(
     maki.set("base64", base64::create_base64_table(lua)?)?;
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
+    maki.set("gui", gui::create_gui_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     warn_invalid_net_hosts(&plugin, reach.egress().declared());
     // One egress value shared by the two namespaces that can open a socket, so

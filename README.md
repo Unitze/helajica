@@ -1,3 +1,45 @@
+<p align="center"><img src="./assets/app-icon.svg" width="96" alt="Helajica"></p>
+
+# Helajica
+
+A desktop app for [maki](https://github.com/tontinton/maki), built with
+[GPUI](https://www.gpui.rs). It is a fork, not a wrapper: the window drives
+maki's own agent in-process, so you get the same tools, prompt cache, cost
+efficiency and plugins as `maki` in a terminal.
+
+- **One window.** Projects and their sessions in the sidebar, the
+  conversation in the middle, model, mode and context fill right by the
+  input.
+- **Modes.** Ask before edits, Plan, or Bypass permissions (maki's yolo).
+- **Extensible from Lua.** Plugins draw sidebar panels, status items,
+  palette commands, toasts and themes through `maki.gui` - see the
+  [`helajica-gui` skill](.maki/skills/helajica-gui/SKILL.md) and
+  [`examples/gui`](examples/gui).
+- **Updates itself** from this repo's GitHub releases.
+
+## Install
+
+Download the binary for your platform from
+[Releases](https://github.com/Unitze/helajica/releases/latest) and run it.
+From source:
+
+```sh
+cargo build --release --bin helajica
+```
+
+`maki gui [path]` opens the same window from the CLI.
+
+## Releasing
+
+Run the **Release** workflow from the Actions tab with the new version
+(e.g. `0.2.0`). It bumps `maki-gui`'s version, tags `v0.2.0`, builds
+Windows, macOS and Linux, and publishes the release; running apps offer the
+update in their title bar.
+
+---
+
+The rest of this README is maki's.
+
 <img src="./banner.png">
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.

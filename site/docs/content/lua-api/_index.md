@@ -119,6 +119,7 @@ The rules:
 | [`maki.env`](#maki-env) | Paths to maki's own directories (config, state, logs, legacy). |
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
+| [`maki.gui`](#maki-gui) | Message bus between Lua plugins and the Helajica desktop app (`maki gui`). |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
 | [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
 | [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
@@ -3259,6 +3260,95 @@ for _, item in ipairs(res.items) do
   print(item.path, r and item.path:sub(r[1], r[2]))
 end
 if not res.complete then print("still scanning, ask again") end
+```
+
+
+## maki.gui {#maki-gui}
+
+Message bus between Lua plugins and the Helajica desktop app (`maki gui`).
+
+Topics are free-form strings; namespace them with your plugin name.
+Under the TUI `active()` is false and `emit` returns an error pair.
+
+```lua
+maki.gui.emit("ui.notify", { message = "hi", level = "success" })
+```
+
+---
+
+### `maki.gui.active()` {#maki-gui-active}
+
+```lua
+maki.gui.active()
+```
+
+Whether a desktop GUI is attached to this process.
+
+**Returns:** (`boolean`) true inside the Helajica desktop app (`maki gui`).
+
+**Example:**
+
+```lua
+if maki.gui.active() then
+  maki.gui.emit("my-plugin/status", { ok = true })
+end
+```
+
+---
+
+### `maki.gui.emit()` {#maki-gui-emit}
+
+```lua
+maki.gui.emit({topic}, {data})
+```
+
+Send {data} to the GUI under {topic}. The reserved `ui.*` topics draw:
+`ui.panel` (a sidebar panel), `ui.status` (a status item by the input),
+`ui.command` (a palette command, answered on `ui.command.<id>`),
+`ui.notify`, `ui.prompt` and `ui.theme`. Re-emit with the same `id` to
+redraw; `{ id = ..., remove = true }` takes an entry away.
+
+**Parameters:**
+
+- `{topic}` (`string`) A `ui.*` topic, or one namespaced with your plugin name.
+- `{data}` (`any`) JSON-serializable value.
+
+**Returns:** (`boolean?`, `string?`) true, or nil plus an error when no GUI is attached.
+
+**Example:**
+
+```lua
+maki.gui.emit("ui.status", { id = "git", text = "main" })
+```
+
+---
+
+### `maki.gui.recv()` {#maki-gui-recv}
+
+```lua
+maki.gui.recv({topic})
+```
+
+Wait for the next message the GUI sends under {topic}, such as a click on
+a panel button (its `topic` and `data`) or a palette command
+(`ui.command.<id>`). Messages queue until read. Suspends the calling task, so run it inside
+`maki.async.spawn`. Cancelling the task ends the wait with an error.
+
+**Parameters:**
+
+- `{topic}` (`string`) Topic to listen on.
+
+**Returns:** (`any?`, `string?`) The message data, or nil plus an error.
+
+**Example:**
+
+```lua
+maki.async.spawn(function()
+  while true do
+    maki.gui.recv("ui.command.git-refresh")
+    maki.gui.emit("ui.status", { id = "git", text = current_branch() })
+  end
+end)
 ```
 
 

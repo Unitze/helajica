@@ -12,11 +12,23 @@ keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
+[[bin]]
+name = "maki"
+path = "src/main.rs"
+
+[[bin]]
+name = "helajica"
+path = "src/desktop.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 maki-ui = { workspace = true }
+maki-gui = { workspace = true }
 maki-agent = { workspace = true }
 maki-acp = { workspace = true }
 maki-config = { workspace = true }
@@ -54,6 +66,7 @@ members = [
   "maki-config",
   "maki-config-macro",
   "maki-docgen",
+  "maki-gui",
   "maki-highlight",
   "maki-interpreter",
   "maki-lua",
@@ -85,6 +98,7 @@ maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
+maki-gui = { path = "maki-gui" }
 maki-lua = { path = "maki-lua" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
@@ -203,6 +217,7 @@ shell-words = "1"
 agent-client-protocol-schema = "1.10"
 wait-timeout = "0.2"
 inventory = "0.3"
+gpui-kit = "0.8"
 
 [profile.bench]
 debug = true

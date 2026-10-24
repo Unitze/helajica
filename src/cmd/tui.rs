@@ -29,16 +29,16 @@ const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
-struct Stack {
-    plugin_host: PluginHost,
-    config: Config,
-    commands: Vec<CustomCommand>,
-    model: Model,
+pub(super) struct Stack {
+    pub(super) plugin_host: PluginHost,
+    pub(super) config: Config,
+    pub(super) commands: Vec<CustomCommand>,
+    pub(super) model: Model,
     needs_login: bool,
 }
 
 impl Stack {
-    fn timeouts(&self) -> maki_providers::Timeouts {
+    pub(super) fn timeouts(&self) -> maki_providers::Timeouts {
         maki_providers::Timeouts::from(&self.config.provider)
     }
 }
@@ -133,17 +133,17 @@ fn config_or_fallback(
     }
 }
 /// What every generation is built from, unchanged for the life of the process.
-struct Launch<'a> {
-    cli: &'a Cli,
-    cwd: &'a Path,
-    storage: &'a StateDir,
-    interaction: Interaction,
+pub(super) struct Launch<'a> {
+    pub(super) cli: &'a Cli,
+    pub(super) cwd: &'a Path,
+    pub(super) storage: &'a StateDir,
+    pub(super) interaction: Interaction,
 }
 
 /// The one construction path for a generation: first startup passes
 /// `fallback: None` (fail-fast); `/reload` passes the last-good config and
 /// model so a broken config reopens the UI with a warning instead of exiting.
-fn build_stack(
+pub(super) fn build_stack(
     launch: &Launch<'_>,
     trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,

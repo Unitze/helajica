@@ -1,9 +1,16 @@
-# To release:
-#   git tag vX.Y.Z
-#   git push origin vX.Y.Z
+# Ships the desktop app. Run it from the Actions tab with the version to
+# release (e.g. 0.2.0): it bumps maki-gui's version, tags vX.Y.Z on main,
+# builds every platform and publishes the release the app updates from.
+# Pushing a vX.Y.Z tag by hand runs the same build for that tag.
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, e.g. 0.2.0
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -12,255 +19,105 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  BINARY_NAME: maki
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
+  GUI_DEPS: libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  create-release:
-    name: Create Release
+  prepare:
+    name: Tag and draft
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
+
+      - name: Bump version and tag
+        id: tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="${INPUT_VERSION#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$version' is not a semver version"
+            exit 1
+          fi
+          python3 .github/scripts/set_gui_version.py "$version"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release v$version"
+          git tag "v$version"
+          git push origin HEAD:main "v$version"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
 
       - name: Create draft release
         run: |
-          .github/scripts/retry.sh bash -c \
-            'gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes'
+          tag="${{ steps.tag.outputs.tag }}"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --draft --title "Helajica $tag" --generate-notes
 
-  build-linux:
-    name: Build (${{ matrix.target }})
-    needs: create-release
+  build:
+    name: Build (${{ matrix.os }}-${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-
+          - runner: windows-latest
+            os: windows
+            arch: x86_64
+            exe: .exe
+          - runner: macos-latest
+            os: macos
+            arch: aarch64
+            exe: ""
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            exe: ""
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Build in Alpine container
-        run: |
-          docker run --rm \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            -e CARGO_TERM_COLOR=always \
-            -e CARGO_INCREMENTAL=0 \
-            alpine:3.21 sh -c '
-              apk add --no-cache gcc g++ musl-dev make linux-headers curl git ca-certificates pkgconf python3-dev
-              git config --global --add safe.directory /workspace
-              curl --proto "=https" --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target ${{ matrix.target }}
-              source "$HOME/.cargo/env"
-              cargo build --release --target ${{ matrix.target }}
-            '
-          sudo chown -R $(id -u):$(id -g) target/
-
-      - name: Package
-        run: |
-          tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
-
-  build-netbsd:
-    name: Build (${{ matrix.target }})
-    needs: create-release
-    runs-on: ubuntu-latest
-    # tier 3 on an unpinned nightly breaks on its own schedule, so a failure
-    # there must not hold back the release of every other target
-    continue-on-error: ${{ matrix.toolchain == 'nightly' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-netbsd
-            zig_target: x86_64-netbsd.10.1
-            toolchain: stable
-            std: precompiled
-          - target: aarch64-unknown-netbsd
-            zig_target: aarch64-netbsd.10.1
-            toolchain: nightly
-            std: build-std
-
-    steps:
-      - uses: actions/checkout@v7
-
-      # zig bundles NetBSD 10.1 libc headers, crt objects and stub shared
-      # libraries, so it is a self-contained NetBSD cross toolchain: Ubuntu has
-      # no gcc-*-netbsd packages and NetBSD ships no cross kits for Linux.
-      - name: Install zig
-        env:
-          ZIG_VERSION: 0.16.0
-        run: |
-          .github/scripts/retry.sh curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          tar xJf "$RUNNER_TEMP/zig.tar.xz" -C "$HOME"
-          echo "$HOME/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-
-      - name: Install Rust toolchain
-        env:
-          TOOLCHAIN: ${{ matrix.toolchain }}
-          TARGET: ${{ matrix.target }}
-          STD: ${{ matrix.std }}
-        run: |
-          rustup toolchain install "$TOOLCHAIN" --profile minimal
-          rustup default "$TOOLCHAIN"
-          if [ "$STD" = precompiled ]; then
-            rustup target add "$TARGET"
-          else
-            # aarch64-unknown-netbsd is tier 3: no precompiled std to download.
-            # llvm-tools provides the llvm-ar/llvm-nm that compiler_builtins
-            # needs when std is built from source.
-            rustup component add rust-src llvm-tools --toolchain "$TOOLCHAIN"
-          fi
-
-      - name: Configure cross toolchain
-        env:
-          TARGET: ${{ matrix.target }}
-          ZIG_TARGET: ${{ matrix.zig_target }}
-        run: |
-          u=${TARGET//-/_}
-          U=${TARGET^^}; U=${U//-/_}
-          w="$PWD/.cross"
-          mkdir -p "$w"
-          for m in cc cxx; do
-            [ "$m" = cxx ] && zm='c++' || zm='cc'
-            cat > "$w/$m" <<EOF
-          #!/bin/bash
-          # the cc crate and openssl-src pass the rust triple as -target / --target=,
-          # which zig cannot parse; swap it for zig's own target syntax
-          args=(); skip=0
-          for a in "\$@"; do
-            if ((skip)); then skip=0; continue; fi
-            case "\$a" in -target|--target) skip=1; continue;; -target=*|--target=*) continue;; esac
-            args+=("\$a")
-          done
-          exec zig $zm -target $ZIG_TARGET "\${args[@]}"
-          EOF
-          done
-          cat > "$w/linker" <<EOF
-          #!/bin/bash
-          exec zig cc -target $ZIG_TARGET "\$@"
-          EOF
-          # wrappers, not "AR=zig ar": openssl-src splits a multi-word AR
-          printf '#!/bin/sh\nexec zig ar "$@"\n' > "$w/ar"
-          printf '#!/bin/sh\nexec zig ranlib "$@"\n' > "$w/ranlib"
-          chmod +x "$w"/*
-          {
-            echo "CC_$u=$w/cc"
-            echo "CXX_$u=$w/cxx"
-            echo "AR_$u=$w/ar"
-            echo "RANLIB_$u=$w/ranlib"
-            echo "CARGO_TARGET_${U}_LINKER=$w/linker"
-          } >> "$GITHUB_ENV"
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
         with:
-          key: ${{ matrix.target }}-${{ github.ref_name }}
-
-      - name: Build
-        env:
-          TARGET: ${{ matrix.target }}
-          STD: ${{ matrix.std }}
-        run: |
-          if [ "$STD" = build-std ]; then
-            cargo build --release --locked --target "$TARGET" -Z build-std=std,panic_abort
-          else
-            cargo build --release --locked --target "$TARGET"
-          fi
-
-      - name: Package
-        run: |
-          tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
-
-  build-other:
-    name: Build (${{ matrix.target }})
-    needs: create-release
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-          - target: aarch64-apple-darwin
-            runner: macos-14
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-
-    steps:
-      - uses: actions/checkout@v7
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-${{ github.ref_name }}
+          key: release
+
+      - name: Install GUI system libraries
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y $GUI_DEPS
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin helajica
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Upload
         run: |
-          tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          tag="$GITHUB_REF_NAME"
-          archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
-          cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe"
-          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        shell: bash
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+          asset="helajica-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.exe }}"
+          cp "target/release/helajica${{ matrix.exe }}" "$asset"
+          gh release upload "${{ needs.prepare.outputs.tag }}" "$asset" --clobber
 
   publish:
-    name: Publish Release
-    needs: [build-linux, build-netbsd, build-other]
+    name: Publish
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Download artifacts
-        run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts
-
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          sha256sum * > ../sha256sums.txt
-          cat ../sha256sums.txt
-
-      - name: Upload checksums
-        run: .github/scripts/retry.sh gh release upload "$GITHUB_REF_NAME" sha256sums.txt --clobber
-
-      - name: Mark release as published
-        run: .github/scripts/retry.sh gh release edit "$GITHUB_REF_NAME" --draft=false
+      - name: Publish release
+        run: gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false --latest
