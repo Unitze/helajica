@@ -54,7 +54,7 @@ jobs:
           python3 .github/scripts/set_gui_version.py "$version"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Release v$version"
+          git diff --quiet || git commit -am "Release v$version"
           git tag "v$version"
           git push origin HEAD:main "v$version"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
