@@ -541,6 +541,7 @@ impl<'h> Agent<'h> {
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
+        let model_started = Instant::now();
         let response = match stream_with_retry(
             StreamRequest {
                 provider: &*self.provider,
@@ -595,6 +596,7 @@ impl<'h> Agent<'h> {
         self.note_input_transformations(&response.input_transformations);
 
         let has_tools = response.message.has_tool_calls();
+        let tool_count = response.message.tool_uses().count();
         let stop_reason = response.stop_reason;
         info!(
             input_tokens = response.usage.input,
@@ -602,6 +604,8 @@ impl<'h> Agent<'h> {
             cache_creation = response.usage.cache_creation,
             cache_read = response.usage.cache_read,
             has_tools,
+            tool_count,
+            model_duration_ms = model_started.elapsed().as_millis() as u64,
             self.num_turns,
             model = %self.model.id,
             stop_reason = stop_reason.map_or("none", Into::into),
@@ -613,7 +617,14 @@ impl<'h> Agent<'h> {
 
         if has_tools {
             let history_len_before = self.history.len();
+            let tools_started = Instant::now();
             self.process_tool_calls(response).await?;
+            info!(
+                self.num_turns,
+                tool_count,
+                tools_duration_ms = tools_started.elapsed().as_millis() as u64,
+                "tool calls completed"
+            );
             self.gauge
                 .append(&self.history.as_slice()[history_len_before..]);
         } else {

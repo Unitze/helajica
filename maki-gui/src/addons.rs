@@ -48,8 +48,6 @@ impl Addon {
         }
     }
 
-    /// Off unless the user turned it on, except that someone already signed
-    /// in keeps what they had.
     pub fn enabled(self, settings: &Settings, storage: Option<&StateDir>) -> bool {
         settings
             .addons
@@ -57,7 +55,7 @@ impl Addon {
             .copied()
             .unwrap_or_else(|| match self {
                 Self::ChatGptSignIn => storage.is_some_and(openai_auth::signed_in),
-                Self::BackgroundSubagents => false,
+                Self::BackgroundSubagents => true,
             })
     }
 
@@ -69,12 +67,12 @@ impl Addon {
     }
 
     /// The plugin options this add-on sets while on, laid over the config.
-    pub fn plugin_options(self) -> Option<(String, Map<String, Value>)> {
+    pub fn plugin_options(self, enabled: bool) -> Option<(String, Map<String, Value>)> {
         match self {
             Self::ChatGptSignIn => None,
             Self::BackgroundSubagents => Some((
                 TASK_PLUGIN.to_owned(),
-                Map::from_iter([(ALLOW_BACKGROUND.to_owned(), Value::Bool(true))]),
+                Map::from_iter([(ALLOW_BACKGROUND.to_owned(), Value::Bool(enabled))]),
             )),
         }
     }
@@ -104,5 +102,18 @@ mod tests {
     #[test]
     fn off_by_default_without_a_sign_in() {
         assert!(!Addon::ChatGptSignIn.enabled(&Settings::default(), None));
+    }
+
+    #[test]
+    fn background_agents_default_on_but_respect_an_explicit_opt_out() {
+        assert!(Addon::BackgroundSubagents.enabled(&Settings::default(), None));
+        let settings = Settings {
+            addons: BTreeMap::from([(Addon::BackgroundSubagents.id().into(), false)]),
+            ..Settings::default()
+        };
+        let enabled = Addon::BackgroundSubagents.enabled(&settings, None);
+        assert!(!enabled);
+        let (_, options) = Addon::BackgroundSubagents.plugin_options(enabled).unwrap();
+        assert_eq!(options[ALLOW_BACKGROUND], false);
     }
 }

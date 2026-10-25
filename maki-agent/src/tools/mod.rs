@@ -30,6 +30,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use jiff::fmt::friendly::{Designator, Spacing, SpanPrinter};
 use maki_config::ProjectConfig;
 use serde_json::Value;
@@ -468,26 +469,43 @@ pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String
     walk_builder_opts(root, patterns, true)
 }
 
-/// `.git` is always excluded, even when `gitignore` is false.
+/// `.git` is always excluded, even when `gitignore` is false. `patterns`
+/// pick the files; a `!pattern` leaves matches out.
+///
+/// The picking patterns filter files rather than joining the walk's
+/// overrides: an override whitelist beats `.gitignore`, and `**/*` matches
+/// directory names too, so it would walk every ignored tree (`target/`,
+/// `node_modules/`) and stat each file in it.
 pub fn walk_builder_opts(
     root: &str,
     patterns: &[&str],
     gitignore: bool,
 ) -> Result<WalkBuilder, String> {
-    let mut ob = ignore::overrides::OverrideBuilder::new(root);
-    ob.add("!.git").expect("!.git is a valid glob");
-
-    for p in patterns {
-        ob.add(p)
-            .map_err(|e| format!("invalid glob pattern: {e}"))?;
+    let invalid = |e: ignore::Error| format!("invalid glob pattern: {e}");
+    let mut excluded = OverrideBuilder::new(root);
+    excluded.add("!.git").expect("!.git is a valid glob");
+    let mut picked = OverrideBuilder::new(root);
+    let mut picks = false;
+    for pattern in patterns {
+        match pattern.starts_with('!') {
+            true => excluded.add(pattern).map_err(invalid)?,
+            false => {
+                picks = true;
+                picked.add(pattern).map_err(invalid)?
+            }
+        };
     }
 
-    let overrides = ob
-        .build()
-        .map_err(|e| format!("invalid glob pattern: {e}"))?;
-
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
+    wb.hidden(false)
+        .overrides(excluded.build().map_err(invalid)?);
+    if picks {
+        let picked = picked.build().map_err(invalid)?;
+        wb.filter_entry(move |entry| {
+            entry.file_type().is_some_and(|ft| ft.is_dir())
+                || picked.matched(entry.path(), false).is_whitelist()
+        });
+    }
     if !gitignore {
         wb.ignore(false)
             .git_ignore(false)
@@ -1240,6 +1258,44 @@ mod tests {
         assert!(
             !with_ignored.iter().any(|p| p.contains(".git/")),
             ".git/ must be excluded even with gitignore=false, got: {with_ignored:?}"
+        );
+    }
+
+    #[test_case("**/*" ; "everything")]
+    #[test_case("**/*.rs" ; "by_extension")]
+    fn walk_builder_patterns_leave_ignored_trees_out(pattern: &str) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "target/
+",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::write(root.join("target/debug/build.rs"), "").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+
+        let files: Vec<PathBuf> = walk_builder(&root.to_string_lossy(), &[pattern])
+            .unwrap()
+            .build()
+            .flatten()
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+            .map(|e| e.into_path())
+            .collect();
+        assert!(
+            files.contains(&root.join("src").join("lib.rs")),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(root.join("target"))),
+            "{files:?}"
         );
     }
 

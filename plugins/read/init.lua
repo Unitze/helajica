@@ -11,9 +11,9 @@ local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed
 - Supports absolute, relative, and ~/ paths.
 - **offset** and **limit** are required. Use offset=1 to read from the first line.
 - Use limit=0 to read until the end of file (capped at 2000 lines).
-- Use the **index** tool or **grep** tool first to find the offset and limit.
+- Use **index** or **grep** to locate unfamiliar sections in large files. Read directly when the relevant range is known or the file is small.
 - Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
+- Choose a useful surrounding window; a separate line-count call is unnecessary.
 - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
@@ -156,7 +156,7 @@ maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
 - When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
+- Read a useful surrounding window without a separate line-count call.]],
 })
 
 maki.api.register_tool({

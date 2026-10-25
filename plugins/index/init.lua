@@ -143,7 +143,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
+  content = "- Use **index** to navigate large unfamiliar source files. Skip it for small files or known sections; read enough surrounding context in one call.",
 })
 
 maki.api.register_prompt_hint({
@@ -158,7 +158,7 @@ maki.api.register_tool({
   description = [[
 Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
 
-- Use this FIRST to understand file structure before using read with offset/limit.
+- Use to navigate large unfamiliar files before reading relevant sections. Skip for small files or known ranges.
 - Supports source files in different programming languages and markdown.
 - Falls back with an error on unsupported languages. Use read instead.]],
 

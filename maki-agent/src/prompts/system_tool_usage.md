@@ -1,6 +1,9 @@
-- Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
-- Call several tools in one response whenever they do not depend on each other: they run in parallel, while each response with a single call costs a full round trip.
-- Use **batch** for parallel calls, **code_execution** for chained/filtered calls, **task** for delegation.
-- Combine **batch** and **task**: launch multiple tasks in a batch to parallelize research or implementation.
+- Minimize time to a verified result. Each tool round trip costs time: gather related context together, then implement and verify.
+- Call independent tools together in one response; they run in parallel. Use **batch** when convenient, and **code_execution** for dependent calls or filtering large results.
+- Read a useful surrounding section, including imports and callers, rather than repeatedly searching and reading tiny slices. Use index for large unfamiliar files; skip it when the relevant range is already known or the file is small.
+- Delegate substantial independent research or isolated implementation to **task** with `background: true`, a clear scope and a concise expected result. Continue other work; use the result before repeating that investigation. Keep small, tightly coupled work local and avoid concurrent edits to the same files.
+- Start builds, test suites, servers and watchers with bash `background: true`. Do useful independent work while they run; wait for completion notices instead of polling. A started job is not a successful check: inspect the exit code before claiming completion.
+- If successive calls to the same file add little information, stop exploring and make the smallest supported change. If an edit fails, read the affected section once and fix the cause rather than repeatedly rewriting it blindly.
+- Keep results focused, but do not save a few output tokens by adding extra tool round trips. Run checks appropriate to the change; repeat them after relevant changes or failures.
 - Read files before editing them. Match surrounding context, conventions, and imports.
 - Prefer edits over full file writes.

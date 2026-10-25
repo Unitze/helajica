@@ -210,6 +210,7 @@ pub struct WorkspaceView {
     sidebar_scroller: Scroller,
     suggestions_scroller: Scroller,
     aside_scroller: Scroller,
+    subagents_scroller: Scroller,
     /// Items from here on arrived live and fade in; the loaded history does not.
     animate_from: usize,
     focus: FocusHandle,
@@ -290,6 +291,7 @@ impl WorkspaceView {
             sidebar_scroller: Scroller::area(),
             suggestions_scroller: Scroller::area(),
             aside_scroller: Scroller::area(),
+            subagents_scroller: Scroller::area(),
             list,
             animate_from: 0,
             focus: cx.focus_handle(),
@@ -2338,7 +2340,7 @@ impl WorkspaceView {
                     .child(
                         div()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Output · last 12 lines"),
+                            .child(format!("Output · last {OPEN_TAIL_LINES} lines")),
                     )
                     .child(
                         Button::new(SharedString::from(format!("copy-output-{}", call.id)))
@@ -2546,6 +2548,7 @@ impl WorkspaceView {
                                                 .rounded(px(999.))
                                                 .icon(Icon::new(Lucide::Square))
                                                 .tooltip("Stop")
+                                                .accessibility_label("Stop current task")
                                                 .on_click(cx.listener(|this, _, _, _| {
                                                     this.send(Command::Cancel)
                                                 })))
@@ -2556,6 +2559,7 @@ impl WorkspaceView {
                                                 .rounded(px(999.))
                                                 .icon(Icon::new(Lucide::ArrowUp))
                                                 .tooltip(if working { "Send a follow-up (Enter); applied before the next model request" } else { "Send (Enter)" })
+                                                .accessibility_label(if working { "Send follow-up" } else { "Send message" })
                                                 .disabled(empty)
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.submit(window, cx)
@@ -2630,43 +2634,55 @@ impl WorkspaceView {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle("subagents", cx))),
             )
             .when(open, |this| {
-                this.children(self.transcript.subagents.values().map(|task| {
-                    let id = task.info.parent_tool_use_id.clone();
-                    let details = format!(
-                        "{} · {} · {} turns · {}",
-                        task.info.name,
-                        task.info.model.as_deref().unwrap_or("inherited model"),
-                        task.turns,
-                        task.activity
-                    );
-                    h_flex()
-                        .gap_2()
+                this.child(
+                    div()
+                        .id("subagents-scroll")
+                        .max_h(px(ASIDE_HEIGHT))
+                        .smooth_scroll(&self.subagents_scroller, cx)
                         .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(if task.status == ToolStatus::Failed {
-                                    cx.theme().danger
-                                } else {
-                                    cx.theme().muted_foreground
-                                })
-                                .truncate()
-                                .child(details),
-                        )
-                        .when(task.status == ToolStatus::Running, |row| {
-                            row.child(
-                                Button::new(SharedString::from(format!("stop-agent-{id}")))
-                                    .ghost()
-                                    .xsmall()
-                                    .label("Stop")
-                                    .tooltip("Stop this subagent")
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        this.send(Command::CancelTask(id.clone()))
-                                    })),
-                            )
-                        })
-                }))
+                            v_flex()
+                                .gap_1()
+                                .children(self.transcript.subagents.values().map(|task| {
+                                    let id = task.info.parent_tool_use_id.clone();
+                                    let details = format!(
+                                        "{} · {} · {} turns · {}",
+                                        task.info.name,
+                                        task.info.model.as_deref().unwrap_or("inherited model"),
+                                        task.turns,
+                                        task.activity
+                                    );
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_xs()
+                                                .text_color(if task.status == ToolStatus::Failed {
+                                                    cx.theme().danger
+                                                } else {
+                                                    cx.theme().muted_foreground
+                                                })
+                                                .truncate()
+                                                .child(details),
+                                        )
+                                        .when(task.status == ToolStatus::Running, |row| {
+                                            row.child(
+                                                Button::new(SharedString::from(format!(
+                                                    "stop-agent-{id}"
+                                                )))
+                                                .ghost()
+                                                .xsmall()
+                                                .label("Stop")
+                                                .tooltip("Stop this subagent")
+                                                .on_click(cx.listener(move |this, _, _, _| {
+                                                    this.send(Command::CancelTask(id.clone()))
+                                                })),
+                                            )
+                                        })
+                                })),
+                        ),
+                )
             })
     }
 

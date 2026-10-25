@@ -1306,6 +1306,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
+            subagent_cancels: Arc::default(),
             tool_names: Vec::new(),
             interrupt: maki_agent::InterruptQueue::new(),
             answer_tx,

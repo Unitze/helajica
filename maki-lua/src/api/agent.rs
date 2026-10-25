@@ -226,7 +226,9 @@ impl Upstream {
                     envelope: Box::new(envelope),
                 });
             }
-            Self::Chat { ui: None, .. } => {}
+            Self::Chat {
+                session, ui: None, ..
+            } => super::gui::task_event(*session, envelope),
         }
     }
 
@@ -247,6 +249,22 @@ impl Upstream {
     /// A plugin task shows up in its chat as soon as it opens, so the user can
     /// find it in `/tasks` and stop it even before its first prompt.
     fn open_task(&self, info: SubagentInfo) {
+        if let Self::Chat {
+            session, ui: None, ..
+        } = self
+        {
+            super::gui::task_event(
+                *session,
+                Envelope {
+                    event: AgentEvent::Notice {
+                        text: "Starting…".into(),
+                    },
+                    subagent: Some(info),
+                    run_id: 0,
+                },
+            );
+            return;
+        }
         if let Self::Chat {
             session,
             plugin,

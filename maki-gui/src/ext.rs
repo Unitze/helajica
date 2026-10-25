@@ -79,6 +79,12 @@ pub struct Panel {
 pub struct StatusItem {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub tooltip: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub data: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -199,6 +205,17 @@ mod tests {
     use super::*;
 
     const PANEL_ID: &str = "git";
+
+    #[test]
+    fn clickable_status_preserves_its_action_and_tooltip() {
+        let mut ext = Extensions::default();
+        ext.apply(STATUS, json!({ "id": "jobs", "text": "1 shell", "tooltip": "cargo check", "topic": "bash.jobs.toggle", "data": { "job": 1 } }));
+        assert_eq!(ext.status[0].topic.as_deref(), Some("bash.jobs.toggle"));
+        assert_eq!(ext.status[0].tooltip, "cargo check");
+        assert_eq!(ext.status[0].data["job"], 1);
+        ext.apply(STATUS, json!({ "id": "jobs", "text": "idle" }));
+        assert!(ext.status[0].topic.is_none());
+    }
 
     #[test]
     fn panels_replace_by_id_and_remove() {

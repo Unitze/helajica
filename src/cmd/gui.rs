@@ -131,7 +131,13 @@ struct MakiEngine {
     lua_route: LuaRoute,
 }
 
-type LuaRoute = Arc<Mutex<Option<Sender<Update>>>>;
+#[derive(Default)]
+struct LuaRoutes {
+    focused: Option<Sender<Update>>,
+    sessions: HashMap<MakiId, WeakSender<Update>>,
+}
+
+type LuaRoute = Arc<Mutex<LuaRoutes>>;
 
 impl MakiEngine {
     fn new(cli: &Cli, storage: StateDir, gui_dir: Option<PathBuf>) -> Self {
@@ -140,9 +146,31 @@ impl MakiEngine {
         maki_lua::attach_gui(lua_tx);
         let route = Arc::clone(&lua_route);
         thread::spawn(move || {
-            for GuiMessage { topic, data } in lua_rx {
-                if let Some(updates) = lock(&route).as_ref() {
-                    let _ = updates.send(Update::Lua { topic, data });
+            for message in lua_rx {
+                let routes = lock(&route);
+                match message {
+                    GuiMessage::Emit { topic, data } => {
+                        let scoped = data
+                            .get("session")
+                            .and_then(Value::as_str)
+                            .and_then(|id| id.parse::<MakiId>().ok());
+                        let updates = match scoped {
+                            Some(session) => {
+                                routes.sessions.get(&session).and_then(WeakSender::upgrade)
+                            }
+                            None => routes.focused.clone(),
+                        };
+                        if let Some(updates) = updates {
+                            let _ = updates.send(Update::Lua { topic, data });
+                        }
+                    }
+                    GuiMessage::Task { session, envelope } => {
+                        if let Some(updates) =
+                            routes.sessions.get(&session).and_then(WeakSender::upgrade)
+                        {
+                            let _ = updates.send(Update::Agent(envelope));
+                        }
+                    }
                 }
             }
         });
@@ -552,6 +580,7 @@ fn serve_session(
         };
         let updates = updates_tx.clone();
         let route = Arc::clone(&base.lua_route);
+        let session_key = handle.session_id.id();
         let lua_handle = lua_handle.clone();
         move || {
             let plan = Arc::clone(&plan);
@@ -561,7 +590,9 @@ fn serve_session(
                     false => MODE_BUILD,
                 }
             });
-            *lock(&route) = Some(updates.clone());
+            let mut routes = lock(&route);
+            routes.sessions.insert(session_key, updates.downgrade());
+            routes.focused = Some(updates.clone());
         }
     };
     focus();
@@ -622,6 +653,7 @@ fn serve_session(
         serve(
             &commands_rx,
             &handle,
+            &base.lua_handle,
             &base.commands,
             base.defaults,
             &base.model_policy,
@@ -634,8 +666,13 @@ fn serve_session(
 
     {
         let mut route = lock(&base.lua_route);
-        if route.as_ref().is_some_and(|r| r.same_channel(&updates_tx)) {
-            *route = None;
+        route.sessions.remove(&handle.session_id.id());
+        if route
+            .focused
+            .as_ref()
+            .is_some_and(|r| r.same_channel(&updates_tx))
+        {
+            route.focused = None;
         }
     }
     drop(updates_tx);
@@ -674,6 +711,7 @@ struct Aside {
 fn serve(
     commands: &Receiver<Command>,
     handle: &InteractiveHandle,
+    lua: &EventHandle,
     slash_commands: &[CustomCommand],
     mut defaults: SessionDefaults,
     model_policy: &ModelPolicy,
@@ -708,6 +746,14 @@ fn serve(
             }
             Command::Cancel => {
                 let _ = handle.cancel_tx.try_send(());
+            }
+            Command::CancelTask(id) => {
+                handle.subagent_cancels.cancel(id.clone());
+                lua.cancel_plugin_session(&id);
+                lua.fire_autocmd(
+                    "TaskStopped",
+                    serde_json::json!({ "session_id": handle.session_id.id(), "id": id }),
+                );
             }
             Command::Permission { id, answer } => {
                 let _ = handle

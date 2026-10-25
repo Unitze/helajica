@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use flume::{Receiver, Sender};
+use maki_agent::Envelope;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Value};
-use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use super::util::convert::{json_to_lua, lua_to_json};
@@ -21,10 +22,16 @@ use crate::runtime::{TaskHandle, lock_cell};
 const NO_GUI_ERR: &str = "no gui attached";
 const GUI_CLOSED_ERR: &str = "gui closed";
 
-#[derive(Debug, Clone, Serialize)]
-pub struct GuiMessage {
-    pub topic: String,
-    pub data: JsonValue,
+#[derive(Debug)]
+pub enum GuiMessage {
+    Emit {
+        topic: String,
+        data: JsonValue,
+    },
+    Task {
+        session: MakiId,
+        envelope: Box<Envelope>,
+    },
 }
 
 type Topic = (Sender<JsonValue>, Receiver<JsonValue>);
@@ -36,6 +43,15 @@ static INBOX: OnceLock<Mutex<HashMap<String, Topic>>> = OnceLock::new();
 /// one process hosts at most one GUI.
 pub fn attach_gui(tx: Sender<GuiMessage>) {
     let _ = OUTBOX.set(tx);
+}
+
+pub(crate) fn task_event(session: MakiId, envelope: Envelope) {
+    if let Some(outbox) = OUTBOX.get() {
+        let _ = outbox.send(GuiMessage::Task {
+            session,
+            envelope: Box::new(envelope),
+        });
+    }
 }
 
 /// Hands a GUI message to whichever plugin waits on `topic`. Queued until one
@@ -82,7 +98,7 @@ fn emit(lua: &Lua, topic: String, data: Value) -> LuaResult<Pair<bool>> {
         return Ok(err_pair(NO_GUI_ERR));
     };
     let data = try_pair!(lua_to_json(lua, &data));
-    Ok(match outbox.send(GuiMessage { topic, data }) {
+    Ok(match outbox.send(GuiMessage::Emit { topic, data }) {
         Ok(()) => (Some(true), None),
         Err(_) => err_pair(GUI_CLOSED_ERR),
     })

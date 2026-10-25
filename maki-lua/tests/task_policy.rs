@@ -722,12 +722,15 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
 }
 
 #[test]
-fn background_input_is_opt_in() {
+fn background_input_is_available_by_default_and_can_be_disabled() {
     let advertised = |reg: &ToolRegistry| {
         reg.get(TASK_TOOL).unwrap().tool.schema()["properties"]["background"].is_object()
     };
-    assert!(!advertised(&load_task_host().0));
+    assert!(advertised(&load_task_host().0));
     assert!(advertised(&load_background_host().0));
+    let mut opts = serde_json::Map::new();
+    opts.insert("allow_background".into(), json!(false));
+    assert!(!advertised(&load_task_host_with_opts(opts).0));
 }
 
 #[test_case::test_case(SCENARIO_PLAIN, None, PLAIN_TEXT, FINISHED ; "plain")]

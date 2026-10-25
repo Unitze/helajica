@@ -78,8 +78,7 @@ pub fn plugin_overlay(gui_dir: Option<&Path>) -> PluginOverlay {
     let storage = maki_storage::StateDir::resolve().ok();
     let options = addons::Addon::ALL
         .into_iter()
-        .filter(|addon| addon.enabled(&settings, storage.as_ref()))
-        .filter_map(addons::Addon::plugin_options)
+        .filter_map(|addon| addon.plugin_options(addon.enabled(&settings, storage.as_ref())))
         .collect();
     PluginOverlay {
         switches: settings.plugins,

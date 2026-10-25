@@ -30,7 +30,7 @@ local Runner = {}
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
   allow_background = {
-    default = false,
+    default = true,
     desc = "Expose a `background` input that pushes subagent results to the chat when they finish.",
   },
   allow_model = {

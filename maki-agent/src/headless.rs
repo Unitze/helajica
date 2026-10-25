@@ -331,6 +331,7 @@ pub struct InteractiveHandle {
     pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
+    pub subagent_cancels: Arc<CancelMap<String>>,
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, SessionEvents) {
@@ -390,6 +391,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let session_ref_clone = session_ref.clone();
     let task_permissions = Arc::clone(&permissions);
+    let subagent_cancels = Arc::new(CancelMap::new());
+    let task_cancels = Arc::clone(&subagent_cancels);
     let task = smol::spawn(run_session(guard, params.mcp_handle.clone(), async move {
         let mut model = params.model;
         let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
@@ -478,7 +481,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                         timeouts: params.timeouts,
                         file_access: Arc::clone(&file_access),
                         prompt_slots: Arc::clone(&params.prompt_slots),
-                        subagent_cancels: Arc::new(CancelMap::new()),
+                        subagent_cancels: Arc::clone(&task_cancels),
                         ledger: Arc::new(RunLedger::default()),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
@@ -493,8 +496,15 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_mcp(mcp.clone());
 
+                if matches!(next.source, InputSource::Gui) {
+                    let _ = error_tx.send(AgentEvent::QueueItemConsumed {
+                        text: next.message.clone(),
+                        images: next.images.clone(),
+                    });
+                }
                 let result = agent.run(next).await;
                 drop(agent);
+                task_cancels.cancel_all();
                 cancel_task.cancel().await;
 
                 if let Err(ref e) = result {
@@ -519,6 +529,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     (
         InteractiveHandle {
+            subagent_cancels,
             tool_names,
             interrupt,
             answer_tx,

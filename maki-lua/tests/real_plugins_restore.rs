@@ -263,7 +263,10 @@ fn multiedit_batch_child_shows_full_numbered_diff() {
     let path = dir.path().join("f.rs");
     std::fs::write(&path, "top\nzzz\nn1\nn2\nn3\nn4\nn5\nbottom\n").unwrap();
 
-    let host = PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).unwrap();
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("edit", include_str!("../../plugins/edit/init.lua"))
+        .unwrap();
+    host.load_source("batch", BATCH_SRC).unwrap();
     let input = json!({ "tool_calls": [{ "tool": "multiedit", "parameters": {
         "path": path.to_str().unwrap(),
         "edits": [{ "old_string": "old1\nold2\nold3\nold4\nold5", "new_string": "n1\nn2\nn3\nn4\nn5" }],
@@ -349,7 +352,9 @@ const SKILL_BODY: &str = "1 # Release\n2 Tag it.";
 #[test]
 fn skill_restore_renders_content_not_llm_text() {
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("skill", include_str!("../../plugins/skill/init.lua"))
+        .unwrap();
     let output = format!("{SKILL_LOCATION}\n   1 | # Release\n   2 | Tag it.");
     let r = restore(
         &host,
@@ -373,7 +378,9 @@ fn index_dir_renders_identically_live_and_restored() {
         std::fs::write(dir.path().join(name), "").unwrap();
     }
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("index", include_str!("../../plugins/index/init.lua"))
+        .unwrap();
     let input = json!({ "path": dir.path().to_str().unwrap() });
 
     let live = exec_live(&host, &reg, INDEX_TOOL, input.clone());

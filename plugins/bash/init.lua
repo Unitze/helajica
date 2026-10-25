@@ -662,45 +662,53 @@ if opts.allow_background then
   -- One line under the composer for every running shell, so the count and
   -- the commands behind it are one glance away. A shell that exits drops out
   -- of `background_jobs` on its own, so this is re-polled rather than pushed.
-  local jobs_shown
-  local jobs_open = false
+  local jobs_shown = {}
+  local jobs_open = {}
 
   local function jobs_status()
-    local live = {}
+    local grouped = {}
+    for chat in pairs(jobs_shown) do
+      grouped[chat] = {}
+    end
     for id, entry in pairs(background_jobs) do
-      live[#live + 1] = { id = id, command = entry.command }
+      grouped[entry.chat] = grouped[entry.chat] or {}
+      table.insert(grouped[entry.chat], { id = id, command = entry.command })
     end
-    table.sort(live, function(a, b)
-      return a.id < b.id
-    end)
-    local parts = {}
-    for _, job in ipairs(live) do
-      parts[#parts + 1] = job.command .. " (job " .. job.id .. ")"
+    for chat, live in pairs(grouped) do
+      table.sort(live, function(a, b)
+        return a.id < b.id
+      end)
+      local parts = {}
+      for _, job in ipairs(live) do
+        parts[#parts + 1] = job.command .. " (job " .. job.id .. ")"
+      end
+      local shown = table.concat(parts, " · ")
+      if shown ~= jobs_shown[chat] then
+        jobs_shown[chat] = shown
+        local data = { id = JOBS_STATUS_ID, session = chat, text = "", remove = #live == 0 }
+        if #live > 0 then
+          data.text = #live == 1 and "1 shell" or #live .. " shells"
+          data.tooltip = "Click to view background shells: " .. shown
+          data.topic = JOBS_TOGGLE_TOPIC
+          data.data = { session = chat }
+        end
+        maki.gui.emit("ui.status", data)
+        local body = {}
+        for _, job in ipairs(live) do
+          body[#body + 1] = { type = "text", text = "Job " .. job.id }
+          body[#body + 1] = { type = "code", text = job.command }
+          body[#body + 1] =
+            { type = "button", label = "Stop", topic = JOBS_STOP_TOPIC, data = { job = job.id, session = chat } }
+        end
+        maki.gui.emit("ui.panel", {
+          id = JOBS_STATUS_ID,
+          session = chat,
+          title = "Background shells",
+          body = body,
+          remove = not jobs_open[chat] or #live == 0,
+        })
+      end
     end
-    local shown = table.concat(parts, " · ")
-    if shown == jobs_shown then
-      return
-    end
-    jobs_shown = shown
-    local data = { id = JOBS_STATUS_ID, text = "", remove = #live == 0 }
-    if #live > 0 then
-      data.text = #live == 1 and "1 shell" or #live .. " shells"
-      data.tooltip = "Click to view background shells: " .. shown
-      data.topic = JOBS_TOGGLE_TOPIC
-    end
-    maki.gui.emit("ui.status", data)
-    local body = {}
-    for _, job in ipairs(live) do
-      body[#body + 1] = { type = "text", text = "Job " .. job.id }
-      body[#body + 1] = { type = "code", text = job.command }
-      body[#body + 1] = { type = "button", label = "Stop", topic = JOBS_STOP_TOPIC, data = { job = job.id } }
-    end
-    maki.gui.emit("ui.panel", {
-      id = JOBS_STATUS_ID,
-      title = "Background shells",
-      body = body,
-      remove = not jobs_open or #live == 0,
-    })
   end
 
   local function poll_jobs()
@@ -714,13 +722,15 @@ if opts.allow_background then
     maki.async.run(poll_jobs)
     maki.async.spawn(function()
       while true do
-        local _, err = maki.gui.recv(JOBS_TOGGLE_TOPIC)
+        local data, err = maki.gui.recv(JOBS_TOGGLE_TOPIC)
         if err then
           return
         end
-        jobs_open = not jobs_open
-        jobs_shown = nil
-        jobs_status()
+        if data and data.session and jobs_shown[data.session] ~= nil then
+          jobs_open[data.session] = not jobs_open[data.session]
+          jobs_shown[data.session] = false
+          jobs_status()
+        end
       end
     end)
     maki.async.spawn(function()
@@ -730,13 +740,13 @@ if opts.allow_background then
           return
         end
         local entry = data and background_jobs[data.job]
-        if entry then
+        if entry and entry.chat == data.session then
           stop_shell(data.job, entry)
           maki.session.notify(
             "Background shell " .. data.job .. " was stopped by the user. Do not restart it unless asked.",
             { session = entry.chat, wake = true }
           )
-          jobs_shown = nil
+          jobs_shown[entry.chat] = false
           jobs_status()
         end
       end

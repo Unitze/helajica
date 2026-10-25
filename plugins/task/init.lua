@@ -32,6 +32,12 @@ local examples = {
   },
 }
 
+if Background then
+  description = description
+    .. "\nUse background: true for substantial independent work so you can continue your own task. Results arrive as completion notices; do not duplicate the delegated work or poll. Use blocking mode only when its result is needed immediately."
+  examples[1].background = true
+end
+
 local function handler(input, ctx)
   local prepared, prepare_err = Runner.prepare(input, ctx)
   if prepare_err then

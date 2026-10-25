@@ -1,1 +1,1 @@
-Most efficient tools: batch, code_execution, task.
+Optimize for a correct, verified result with fewer round trips. Independent calls can share one response. Use batch for groups, code_execution for processing, and background tasks for substantial independent work.

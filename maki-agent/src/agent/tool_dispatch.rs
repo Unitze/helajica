@@ -126,6 +126,7 @@ pub async fn run(
     ctx: &ToolContext,
     origin: CallOrigin,
 ) -> ToolDoneEvent {
+    let started = Instant::now();
     let resolved = resolve(ctx, name);
     let name = resolved.name;
     let hook = Hook::of(ctx, &resolved, origin);
@@ -165,7 +166,6 @@ pub async fn run(
     };
 
     let source = maki_otel::enabled().then(|| resolved.route.source());
-    let started = Instant::now();
     let mut done = run_inner(
         resolved,
         id,
@@ -176,10 +176,10 @@ pub async fn run(
         hook.as_ref(),
     )
     .await;
-    let took = started.elapsed();
     if let Some(hook) = &hook {
         hook.filter_output(&mut done, &input).await;
     }
+    let took = started.elapsed();
     if origin.is_model() {
         attach_call_instructions(ctx, &mut done);
     }

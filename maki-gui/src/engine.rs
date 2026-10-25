@@ -102,6 +102,7 @@ pub enum Command {
     /// [`Update::Btw`].
     Btw(String),
     Cancel,
+    CancelTask(String),
     Permission {
         id: String,
         answer: PermissionAnswer,
