@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 22 built-in tools in this reference (21 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 23 built-in tools in this reference (22 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -22,7 +22,7 @@ Commands run in the session's working directory (see Environment) by default.
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `command` | string | yes |  | The bash command to execute |
 | `tail` | integer | no |  | Return only the last N lines |
-| `background` | boolean | no |  | Run without waiting, for servers, watchers and long builds or tests. Returns a job id at once; its exit code and last output arrive later in a notice. |
+| `background` | boolean | no |  | Use true for builds, test suites and servers: returns a job id immediately and reports completion later. Omit to auto-background after 10s in live chats; false waits synchronously. |
 | `description` | string | no |  | Short description (3-5 words) of what the command does |
 
 ### `bash_stop` {#bash_stop}
@@ -141,6 +141,15 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 |-----------|------|----------|-------------|
 | `path` | string | yes | Path to the image file |
 
+### `screenshot` {#screenshot}
+
+Take a screenshot and see it: the whole screen, or one window by title or program name (Windows). The image comes back as vision input, and the file is kept so you can embed it in your reply.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `delay_ms` | integer | no | Wait this long first, for a window that is still opening or redrawing |
+| `window` | string | no | Part of the window title or program name to capture (Windows only); omit for the whole screen |
+
 ## Execution & Control
 
 ### `batch` {#batch}
@@ -180,6 +189,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `background` | boolean | no | Run in the background and continue other work. The result arrives later in a notice. End your turn to wait for it. Background tasks cannot ask for permissions. |
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |

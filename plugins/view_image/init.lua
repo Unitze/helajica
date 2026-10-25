@@ -1,4 +1,5 @@
 local shorten_path = require("maki.shorten_path")
+local screenshot = require("screenshot")
 
 local DESCRIPTION =
   [[View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
@@ -15,6 +16,18 @@ local MAX_EDGE = 1568
 -- Refuse absurdly large files up front; maki.image.decode also enforces a
 -- host-side pixel cap against decode bombs.
 local MAX_INPUT_BYTES = 50 * 1024 * 1024
+
+local SCREENSHOT_DESCRIPTION =
+  [[Take a screenshot and see it: the whole screen, or one window by title or program name (Windows). The image comes back as vision input, and the file is kept so you can embed it in your reply.
+
+- Use it to check work with a visible result: an app you started, a page in a browser, a chart window.
+- Start the app first (bash `background: true` for one that keeps running) and give it time to draw with `delay_ms`.]]
+
+local VERIFY_HINT = [[
+- Check work that has a visible result yourself, the way a user would: start or reload it, take a screenshot, look at it, fix what is off, and repeat until it looks right. Say what you checked; do not claim a UI works from the code alone.]]
+
+-- How long a screenshot may wait for a window to draw.
+local MAX_DELAY_MS = 30000
 
 local SHOW_MEDIA_HINT = [[
 - The desktop app draws media embedded in your reply: to show the user an image or a video, make the file (save the plot, render the clip with ffmpeg, ...) and put `![caption](absolute/path/to/file)` on its own line. Images show in place; videos open in the system player.]]
@@ -159,6 +172,48 @@ maki.api.register_tool({
     return load_image(path)
   end,
 })
+
+maki.api.register_tool({
+  name = "screenshot",
+  kind = "read",
+  permission = "run",
+  description = SCREENSHOT_DESCRIPTION,
+  audiences = { "main", "research_sub", "general_sub" },
+
+  schema = {
+    type = "object",
+    properties = {
+      window = {
+        type = "string",
+        description = "Part of the window title or program name to capture (Windows only); omit for the whole screen",
+      },
+      delay_ms = {
+        type = "integer",
+        description = "Wait this long first, for a window that is still opening or redrawing",
+      },
+    },
+  },
+
+  header = function(input)
+    local buf = maki.ui.buf()
+    buf:line({ { input.window or "screen", "path" } })
+    return buf
+  end,
+
+  handler = function(input, _ctx)
+    local delay = math.min(input.delay_ms or 0, MAX_DELAY_MS)
+    if delay > 0 then
+      maki.async.sleep(delay)
+    end
+    local path, err = screenshot.capture(input.window)
+    if not path then
+      return fail("error: " .. err)
+    end
+    return load_image(path)
+  end,
+})
+
+maki.api.register_prompt_hint({ slot = "tool_usage", content = VERIFY_HINT })
 
 if maki.gui.active() then
   maki.api.register_prompt_hint({ slot = "tool_usage", content = SHOW_MEDIA_HINT })

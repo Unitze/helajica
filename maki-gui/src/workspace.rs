@@ -28,12 +28,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Anchor, Animation, AnimationExt as _, App, AppContext as _, AsyncWindowContext, ClipboardEntry,
-    Context, Div, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, Image, ImageSource,
-    InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, ListAlignment, ListOffset,
-    ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, WeakEntity,
-    Window, actions, div, ease_out_quint, hsla, img, list, prelude::FluentBuilder as _, px,
-    relative, rgb,
+    ClipboardItem, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, Image,
+    ImageSource, InteractiveElement as _, IntoElement, KeyBinding, KeyDownEvent, ListAlignment,
+    ListOffset, ListState, ObjectFit, ParentElement as _, PathPromptOptions, Render, SharedString,
+    Stateful, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
+    WeakEntity, Window, actions, div, ease_out_quint, hsla, img, list, prelude::FluentBuilder as _,
+    px, relative, rgb,
 };
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
@@ -59,7 +59,7 @@ use crate::settings::Settings;
 use crate::settings_page::{self, SettingsView};
 use crate::titlebar::{Handler, title_bar};
 use crate::transcript::{
-    Change, Item, Level, ToolCall, ToolStatus, Transcript, run_elapsed, step_run,
+    Change, Item, Level, ToolCall, ToolStatus, Transcript, run_elapsed, step_run, step_runs,
 };
 use crate::update::{self, Release};
 
@@ -73,6 +73,9 @@ const SIDEBAR_WIDTH: f32 = 264.;
 const MAIN_CORNER_RADIUS: f32 = 12.;
 const TRANSCRIPT_WIDTH: f32 = 820.;
 const TOOL_PREVIEW_LINES: usize = 12;
+/// Lines at the end of a long bash output that the open card reports, such as
+/// the last of a build still running.
+const OPEN_TAIL_LINES: usize = 12;
 /// Lines the step card sits in from its header, past the status icon.
 const STEP_INDENT: f32 = 22.;
 const THOUGHT_LABEL: &str = "Thought";
@@ -82,6 +85,8 @@ const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const SPINNER_COLOR: u32 = 0xd97757;
 const WRITING_ACTIVITY: &str = "Writing…";
 const THINKING_CHIP: &str = "thinking";
+/// Shorter thinking would read as "thinking 0s".
+const THINKING_CHIP_MIN: Duration = Duration::from_secs(1);
 const WORKING_ACTIVITY: &str = "Working…";
 /// In `expanded`, this key marks the todo card as folded: it starts open.
 const TODOS_FOLDED_KEY: &str = "todos-folded";
@@ -195,6 +200,8 @@ pub struct WorkspaceView {
     mode: Mode,
     update: UpdateState,
     expanded: HashSet<String>,
+    step_open: HashMap<String, bool>,
+    step_ranges: Vec<Range<usize>>,
     sidebar_hidden: bool,
     /// The picture open over the window, after a thumbnail was clicked.
     viewing: Option<ImageSource>,
@@ -275,6 +282,8 @@ impl WorkspaceView {
             mode: Mode::Ask,
             update: UpdateState::Idle,
             expanded: HashSet::new(),
+            step_open: HashMap::new(),
+            step_ranges: Vec::new(),
             sidebar_hidden: false,
             viewing: None,
             scroller: Scroller::new(list.clone()),
@@ -503,6 +512,7 @@ impl WorkspaceView {
                     usage: self.usage.take(),
                     model_picker: self.model_picker.take(),
                     expanded: mem::take(&mut self.expanded),
+                    step_open: mem::take(&mut self.step_open),
                     pending: Vec::new(),
                     run_ended: None,
                     _task: Task::ready(()),
@@ -559,6 +569,7 @@ impl WorkspaceView {
                 usage: self.usage.take(),
                 model_picker: self.model_picker.take(),
                 expanded: mem::take(&mut self.expanded),
+                step_open: mem::take(&mut self.step_open),
                 pending: Vec::new(),
                 run_ended: None,
                 _task: task,
@@ -582,6 +593,7 @@ impl WorkspaceView {
             usage,
             model_picker,
             expanded,
+            step_open,
             pending,
             run_ended,
             _task,
@@ -593,6 +605,7 @@ impl WorkspaceView {
         self.usage = usage;
         self.model_picker = model_picker;
         self.expanded = expanded;
+        self.step_open = step_open;
         self.thinking = self.saved_thinking(&boot.model);
         let _ = commands.send(Command::Focus);
         let _ = commands.send(Command::Yolo(self.mode == Mode::Bypass));
@@ -806,6 +819,8 @@ impl WorkspaceView {
             let session_id = session.boot.session_id.clone();
             let _ = this.update_in(cx, |this, window, cx| {
                 this.transcript = Transcript::from_history(&session.boot.history);
+                this.expanded.clear();
+                this.step_open.clear();
                 this.refresh_thumbs();
                 for warning in &session.boot.warnings {
                     this.transcript.notice(warning.clone(), Level::Warning);
@@ -833,10 +848,7 @@ impl WorkspaceView {
                 cx.notify();
             });
             while let Ok(update) = updates.recv_async().await {
-                let Ok(Some(current)) = this.update(cx, |this, _| this.project.clone()) else {
-                    return;
-                };
-                if Self::deliver(&this, &current, &session_id, update, cx).is_err() {
+                if Self::deliver(&this, &project, &session_id, update, cx).is_err() {
                     return;
                 }
             }
@@ -1224,10 +1236,22 @@ impl WorkspaceView {
         }
         match self.transcript.apply(envelope) {
             Change::None => {}
-            Change::Appended => cx.notify(),
+            Change::Status => cx.notify(),
+            Change::Appended => {
+                self.sync_list();
+                if let Some(run) = step_run(
+                    &self.transcript.items,
+                    self.transcript.items.len().saturating_sub(1),
+                ) {
+                    self.list.remeasure_items(run);
+                }
+                cx.notify();
+            }
             Change::Updated(index) => {
                 self.refresh_thumb(index);
-                self.list.remeasure_items(index..index + 1);
+                self.list.remeasure_items(
+                    step_run(&self.transcript.items, index).unwrap_or(index..index + 1),
+                );
                 cx.notify();
             }
         }
@@ -1921,7 +1945,12 @@ impl WorkspaceView {
         let len = self.transcript.items.len();
         let last = index + 1 == len;
         let fresh = index >= self.animate_from && index + 2 >= len;
-        let run = step_run(&self.transcript.items, index);
+        let run_index = self.step_ranges.partition_point(|run| run.end <= index);
+        let run = self
+            .step_ranges
+            .get(run_index)
+            .filter(|run| run.contains(&index))
+            .cloned();
         if matches!(item, Item::Thinking(_)) && run.as_ref().is_none_or(|run| index > run.start) {
             return div().into_any_element();
         }
@@ -2102,15 +2131,16 @@ impl WorkspaceView {
                 _ => None,
             })
         };
-        let running = calls().any(|c| c.status == ToolStatus::Running);
         let key = format!("steps-{}", run.start);
-        let open = self.expanded.contains(&key) != running;
+        let open = self.step_open.get(&key).copied().unwrap_or(false);
+        let toggle_key = key.clone();
         let first = index == run.start;
         let shown = !matches!(self.transcript.items[index], Item::Thinking(_));
-        let row = (open && shown).then(|| self.render_step_row(index, &run, cx));
+        let row = (open && shown).then(|| self.render_step_row(index, open, &run, cx));
         if !first {
             return row.map_or_else(|| div().into_any_element(), IntoElement::into_any_element);
         }
+        let running = calls().any(|c| c.status == ToolStatus::Running);
         let failed = calls().any(|c| c.status == ToolStatus::Failed);
         let icon = match (running, failed) {
             (true, _) => Spinner::new().xsmall().into_any_element(),
@@ -2123,7 +2153,12 @@ impl WorkspaceView {
                 .text_color(cx.theme().muted_foreground)
                 .into_any_element(),
         };
-        let title = calls().next_back().map(step_label).unwrap_or_default();
+        let count = calls().count();
+        let title = match (count, calls().next_back()) {
+            (1, Some(call)) => step_label(call),
+            (_, Some(call)) => format!("{count} tools · {}", step_label(call)),
+            _ => String::new(),
+        };
         let elapsed = run_elapsed(steps, Instant::now()).map(short_duration);
         let toggled = run.clone();
         v_flex()
@@ -2135,7 +2170,8 @@ impl WorkspaceView {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.list.remeasure_items(toggled.clone());
-                        this.toggle(&key, cx)
+                        this.step_open.insert(toggle_key.clone(), !open);
+                        cx.notify();
                     }))
                     .child(
                         div()
@@ -2177,12 +2213,12 @@ impl WorkspaceView {
     fn render_step_row(
         &self,
         index: usize,
+        open: bool,
         run: &Range<usize>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let item = &self.transcript.items[index];
         let key = format!("step-{index}");
-        let open = self.expanded.contains(&key);
         let (label, color) = match item {
             Item::Tool(call) => (
                 step_label(call),
@@ -2282,7 +2318,11 @@ impl WorkspaceView {
             }))
     }
 
-    fn tool_output(&self, call: &ToolCall, open: bool, cx: &App) -> impl IntoElement + use<> {
+    /// The output panel of a call. Open, it shows the whole output, or the tail
+    /// of a long one: a step card draws inside a row measured from what it
+    /// painted, and a card taller than the window never gets to run again.
+    fn tool_output(&self, call: &ToolCall, open: bool, cx: &mut Context<Self>) -> Div {
+        let id = call.id.clone();
         div()
             .px_3()
             .py_2()
@@ -2292,8 +2332,30 @@ impl WorkspaceView {
             .font_family(cx.theme().mono_font_family.clone())
             .text_xs()
             .whitespace_normal()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Output · last 12 lines"),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("copy-output-{}", call.id)))
+                            .ghost()
+                            .xsmall()
+                            .label("Copy full output")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(call) = this.transcript.tool(&id) {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        call.output.clone(),
+                                    ));
+                                }
+                            })),
+                    ),
+            )
             .child(match open {
-                true => call.output.clone(),
+                true => tail(&call.output, OPEN_TAIL_LINES),
                 false => preview(&call.output, TOOL_PREVIEW_LINES),
             })
     }
@@ -2429,6 +2491,9 @@ impl WorkspaceView {
                         "todos-in",
                     ))
                 })
+                .when(!self.transcript.subagents.is_empty(), |this| {
+                    this.child(self.render_subagents(cx))
+                })
                 .child(
                     div()
                         .relative()
@@ -2474,27 +2539,27 @@ impl WorkspaceView {
                                                 Textarea::new(&self.composer).bordered(false),
                                             ),
                                         )
-                                        .child(match working {
-                                            true => Button::new("stop")
-                                                .primary()
+                                        .when(working, |this| {
+                                            this.child(Button::new("stop")
+                                                .ghost()
                                                 .small()
                                                 .rounded(px(999.))
                                                 .icon(Icon::new(Lucide::Square))
                                                 .tooltip("Stop")
                                                 .on_click(cx.listener(|this, _, _, _| {
                                                     this.send(Command::Cancel)
-                                                })),
-                                            false => Button::new("send")
+                                                })))
+                                        })
+                                        .child(Button::new("send")
                                                 .primary()
                                                 .small()
                                                 .rounded(px(999.))
                                                 .icon(Icon::new(Lucide::ArrowUp))
-                                                .tooltip("Send")
+                                                .tooltip(if working { "Send a follow-up (Enter); applied before the next model request" } else { "Send (Enter)" })
                                                 .disabled(empty)
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.submit(window, cx)
-                                                })),
-                                        }),
+                                                }))),
                                 ),
                         ),
                 )
@@ -2504,21 +2569,105 @@ impl WorkspaceView {
 
     /// What the agent is doing right now, from the newest thing in the turn.
     fn activity(&self) -> String {
+        if self.transcript.pending_messages > 0 {
+            return format!(
+                "{} message(s) queued · received before the next model request",
+                self.transcript.pending_messages
+            );
+        }
         let mut turn = self
             .transcript
             .items
             .iter()
             .rev()
             .take_while(|item| !matches!(item, Item::User { .. }));
-        let running = turn.clone().find_map(|item| match item {
-            Item::Tool(call) if call.status == ToolStatus::Running => Some(call),
-            _ => None,
-        });
+        let running = self
+            .transcript
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Tool(call) if call.status == ToolStatus::Running => Some(call),
+                _ => None,
+            });
         match (running, turn.next()) {
             (Some(call), _) => step_label(call),
             (None, Some(Item::Assistant(_))) => WRITING_ACTIVITY.into(),
             _ => WORKING_ACTIVITY.into(),
         }
+    }
+
+    fn render_subagents(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = "subagents";
+        let open = self.expanded.contains(key);
+        let running = self
+            .transcript
+            .subagents
+            .values()
+            .filter(|task| task.status == ToolStatus::Running)
+            .count();
+        v_flex()
+            .gap_1()
+            .px_3()
+            .child(
+                Button::new("subagents")
+                    .ghost()
+                    .xsmall()
+                    .label(format!(
+                        "{} {} · {running} running",
+                        self.transcript.subagents.len(),
+                        if self.transcript.subagents.len() == 1 {
+                            "agent"
+                        } else {
+                            "agents"
+                        }
+                    ))
+                    .icon(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle("subagents", cx))),
+            )
+            .when(open, |this| {
+                this.children(self.transcript.subagents.values().map(|task| {
+                    let id = task.info.parent_tool_use_id.clone();
+                    let details = format!(
+                        "{} · {} · {} turns · {}",
+                        task.info.name,
+                        task.info.model.as_deref().unwrap_or("inherited model"),
+                        task.turns,
+                        task.activity
+                    );
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(if task.status == ToolStatus::Failed {
+                                    cx.theme().danger
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .truncate()
+                                .child(details),
+                        )
+                        .when(task.status == ToolStatus::Running, |row| {
+                            row.child(
+                                Button::new(SharedString::from(format!("stop-agent-{id}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Stop")
+                                    .tooltip("Stop this subagent")
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.send(Command::CancelTask(id.clone()))
+                                    })),
+                            )
+                        })
+                }))
+            })
     }
 
     /// A reply's markdown, with the pictures and videos it embeds drawn in
@@ -2602,7 +2751,7 @@ impl WorkspaceView {
                             .gap_2()
                             .child(div().min_w_0().truncate().child(label.clone()))
                             .children(elapsed.map(|elapsed| div().flex_none().child(elapsed)))
-                            .when(!thinking.elapsed().is_zero(), |row| {
+                            .when(thinking.elapsed() >= THINKING_CHIP_MIN, |row| {
                                 row.child(
                                     div()
                                         .flex_none()
@@ -2960,7 +3109,25 @@ impl WorkspaceView {
                 )
             })
             .child(div().flex_1())
-            .children(self.ext.status.iter().map(|s| div().child(s.text.clone())))
+            .children(self.ext.status.iter().map(|s| {
+                let tooltip = SharedString::from(s.tooltip.clone());
+                div()
+                    .id(SharedString::from(s.id.clone()))
+                    .max_w(px(FILE_CHIP_WIDTH))
+                    .truncate()
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .when_some(s.topic.clone(), |this, topic| {
+                        let data = s.data.clone();
+                        this.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.send(Command::Lua {
+                                    topic: topic.clone(),
+                                    data: data.clone(),
+                                });
+                            }))
+                    })
+                    .child(s.text.clone())
+            }))
             .children(
                 self.transcript
                     .totals
@@ -3211,6 +3378,7 @@ fn thinking_label(thinking: StoredThinking) -> String {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.step_ranges = step_runs(&self.transcript.items);
         self.scroller.tick(window);
         let hidden = self.sidebar_hidden;
         v_flex()
@@ -3644,6 +3812,17 @@ fn short_duration(elapsed: Duration) -> String {
     }
 }
 
+/// The lines the open card shows: all of a short output, the end of a long one.
+fn tail(text: &str, lines: usize) -> String {
+    let mut end = text.lines().rev();
+    let mut shown: Vec<_> = end.by_ref().take(lines).collect();
+    if end.next().is_none() {
+        return text.to_owned();
+    }
+    shown.reverse();
+    format!("…\n{}", shown.join("\n"))
+}
+
 fn preview(text: &str, lines: usize) -> String {
     let mut out: String = text.lines().take(lines).collect::<Vec<_>>().join("\n");
     if text.lines().nth(lines).is_some() {
@@ -3664,6 +3843,7 @@ struct Parked {
     usage: Option<UsageReport>,
     model_picker: Option<Entity<ModelPicker>>,
     expanded: HashSet<String>,
+    step_open: HashMap<String, bool>,
     /// What needs the window: permission prompts, questions, panels.
     pending: Vec<Update>,
     /// A run that ended out of sight, and whether it was cancelled: a goal
@@ -4054,6 +4234,7 @@ mod tests {
             usage: None,
             model_picker: None,
             expanded: HashSet::new(),
+            step_open: HashMap::new(),
             pending: Vec::new(),
             run_ended: None,
             _task: Task::ready(()),
@@ -4098,6 +4279,13 @@ mod tests {
     #[test_case("local", "local" ; "bare")]
     fn short_model_drops_the_provider(spec: &str, expected: &str) {
         assert_eq!(short_model(spec), expected);
+    }
+
+    #[test_case("done", "done" ; "short_output")]
+    #[test_case("b\n", "b\n" ; "single_line")]
+    #[test_case("1\n2\n3", "…\n3" ; "long_output_keeps_the_end")]
+    fn tail_keeps_the_last_lines(output: &str, expected: &str) {
+        assert_eq!(tail(output, 1), expected);
     }
 
     #[test_case(999, "999" ; "small")]

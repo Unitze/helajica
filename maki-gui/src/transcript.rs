@@ -1,12 +1,13 @@
 //! The conversation as the window shows it, folded from agent events. Kept
 //! free of GPUI so the folding is testable on its own.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use maki_agent::types::TodoItem;
-use maki_agent::{AgentEvent, Envelope, ToolOutput};
+use maki_agent::{AgentEvent, Envelope, SubagentInfo, ToolOutput};
 use maki_providers::{ContentBlock, ImageSource, Message, MessageKind, Role, TokenUsage};
 use serde::Deserialize as _;
 use serde_json::Value;
@@ -106,11 +107,22 @@ pub struct Totals {
 pub struct Transcript {
     pub items: Vec<Item>,
     pub working: bool,
+    pub pending_messages: usize,
+    pub subagents: BTreeMap<String, SubagentProgress>,
+    turn_start: usize,
     /// When the agent last started working, for the live status line.
     pub turn_started: Option<Instant>,
     /// Time spent thinking since then, shown instead of the thinking itself.
     pub thinking: ThinkingClock,
     pub totals: Totals,
+}
+
+#[derive(Debug)]
+pub struct SubagentProgress {
+    pub info: SubagentInfo,
+    pub activity: String,
+    pub status: ToolStatus,
+    pub turns: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,6 +151,7 @@ impl ThinkingClock {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Change {
     None,
+    Status,
     Appended,
     Updated(usize),
 }
@@ -152,6 +165,11 @@ impl Transcript {
         {
             transcript.push_message(message);
         }
+        transcript.turn_start = transcript
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::User { .. }))
+            .unwrap_or(0);
         transcript
     }
 
@@ -247,21 +265,24 @@ impl Transcript {
 
     pub fn push_user(&mut self, text: String, images: Vec<ImageSource>) {
         self.items.push(Item::User { text, images });
-        self.begin_turn();
+        self.pending_messages += 1;
+        if !self.working {
+            self.begin_turn();
+        }
     }
 
     pub fn begin_turn(&mut self) {
+        self.turn_start = self.items.len().saturating_sub(1);
         self.working = true;
         self.turn_started = Some(Instant::now());
         self.thinking = ThinkingClock::default();
     }
 
-    /// The list the agent's latest `todo_write` set since the user last spoke.
+    /// Follow-ups steer the same run, so its checklist stays visible.
     pub fn todos(&self) -> Vec<TodoItem> {
-        self.items
+        self.items[self.turn_start.min(self.items.len())..]
             .iter()
             .rev()
-            .take_while(|item| !matches!(item, Item::User { .. }))
             .find_map(|item| match item {
                 Item::Tool(call) if call.name == TODO_TOOL => call.input.as_ref(),
                 _ => None,
@@ -286,14 +307,71 @@ impl Transcript {
     /// Folds one event in. Subagent events are left to their parent's tool
     /// row: interleaving them would scramble the main conversation.
     pub fn apply(&mut self, envelope: &Envelope) -> Change {
-        if envelope.subagent.is_some() {
-            return Change::None;
+        if let Some(info) = &envelope.subagent {
+            let progress = self
+                .subagents
+                .entry(info.parent_tool_use_id.clone())
+                .or_insert_with(|| SubagentProgress {
+                    info: info.clone(),
+                    activity: "Starting…".into(),
+                    status: ToolStatus::Running,
+                    turns: 0,
+                });
+            match &envelope.event {
+                AgentEvent::Notice { text } => progress.activity.clone_from(text),
+                AgentEvent::ThinkingDelta { .. } if progress.activity != "Thinking…" => {
+                    progress.activity = "Thinking…".into()
+                }
+                AgentEvent::TextDelta { .. } if progress.activity != "Writing…" => {
+                    progress.activity = "Writing…".into()
+                }
+                AgentEvent::ToolStart(start) => {
+                    progress.activity = format!("{} {}", start.tool, start.summary)
+                }
+                AgentEvent::TurnComplete(_) => progress.turns += 1,
+                AgentEvent::Done { reason, .. } => {
+                    progress.status = if *reason == maki_agent::DoneReason::Cancelled {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Done
+                    };
+                    progress.activity = reason.to_string();
+                }
+                AgentEvent::Error { message, .. } => {
+                    progress.status = ToolStatus::Failed;
+                    progress.activity.clone_from(message);
+                }
+                AgentEvent::StreamClosed if progress.status == ToolStatus::Running => {
+                    progress.status = ToolStatus::Done;
+                    progress.activity = "Finished".into();
+                }
+                _ => return Change::None,
+            }
+            return Change::Status;
+        }
+        if !self.working
+            && matches!(
+                envelope.event,
+                AgentEvent::TextDelta { .. }
+                    | AgentEvent::ThinkingDelta { .. }
+                    | AgentEvent::ToolPending { .. }
+                    | AgentEvent::ToolStart(_)
+            )
+        {
+            self.begin_turn();
         }
         match &envelope.event {
             AgentEvent::ThinkingDelta { .. } => self.thinking.start(),
             _ => self.thinking.stop(),
         }
         match &envelope.event {
+            AgentEvent::QueueItemConsumed { .. } => {
+                if !self.working && self.pending_messages > 0 {
+                    self.begin_turn();
+                }
+                self.pending_messages = self.pending_messages.saturating_sub(1);
+                Change::Status
+            }
             AgentEvent::TextDelta { text } => self.extend(text, false),
             AgentEvent::ThinkingDelta { text } => self.extend(text, true),
             AgentEvent::ToolPending { id, name } => self.upsert_tool(id, |call| {
@@ -307,15 +385,21 @@ impl Transcript {
             AgentEvent::ToolOutput { id, content } => self.upsert_tool(id, |call| {
                 call.output.clone_from(content);
             }),
-            AgentEvent::ToolDone(done) => self.upsert_tool(&done.id, |call| {
-                call.name = done.tool.to_string();
-                call.output = output_text(&done.output);
-                call.status = status(done.is_error);
-                if let ToolOutput::Image { source, .. } = done.output.as_ref() {
-                    call.image = Some(source.clone());
+            AgentEvent::ToolDone(done) => {
+                if let Some(progress) = self.subagents.get_mut(&done.id) {
+                    progress.status = status(done.is_error);
+                    progress.activity = if done.is_error { "Failed" } else { "Finished" }.into();
                 }
-                call.finished = Some(Instant::now());
-            }),
+                self.upsert_tool(&done.id, |call| {
+                    call.name = done.tool.to_string();
+                    call.output = output_text(&done.output);
+                    call.status = status(done.is_error);
+                    if let ToolOutput::Image { source, .. } = done.output.as_ref() {
+                        call.image = Some(source.clone());
+                    }
+                    call.finished = Some(Instant::now());
+                })
+            }
             AgentEvent::TurnComplete(turn) => {
                 add_usage(&mut self.totals.usage, &turn.usage);
                 self.totals.context_window = turn.context_window;
@@ -466,6 +550,29 @@ pub fn step_run(items: &[Item], index: usize) -> Option<Range<usize>> {
         .then_some(start..end)
 }
 
+pub fn step_runs(items: &[Item]) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut has_tool = false;
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            Item::Tool(_) => has_tool = true,
+            Item::Thinking(_) => {}
+            _ => {
+                if has_tool {
+                    runs.push(start..index);
+                }
+                start = index + 1;
+                has_tool = false;
+            }
+        }
+    }
+    if has_tool {
+        runs.push(start..items.len());
+    }
+    runs
+}
+
 /// From the first call starting to the last one finishing, or to `now` while
 /// one still runs. `None` when the calls were not seen live.
 pub fn run_elapsed(steps: &[Item], now: Instant) -> Option<Duration> {
@@ -609,6 +716,40 @@ mod tests {
     }
 
     #[test]
+    fn followups_are_acknowledged_without_resetting_the_running_turn() {
+        let mut t = Transcript::default();
+        t.push_user("first".into(), Vec::new());
+        t.apply(&envelope(AgentEvent::QueueItemConsumed {
+            text: "first".into(),
+            images: Vec::new(),
+        }));
+        let started = t.turn_started;
+        t.push_user("follow up".into(), Vec::new());
+        assert_eq!(t.pending_messages, 1);
+        assert_eq!(t.turn_started, started);
+        assert_eq!(
+            t.apply(&envelope(AgentEvent::QueueItemConsumed {
+                text: "follow up".into(),
+                images: Vec::new()
+            })),
+            Change::Status
+        );
+        assert_eq!(t.pending_messages, 0);
+        assert_eq!(t.turn_started, started);
+    }
+
+    #[test]
+    fn a_background_wakeup_becomes_visible_as_working() {
+        let mut t = Transcript::default();
+        t.apply(&envelope(AgentEvent::ToolPending {
+            id: TOOL_ID.into(),
+            name: TOOL_NAME.into(),
+        }));
+        assert!(t.working);
+        assert!(t.turn_started.is_some());
+    }
+
+    #[test]
     fn thinking_time_stops_once_the_reply_starts() {
         let mut t = Transcript::default();
         t.apply(&envelope(AgentEvent::ThinkingDelta { text: "hmm".into() }));
@@ -700,6 +841,15 @@ mod tests {
     }
 
     #[test]
+    fn a_followup_keeps_the_running_checklist() {
+        let mut transcript = Transcript::default();
+        transcript.push_user("start".into(), Vec::new());
+        transcript.items.push(todo_call(ONE_TODO));
+        transcript.push_user("follow up".into(), Vec::new());
+        assert_eq!(transcript.todos().len(), 1);
+    }
+
+    #[test]
     fn a_resumed_image_result_keeps_its_picture_on_the_call() {
         let pixels = ImageSource::new(ImageMediaType::Png, PIXELS.into());
         let history = [
@@ -788,7 +938,49 @@ mod tests {
             answer_tx: None,
             inbox: None,
         });
-        assert_eq!(t.apply(&env), Change::None);
+        assert_eq!(t.apply(&env), Change::Status);
         assert!(t.items.is_empty());
+        assert_eq!(t.subagents[TOOL_ID].info.name, TOOL_NAME);
+        env.event = AgentEvent::ToolStart(Box::new(maki_agent::ToolStartEvent {
+            id: "child".into(),
+            tool: Arc::from("read"),
+            summary: "src/lib.rs".into(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: None,
+        }));
+        assert_eq!(t.apply(&env), Change::Status);
+        assert_eq!(t.subagents[TOOL_ID].activity, "read src/lib.rs");
+        env.event = AgentEvent::Error {
+            message: "failed".into(),
+            auth: false,
+        };
+        t.apply(&env);
+        env.event = AgentEvent::StreamClosed;
+        t.apply(&env);
+        assert_eq!(t.subagents[TOOL_ID].status, ToolStatus::Failed);
+        assert!(t.items.is_empty());
+    }
+
+    #[test]
+    fn grouped_rows_match_individual_lookup_across_long_runs() {
+        let mut items = vec![
+            Item::Thinking("alone".into()),
+            Item::Assistant("reply".into()),
+        ];
+        items.extend((0..500).map(|_| tool()));
+        items.push(Item::Assistant("done".into()));
+        items.push(Item::Thinking("between".into()));
+        items.push(tool());
+        assert_eq!(step_runs(&items), vec![2..502, 503..505]);
+        let runs = step_runs(&items);
+        for i in 0..items.len() {
+            assert_eq!(
+                runs.iter().find(|run| run.contains(&i)).cloned(),
+                step_run(&items, i)
+            );
+        }
     }
 }

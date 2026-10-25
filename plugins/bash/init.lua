@@ -21,6 +21,7 @@ local RTK_UNSUPPORTED_FLAGS = {
 local SEPARATOR = "──────"
 -- Lines of a background shell kept for the notice it sends on exit.
 local BACKGROUND_TAIL_LINES = 40
+local FOREGROUND_YIELD_MS = 10000
 
 local rtk_available
 
@@ -267,6 +268,21 @@ Commands run in the session's working directory (see Environment) by default.
 - Interactive commands (sudo, ssh prompts) fail immediately.
 - Use the `tail` param, not `| tail`: piping hides live output.]]
 
+local BACKGROUND_GUIDE = [[
+- Set `background: true` for anything that may take over ~30 seconds or never exits: builds, test suites, dev servers, watchers. Prefer it to raising `timeout`. You get a job id at once, and a notice with the exit code and last output when the command exits.
+- In a live chat, commands still running after 10 seconds automatically continue in the background. Set `background: false` only when you must wait synchronously for the result.
+- While it runs, keep doing work that does not need its result. When nothing is left, end your turn: the notice wakes you. Never poll with sleep. Stop it early with bash_stop.]]
+
+local BACKGROUND_HINT =
+  "- Run builds, test suites and servers with bash `background: true` and keep working; their result arrives as a notice."
+
+-- The line the desktop app keeps under the composer while shells run, and
+-- how often it is refreshed.
+local JOBS_STATUS_ID = "bash-jobs"
+local JOBS_TOGGLE_TOPIC = "bash.jobs.toggle"
+local JOBS_STOP_TOPIC = "bash.jobs.stop"
+local JOBS_POLL_MS = 2000
+
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = "- Read, list, search, and edit files with dedicated tools, even outside cwd. Bash is for git, builds, tests, and file management (mv, cp, rm, mkdir).",
@@ -283,6 +299,11 @@ local opts = maki.api.register_options(output_limits.extend({
     desc = "Expose a `background` input that runs the command without waiting and reports to the chat when it exits, and the `bash_stop` tool.",
   },
 }))
+
+if opts.allow_background then
+  description = description .. "\n" .. BACKGROUND_GUIDE
+  maki.api.register_prompt_hint({ slot = "tool_usage", content = BACKGROUND_HINT })
+end
 
 -- Job id -> { chat, command, lines, stopped } for every running background shell.
 local background_jobs = {}
@@ -301,6 +322,38 @@ local function last_output(entry)
   return ". Last output:\n" .. table.concat(entry.lines, "\n")
 end
 
+local function report_background(id, entry, code)
+  background_jobs[id] = nil
+  if entry.stopped then
+    return
+  end
+  local text = "Background shell "
+    .. id
+    .. " (`"
+    .. entry.command
+    .. "`) exited with code "
+    .. code
+    .. last_output(entry)
+  local _, err = maki.session.notify(text, { session = entry.chat, wake = true })
+  if err then
+    maki.log.warn("background shell notification failed: " .. err)
+  end
+end
+
+local function started_output(job)
+  return "Running in the background as job "
+    .. job
+    .. ". Its exit code and last output will arrive in a completion notice. Continue independent work, or end your turn to wait. Do not poll or start the same command again. Stop it with bash_stop."
+end
+
+-- A shell the user stopped needs no exit notice, and its entry goes away so
+-- the status line and `/jobs` stop listing it.
+local function stop_shell(id, entry)
+  entry.stopped = true
+  background_jobs[id] = nil
+  maki.fn.jobstop(id)
+end
+
 -- Returns nil without a live chat to report to, and the caller runs the
 -- command in the foreground instead.
 local function start_background(command, workdir, ctx)
@@ -311,6 +364,7 @@ local function start_background(command, workdir, ctx)
   local entry = { chat = chat, command = command, lines = {} }
   local job, err = maki.fn.jobstart(command, {
     cwd = workdir,
+    scope = { session = chat },
     env = { GIT_TERMINAL_PROMPT = "0" },
     on_stdout = function(_, line)
       remember(entry.lines, line)
@@ -319,26 +373,14 @@ local function start_background(command, workdir, ctx)
       remember(entry.lines, line)
     end,
     on_exit = function(id, code)
-      background_jobs[id] = nil
-      if entry.stopped then
-        return
-      end
-      local text = "Background shell " .. id .. " (`" .. command .. "`) exited with code " .. code .. last_output(entry)
-      local _, notify_err = maki.session.notify(text, { session = chat, wake = true })
-      if notify_err then
-        maki.log.warn("background shell notification failed: " .. notify_err)
-      end
+      report_background(id, entry, code)
     end,
   })
   if not job then
     return { llm_output = "error: " .. err, is_error = true }
   end
   background_jobs[job] = entry
-  return {
-    llm_output = "Started in the background as job "
-      .. job
-      .. ". A notice with its exit code and last output arrives when it exits: end your turn to wait for it, or keep working. Stop it early with bash_stop.",
-  }
+  return { llm_output = started_output(job) }
 end
 
 maki.api.register_tool({
@@ -356,7 +398,7 @@ maki.api.register_tool({
       background = opts.allow_background
           and {
             type = "boolean",
-            description = "Run without waiting, for servers, watchers and long builds or tests. Returns a job id at once; its exit code and last output arrive later in a notice.",
+            description = "Use true for builds, test suites and servers: returns a job id immediately and reports completion later. Omit to auto-background after 10s in live chats; false waits synchronously.",
           }
         or nil,
     },
@@ -392,6 +434,9 @@ maki.api.register_tool({
       s = s .. " in " .. relative_path(workdir)
     end
     local hints = {}
+    if input.background then
+      hints[#hints + 1] = "background"
+    end
     if input.timeout then
       hints[#hints + 1] = maki.ui.humantime(input.timeout) .. " timeout"
     end
@@ -463,6 +508,9 @@ maki.api.register_tool({
     local output_parts = {}
     local has_output = false
     local finished = false
+    local chat = opts.allow_background and input.background ~= false and ctx:session_id()
+    local entry = chat and { chat = chat, command = command, lines = {} }
+    local detached = false
 
     -- Presentation limits apply after the view streams every line. Both the
     -- exit and cancel path go through here.
@@ -510,8 +558,15 @@ maki.api.register_tool({
 
     local job, err = maki.fn.jobstart(command, {
       cwd = workdir,
+      scope = chat and { session = chat } or nil,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
+        if entry then
+          remember(entry.lines, line)
+        end
+        if detached then
+          return
+        end
         if not has_output then
           has_output = true
           view:clear()
@@ -520,6 +575,12 @@ maki.api.register_tool({
         view:append(line)
       end,
       on_stderr = function(_, line)
+        if entry then
+          remember(entry.lines, line)
+        end
+        if detached then
+          return
+        end
         if not has_output then
           has_output = true
           view:clear()
@@ -527,12 +588,33 @@ maki.api.register_tool({
         append_line(output_parts, line)
         view:append(line)
       end,
-      on_exit = function(_, code)
-        finish(code)
+      on_exit = function(id, code)
+        if detached then
+          report_background(id, entry, code)
+        else
+          finish(code)
+        end
       end,
     })
     if not job then
       return { llm_output = "error: " .. err, is_error = true }
+    end
+
+    if entry then
+      maki.defer_fn(function()
+        if finished then
+          return
+        end
+        detached, finished = true, true
+        background_jobs[job] = entry
+        local output = final_output()
+        output_parts = {}
+        view:finish()
+        ctx:finish({
+          llm_output = started_output(job) .. (output ~= "" and "\nOutput so far:\n" .. output or ""),
+          body = buf,
+        })
+      end, FOREGROUND_YIELD_MS)
     end
 
     -- Esc or deadline: hand back the lines streamed so far, so the model
@@ -542,6 +624,9 @@ maki.api.register_tool({
         return
       end
       finished = true
+      if chat then
+        maki.fn.jobstop(job)
+      end
       ctx:finish(partial.cut(view, final_output(), reason, timeout_secs))
     end)
 
@@ -569,20 +654,100 @@ if opts.allow_background then
       if not entry then
         return { llm_output = "error: no running background shell " .. tostring(input.job), is_error = true }
       end
-      entry.stopped = true
-      background_jobs[input.job] = nil
-      maki.fn.jobstop(input.job)
+      stop_shell(input.job, entry)
       return { llm_output = "Stopped job " .. input.job .. last_output(entry) }
     end,
   })
+
+  -- One line under the composer for every running shell, so the count and
+  -- the commands behind it are one glance away. A shell that exits drops out
+  -- of `background_jobs` on its own, so this is re-polled rather than pushed.
+  local jobs_shown
+  local jobs_open = false
+
+  local function jobs_status()
+    local live = {}
+    for id, entry in pairs(background_jobs) do
+      live[#live + 1] = { id = id, command = entry.command }
+    end
+    table.sort(live, function(a, b)
+      return a.id < b.id
+    end)
+    local parts = {}
+    for _, job in ipairs(live) do
+      parts[#parts + 1] = job.command .. " (job " .. job.id .. ")"
+    end
+    local shown = table.concat(parts, " · ")
+    if shown == jobs_shown then
+      return
+    end
+    jobs_shown = shown
+    local data = { id = JOBS_STATUS_ID, text = "", remove = #live == 0 }
+    if #live > 0 then
+      data.text = #live == 1 and "1 shell" or #live .. " shells"
+      data.tooltip = "Click to view background shells: " .. shown
+      data.topic = JOBS_TOGGLE_TOPIC
+    end
+    maki.gui.emit("ui.status", data)
+    local body = {}
+    for _, job in ipairs(live) do
+      body[#body + 1] = { type = "text", text = "Job " .. job.id }
+      body[#body + 1] = { type = "code", text = job.command }
+      body[#body + 1] = { type = "button", label = "Stop", topic = JOBS_STOP_TOPIC, data = { job = job.id } }
+    end
+    maki.gui.emit("ui.panel", {
+      id = JOBS_STATUS_ID,
+      title = "Background shells",
+      body = body,
+      remove = not jobs_open or #live == 0,
+    })
+  end
+
+  local function poll_jobs()
+    jobs_status()
+    maki.defer_fn(function()
+      maki.async.run(poll_jobs)
+    end, JOBS_POLL_MS)
+  end
+
+  if maki.gui.active() then
+    maki.async.run(poll_jobs)
+    maki.async.spawn(function()
+      while true do
+        local _, err = maki.gui.recv(JOBS_TOGGLE_TOPIC)
+        if err then
+          return
+        end
+        jobs_open = not jobs_open
+        jobs_shown = nil
+        jobs_status()
+      end
+    end)
+    maki.async.spawn(function()
+      while true do
+        local data, err = maki.gui.recv(JOBS_STOP_TOPIC)
+        if err then
+          return
+        end
+        local entry = data and background_jobs[data.job]
+        if entry then
+          stop_shell(data.job, entry)
+          maki.session.notify(
+            "Background shell " .. data.job .. " was stopped by the user. Do not restart it unless asked.",
+            { session = entry.chat, wake = true }
+          )
+          jobs_shown = nil
+          jobs_status()
+        end
+      end
+    end)
+  end
 
   maki.api.create_autocmd("SessionEnd", {
     callback = function(ev)
       for id, entry in pairs(background_jobs) do
         if entry.chat == ev.data.session_id then
-          entry.stopped = true
-          background_jobs[id] = nil
-          maki.fn.jobstop(id)
+          stop_shell(id, entry)
         end
       end
     end,

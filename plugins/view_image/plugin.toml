@@ -1,2 +1,6 @@
 [permissions]
 fs_read = true
+# Starting the platform's screenshot command.
+run = true
+# The screenshots folder.
+fs_write = true
