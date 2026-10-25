@@ -1119,7 +1119,7 @@ impl ModuleLoader {
     /// Both forms Neovim accepts are tried, `<mod>.lua` before
     /// `<mod>/init.lua`. Every bundled candidate is tried before any plugin
     /// file, so a package still cannot shadow a bundled module.
-    fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+    async fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
         let base = modname.replace('.', "/");
         let candidates = [format!("{base}.lua"), format!("{base}/init.lua")];
 
@@ -1148,10 +1148,10 @@ impl ModuleLoader {
         };
 
         queue_codegen(&self.codegen, &func);
-        func.call(())
+        lua.create_thread(func)?.into_async(())?.await
     }
 
-    fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+    async fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
         if modname.is_empty() {
             return Err(mlua::Error::runtime(
                 "require: module name must be non-empty",
@@ -1177,7 +1177,7 @@ impl ModuleLoader {
         // Cleared on every path, so a failed require never leaves the module
         // wedged as "in progress".
         self.loading.set(modname, true)?;
-        let result = self.load(lua, modname);
+        let result = self.load(lua, modname).await;
         self.loading.set(modname, LuaValue::Nil)?;
         let result = result?;
 
@@ -2988,17 +2988,19 @@ impl LuaRuntime {
         env: &mlua::Table,
         require_root: Option<RequireRoot>,
     ) -> Result<Function, mlua::Error> {
-        let loader = ModuleLoader {
+        let loader = Arc::new(ModuleLoader {
             bundled: self.bundled.clone(),
             require_root,
             env: env.clone(),
             codegen: self.codegen_queue.clone(),
             loaded: self.lua.create_table()?,
             loading: self.lua.create_table()?,
-        };
+        });
 
-        self.lua
-            .create_function(move |lua, modname: String| loader.require(lua, &modname))
+        self.lua.create_async_function(move |lua, modname: String| {
+            let loader = Arc::clone(&loader);
+            async move { loader.require(&lua, &modname).await }
+        })
     }
 
     /// `plugins.<name>` options only reach a plugin through

@@ -1772,6 +1772,46 @@ mod tests {
     }
 
     #[test]
+    fn init_require_can_read_files_and_cache_nested_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".maki");
+        fs::create_dir_all(project.join("lua")).unwrap();
+        fs::write(
+            project.join("plugin.toml"),
+            "[permissions]\nfs_read = true\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("lua/state.lua"),
+            r#"
+local text, err = maki.fs.read("missing-require-regression-state")
+assert(text == nil and err ~= nil)
+return { ready = true }
+"#,
+        )
+        .unwrap();
+        fs::write(project.join("lua/outer.lua"), "return require('state')").unwrap();
+        fs::write(
+            project.join("init.lua"),
+            r#"
+local state = require("outer")
+assert(state.ready)
+assert(require("state") == state)
+assert(require("outer") == state)
+"#,
+        )
+        .unwrap();
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_init_files_from_dirs(
+            InitFiles::GlobalAndProject(project.join("init.lua")),
+            [],
+            &mut Vec::new(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn project_scope_preserves_global_values_and_overrides_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("global");
