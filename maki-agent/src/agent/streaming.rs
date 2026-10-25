@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use flume::TryRecvError;
 use maki_providers::provider::Provider;
 use maki_providers::retry::{RetryPolicy, RetryState};
 use maki_providers::{
@@ -45,9 +46,18 @@ fn canonicalize_tool_names(message: &mut Message) {
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: &EventSender,
+    cancel: &CancelToken,
 ) -> String {
     let mut streamed = String::new();
-    while let Ok(pe) = prx.recv_async().await {
+    loop {
+        let pe = match prx.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => match cancel.race(prx.recv_async()).await {
+                Ok(Ok(event)) => event,
+                _ => break,
+            },
+        };
         let ae = match pe {
             ProviderEvent::TextDelta { text } => {
                 streamed.push_str(&text);
@@ -234,7 +244,8 @@ pub(crate) async fn stream_with_retry(
         let (ptx, prx) = flume::unbounded();
         let forwarder = smol::spawn({
             let event_tx = event_tx.clone();
-            async move { forward_provider_events(prx, &event_tx).await }
+            let cancel = cancel.clone();
+            async move { forward_provider_events(prx, &event_tx, &cancel).await }
         });
         // `race` checks the token before it polls, so a run cancelled while a
         // retry slept on a server `Retry-After` never pays for the attempt it
@@ -317,7 +328,16 @@ pub(crate) async fn stream_with_retry(
                 // in silence would leave that text for the next attempt to be
                 // appended to.
                 let delay_ms = delay.as_millis() as u64;
-                warn!(attempt, delay_ms, rotated, error = %e, "retryable, will retry");
+                warn!(
+                    model = %model.id,
+                    provider = %model.provider,
+                    attempt,
+                    delay_ms,
+                    rotated,
+                    kind = ?e.retry_kind(),
+                    error = %e,
+                    "retryable, will retry"
+                );
                 event_tx.send(AgentEvent::Retry {
                     attempt,
                     message,
@@ -378,8 +398,10 @@ fn error_description(error: &AgentError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
     use std::sync::Mutex;
 
+    use futures_lite::future::poll_once;
     use maki_providers::{
         Effort, KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Role, ThinkingConfig, TokenUsage,
     };
@@ -387,6 +409,31 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+
+    #[test]
+    fn cancelling_stops_forwarding_even_when_a_provider_keeps_its_sender() {
+        const PARTIAL: &str = "partial response";
+        smol::block_on(async {
+            let (provider_tx, provider_rx) = flume::unbounded();
+            let (tx, events) = flume::unbounded();
+            let event_tx = EventSender::new(tx, 0);
+            let (trigger, cancel) = CancelToken::new();
+            provider_tx
+                .send(ProviderEvent::TextDelta {
+                    text: PARTIAL.into(),
+                })
+                .unwrap();
+            let mut forward = pin!(forward_provider_events(provider_rx, &event_tx, &cancel));
+            assert!(poll_once(forward.as_mut()).await.is_none());
+            trigger.cancel();
+            assert_eq!(poll_once(forward.as_mut()).await, Some(PARTIAL.to_owned()));
+            assert!(matches!(
+                events.try_recv().unwrap().event,
+                AgentEvent::TextDelta { text } if text == PARTIAL
+            ));
+            drop(provider_tx);
+        });
+    }
 
     const SECRET_BODY: &str = "messages.0.content: \"my private prompt\", key sk-abc";
     const WINDOW: u32 = 262_144;

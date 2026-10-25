@@ -26,6 +26,7 @@ const OPENAI_LIMIT: &str = "maximum context length is ";
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
 const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
+const REQUEST_TIMEOUT_MESSAGE: &str = "provider request timed out";
 const THINKING_UNBOUND: &str = "bound to a different conversation";
 const UNREADABLE_BODY_MESSAGE: &str = "unable to read error body";
 const RETRY_AFTER_HEADER: &str = "retry-after";
@@ -156,9 +157,10 @@ pub enum ErrorProjection {
     Tool,
     /// The kind is all anyone reads off an io error.
     Io(io::ErrorKind),
-    /// Transports split on whether a connection was ever made.
+    /// Transport timeouts and connection failures have separate retry budgets.
     Http {
         connect_failure: bool,
+        timeout: bool,
     },
     HttpRequest,
     Json,
@@ -188,6 +190,7 @@ impl AgentError {
             Self::Io(e) => ErrorProjection::Io(e.kind()),
             Self::Http(e) => ErrorProjection::Http {
                 connect_failure: is_connect_failure(e),
+                timeout: e.is_timeout(),
             },
             Self::HttpRequest(_) => ErrorProjection::HttpRequest,
             Self::Json(_) => ErrorProjection::Json,
@@ -218,7 +221,9 @@ impl AgentError {
         match self {
             Self::Api { status: 429, .. } => Some(RetryKind::RateLimit),
             Self::Api { status, .. } if *status >= 500 => Some(RetryKind::Transient),
+            Self::Http(e) if e.is_timeout() => Some(RetryKind::Timeout),
             Self::Http(e) if is_connect_failure(e) => Some(RetryKind::Connect),
+            Self::Io(e) if e.kind() == io::ErrorKind::TimedOut => Some(RetryKind::Timeout),
             Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Some(RetryKind::Connect),
             Self::Io(_) | Self::Http(_) => Some(RetryKind::Transient),
             Self::Timeout { .. } => Some(RetryKind::Timeout),
@@ -394,10 +399,12 @@ impl AgentError {
                 status, message, ..
             } => format!("API error ({status}): {message}"),
             Self::Tool { tool, message } => format!("{tool}: {message}"),
+            Self::Io(e) if e.kind() == io::ErrorKind::TimedOut => REQUEST_TIMEOUT_MESSAGE.into(),
             Self::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
                 CONNECT_FAILED_MESSAGE.into()
             }
             Self::Io(e) => format!("I/O error: {e}"),
+            Self::Http(e) if e.is_timeout() => REQUEST_TIMEOUT_MESSAGE.into(),
             Self::Http(e) if is_connect_failure(e) => CONNECT_FAILED_MESSAGE.into(),
             Self::Http(_) => NETWORK_ERROR_MESSAGE.into(),
             Self::Timeout { .. } => "stream timed out, retrying".into(),
@@ -457,6 +464,8 @@ impl AgentError {
             Self::Api { status: 429, .. } => "Rate limited".into(),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
             Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
+            Self::Http(e) if e.is_timeout() => REQUEST_TIMEOUT_MESSAGE.into(),
+            Self::Io(e) if e.kind() == io::ErrorKind::TimedOut => REQUEST_TIMEOUT_MESSAGE.into(),
             Self::Io(_) | Self::Http(_) => "Connection error".into(),
             Self::Timeout { .. } => "Stream timed out".into(),
             _ => self.to_string(),
@@ -508,12 +517,8 @@ impl From<maki_storage::StorageError> for AgentError {
 /// a dead provider edge into the same `ConnectionFailed`, and telling them
 /// apart is not possible from here.
 ///
-/// `ErrorKind::Timeout` stays out: it covers both an expired connect timeout
-/// and a stall on a stream that was already flowing, which want opposite
-/// budgets, and the error alone cannot say which happened. So it retries as
-/// [`RetryKind::Transient`], unbounded, and a blackholed SYN keeps trying where
-/// a refused port gives up in seconds. Splitting the two means tracking whether
-/// any byte ever arrived.
+/// Transport timeouts use the timeout budget whether the connection was
+/// established or not. They must not fall into unbounded transient retries.
 fn is_connect_failure(e: &isahc::Error) -> bool {
     matches!(
         e.kind(),
@@ -538,7 +543,7 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 mod tests {
     use std::{collections::HashSet, mem::discriminant};
 
-    use maki_config::DEFAULT_MAX_RETRIES;
+    use maki_config::{DEFAULT_MAX_RETRIES, DEFAULT_MAX_TIMEOUT_RETRIES};
     use serde_json::{Value, json};
     use test_case::test_case;
 
@@ -553,7 +558,7 @@ mod tests {
     const RATE_LIMITED_RETRY_MESSAGE: &str = "Rate limited";
     /// More rounds than any bounded budget allows, so a budget that survives
     /// all of them is the unbounded one.
-    const ROUNDS: u32 = DEFAULT_MAX_RETRIES * 2;
+    const ROUNDS: u32 = (DEFAULT_MAX_RETRIES + DEFAULT_MAX_TIMEOUT_RETRIES) * 2;
     /// Retry budgets are what these tests measure, so the key walk must not add
     /// attempts of its own.
     const ONE_KEY: usize = 1;
@@ -719,6 +724,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transport_timeouts_explain_the_stall() {
+        for error in [
+            AgentError::Http(HttpErrorKind::Timeout.into()),
+            AgentError::Io(io::ErrorKind::TimedOut.into()),
+        ] {
+            assert_eq!(error.user_message(), REQUEST_TIMEOUT_MESSAGE);
+            assert_eq!(error.retry_message(), REQUEST_TIMEOUT_MESSAGE);
+        }
+    }
+
     /// Retries this error is granted before the loop has to give up, stopping
     /// at `ROUNDS` for a budget with no ceiling.
     fn retries_granted(error: &AgentError) -> u32 {
@@ -734,6 +750,7 @@ mod tests {
     /// a connection that was made is the network being the network and is
     /// waited out.
     #[test_case(HttpErrorKind::ConnectionFailed, DEFAULT_MAX_RETRIES ; "a_refused_connection_gives_up")]
+    #[test_case(HttpErrorKind::Timeout, DEFAULT_MAX_TIMEOUT_RETRIES ; "an_http_timeout_gives_up")]
     #[test_case(HttpErrorKind::NameResolution, DEFAULT_MAX_RETRIES   ; "an_unresolvable_host_gives_up")]
     #[test_case(HttpErrorKind::Io, ROUNDS                            ; "a_read_error_keeps_retrying")]
     #[test_case(HttpErrorKind::TlsEngine, ROUNDS                     ; "a_tls_failure_keeps_retrying")]
@@ -742,6 +759,7 @@ mod tests {
     }
 
     #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
+    #[test_case(io::ErrorKind::TimedOut, DEFAULT_MAX_TIMEOUT_RETRIES ; "an_io_timeout_gives_up")]
     #[test_case(io::ErrorKind::UnexpectedEof, ROUNDS                  ; "a_truncated_read_keeps_retrying")]
     fn an_io_failure_gives_up_when_nothing_is_listening(kind: io::ErrorKind, expected: u32) {
         assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
@@ -917,6 +935,7 @@ mod tests {
         corpus.extend(
             [
                 io::ErrorKind::ConnectionRefused,
+                io::ErrorKind::TimedOut,
                 io::ErrorKind::UnexpectedEof,
             ]
             .map(|kind| AgentError::Io(kind.into())),
@@ -924,6 +943,7 @@ mod tests {
         corpus.extend(
             [
                 HttpErrorKind::ConnectionFailed,
+                HttpErrorKind::Timeout,
                 HttpErrorKind::NameResolution,
                 HttpErrorKind::TlsEngine,
             ]

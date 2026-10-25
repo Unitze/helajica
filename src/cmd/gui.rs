@@ -746,6 +746,7 @@ fn serve(
                 handle.interrupt.wake();
             }
             Command::Cancel => {
+                handle.subagent_cancels.cancel_all();
                 let _ = handle.cancel_tx.try_send(());
             }
             Command::CancelTask(id) => {

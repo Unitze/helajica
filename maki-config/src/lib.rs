@@ -61,7 +61,7 @@ pub const DEFAULT_RETRY_BASE_MS: u64 = 2_000;
 /// pace of a long outage: a minute between tries is around 180 requests over
 /// three hours, where the old eight seconds would have sent around 1350.
 pub const DEFAULT_RETRY_MAX_MS: u64 = 60_000;
-pub const DEFAULT_MAX_TIMEOUT_RETRIES: u32 = 10;
+pub const DEFAULT_MAX_TIMEOUT_RETRIES: u32 = 2;
 /// Spent only on rate limits the server sent no `Retry-After` for, which is how
 /// a spend cap reads, and that one does not clear for the rest of the billing
 /// period.

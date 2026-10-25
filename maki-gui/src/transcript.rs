@@ -107,6 +107,7 @@ pub struct Totals {
 pub struct Transcript {
     pub items: Vec<Item>,
     pub working: bool,
+    pub stopping: bool,
     pub pending_messages: usize,
     pub subagents: BTreeMap<String, SubagentProgress>,
     turn_start: usize,
@@ -274,8 +275,17 @@ impl Transcript {
     pub fn begin_turn(&mut self) {
         self.turn_start = self.items.len().saturating_sub(1);
         self.working = true;
+        self.stopping = false;
         self.turn_started = Some(Instant::now());
         self.thinking = ThinkingClock::default();
+    }
+
+    pub fn request_stop(&mut self) -> bool {
+        if !self.working || self.stopping {
+            return false;
+        }
+        self.stopping = true;
+        true
     }
 
     /// Follow-ups steer the same run, so its checklist stays visible.
@@ -337,6 +347,9 @@ impl Transcript {
                     progress.activity = format!("{} {}", start.tool, start.summary)
                 }
                 AgentEvent::TurnComplete(_) => progress.turns += 1,
+                AgentEvent::Retry {
+                    attempt, message, ..
+                } => progress.activity = format!("Retry {attempt}: {message}"),
                 AgentEvent::Done { reason, .. } => {
                     let (state, activity) = match reason {
                         DoneReason::EndTurn => (ToolStatus::Done, "Finished"),
@@ -430,6 +443,7 @@ impl Transcript {
                 ..
             } => {
                 self.working = false;
+                self.stopping = false;
                 self.totals.cost = sum(self.totals.cost, *cost);
                 self.totals.context_size = *context_size;
                 self.totals.context_window = *context_window;
@@ -449,13 +463,16 @@ impl Transcript {
             }
             AgentEvent::Error { message, .. } => {
                 self.working = false;
+                self.stopping = false;
                 self.settle_running();
                 // An error is shown as it came. The transcript is markdown, so
                 // a provider body (JSON, HTML) is fenced: unfenced it would be
                 // reflowed and its angle brackets read as markup.
                 self.notice_plain(message.clone(), Level::Error)
             }
-            AgentEvent::Retry { message, .. } => self.push_notice(message, Level::Warning),
+            AgentEvent::Retry {
+                attempt, message, ..
+            } => self.push_notice(format!("Retry {attempt}: {message}"), Level::Warning),
             AgentEvent::Notice { text } | AgentEvent::Steered { text, .. } => {
                 self.push_notice(text, Level::Info)
             }
@@ -714,6 +731,57 @@ mod tests {
     const ONE_TODO: &str = r#"[{"content":"a","status":"pending"}]"#;
     const TWO_TODOS: &str =
         r#"[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]"#;
+    const RETRY_MESSAGE: &str = "provider request timed out";
+    const RETRY_NOTICE: &str = "Retry 3: provider request timed out";
+
+    #[test_case(false ; "cancel_confirmed")]
+    #[test_case(true ; "request_failed")]
+    fn stop_request_waits_for_terminal_confirmation(failed: bool) {
+        let mut transcript = Transcript::default();
+        assert!(!transcript.request_stop());
+        transcript.begin_turn();
+        assert!(transcript.request_stop());
+        assert!(!transcript.request_stop());
+        transcript.apply(&envelope(AgentEvent::TextDelta {
+            text: TEXT_RESULT.into(),
+        }));
+        assert!(transcript.working && transcript.stopping);
+        transcript.apply(&envelope(if failed {
+            AgentEvent::Error {
+                message: RETRY_MESSAGE.into(),
+                auth: false,
+            }
+        } else {
+            AgentEvent::Done {
+                reason: DoneReason::Cancelled,
+                usage: TokenUsage::default(),
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
+                num_turns: 0,
+            }
+        }));
+        assert!(!transcript.working && !transcript.stopping);
+        transcript.begin_turn();
+        assert!(transcript.request_stop());
+    }
+
+    #[test]
+    fn retries_show_the_attempt_and_reason() {
+        let mut transcript = Transcript::default();
+        transcript.begin_turn();
+        transcript.apply(&envelope(AgentEvent::Retry {
+            attempt: 3,
+            message: RETRY_MESSAGE.into(),
+            delay_ms: 0,
+        }));
+        assert!(transcript.working);
+        assert!(matches!(
+            transcript.items.last(),
+            Some(Item::Notice { text, level: Level::Warning }) if text == RETRY_NOTICE
+        ));
+    }
 
     fn envelope(event: AgentEvent) -> Envelope {
         Envelope {

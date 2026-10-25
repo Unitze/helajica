@@ -481,12 +481,16 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                 && new_model.spec() != model.spec()
             {
-                match connect(&mut new_model, params.timeouts, &error_tx).await {
-                    Some(switched) => {
+                match cancel
+                    .race(connect(&mut new_model, params.timeouts, &error_tx))
+                    .await
+                {
+                    Ok(Some(switched)) => {
                         provider = switched;
                         model = new_model;
                     }
-                    None => retry = true,
+                    Ok(None) => retry = true,
+                    Err(_) => {}
                 }
             }
 
@@ -549,13 +553,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                 opts = seed.chat_opts();
                 drop(agent);
                 task_cancels.cancel_all();
-                cancel_task.cancel().await;
 
                 if let Err(ref e) = result {
                     error!(error = %e, "agent error");
                     let _ = error_tx.send(AgentEvent::error(e));
                 }
             }
+
+            cancel_task.cancel().await;
 
             run_id += 1;
             // The window sends while a run is busy, so whatever is waiting is

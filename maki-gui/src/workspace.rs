@@ -89,6 +89,7 @@ const THINKING_CHIP: &str = "thinking";
 /// Shorter thinking would read as "thinking 0s".
 const THINKING_CHIP_MIN: Duration = Duration::from_secs(1);
 const WORKING_ACTIVITY: &str = "Working…";
+const STOPPING_ACTIVITY: &str = "Stopping…";
 /// In `expanded`, this key marks the todo card as folded: it starts open.
 const TODOS_FOLDED_KEY: &str = "todos-folded";
 const THINKING_PREVIEW_LINES: usize = 3;
@@ -405,6 +406,14 @@ impl WorkspaceView {
     fn send(&self, command: Command) {
         if let Some(commands) = self.commands() {
             let _ = commands.send(command);
+        }
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        self.goal = None;
+        if self.transcript.request_stop() {
+            self.send(Command::Cancel);
+            cx.notify();
         }
     }
 
@@ -1518,8 +1527,7 @@ impl WorkspaceView {
                 _ => Mode::Bypass,
             }),
             Builtin::Stop => {
-                self.goal = None;
-                self.send(Command::Cancel);
+                self.stop(cx);
             }
             Builtin::Settings => self.open_settings(window, cx),
             Builtin::Theme => toggle_dark(self.gui_dir.as_deref(), window, cx),
@@ -2712,9 +2720,10 @@ impl WorkspaceView {
                                                 .rounded(px(999.))
                                                 .icon(Icon::new(Lucide::Square))
                                                 .tooltip("Stop")
+                                                .disabled(self.transcript.stopping)
                                                 .accessibility_label("Stop current task")
-                                                .on_click(cx.listener(|this, _, _, _| {
-                                                    this.send(Command::Cancel)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.stop(cx)
                                                 })))
                                         })
                                         .child(Button::new("send")
@@ -2737,6 +2746,9 @@ impl WorkspaceView {
 
     /// What the agent is doing right now, from the newest thing in the turn.
     fn activity(&self) -> String {
+        if self.transcript.stopping {
+            return STOPPING_ACTIVITY.into();
+        }
         if self.transcript.pending_messages > 0 {
             return format!(
                 "{} message(s) queued · received before the next model request",
