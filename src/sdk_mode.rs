@@ -58,6 +58,8 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("question", "Question"),
     ("skill", "Skill"),
 ];
+const TURN_LIMIT_REACHED: &str = "Turn limit reached before the task completed.";
+const TOKEN_LIMIT_REACHED: &str = "Token limit reached before the task completed.";
 
 /// Emits a hyphenated-hex UUIDv7 string for Claude Code SDK wire ids
 /// (message.id, assistant message.id).
@@ -1166,16 +1168,25 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer and a dropped one
-                // never ran, so neither is a success.
                 let is_error = match reason {
-                    DoneReason::Cancelled | DoneReason::Dropped => true,
-                    DoneReason::EndTurn
+                    DoneReason::Cancelled
+                    | DoneReason::Dropped
                     | DoneReason::MaxTokens
-                    | DoneReason::MaxTurns
-                    | DoneReason::Compact => false,
+                    | DoneReason::MaxTurns => true,
+                    DoneReason::EndTurn | DoneReason::Compact => false,
                 };
-                let result = mem::take(&mut self.result_text);
+                let mut result = mem::take(&mut self.result_text);
+                let limit = match reason {
+                    DoneReason::MaxTurns => Some(TURN_LIMIT_REACHED),
+                    DoneReason::MaxTokens => Some(TOKEN_LIMIT_REACHED),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    if !result.is_empty() {
+                        result.push_str("\n\n");
+                    }
+                    result.push_str(limit);
+                }
                 self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message, .. } => {
@@ -1833,5 +1844,26 @@ mod tests {
         let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
         assert_eq!(wire["is_error"], true);
         assert_eq!(wire["result"], DROP_REASON);
+    }
+
+    #[test_case(DoneReason::MaxTurns, TURN_LIMIT_REACHED ; "turn_limit")]
+    #[test_case(DoneReason::MaxTokens, TOKEN_LIMIT_REACHED ; "token_limit")]
+    fn an_exhausted_run_is_an_error_with_partial_answer(reason: DoneReason, limit: &str) {
+        const PARTIAL: &str = "Changes made, verification pending.";
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+        pump.result_text = PARTIAL.into();
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 32,
+            reason,
+        }))
+        .unwrap();
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["is_error"], true);
+        assert_eq!(wire["result"], format!("{PARTIAL}\n\n{limit}"));
     }
 }

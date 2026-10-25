@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
@@ -30,6 +31,7 @@ static LIVE_SESSIONS: LazyLock<Mutex<HashMap<MakiId, Weak<LiveSession>>>> =
 struct LiveSession {
     mailbox: Mutex<Mailbox>,
     seed: Mutex<Weak<AgentSeed>>,
+    waker: Mutex<Option<flume::WeakSender<()>>>,
 }
 
 #[derive(Default)]
@@ -59,6 +61,7 @@ pub struct AgentSeed {
     pub mcp: Option<McpSession>,
     pub timeouts: Timeouts,
     pub file_access: Arc<FileAccess>,
+    pub cwd: Option<Arc<PathBuf>>,
     pub model_policy: Arc<ModelPolicy>,
     /// The chat's thinking and whether it plans, as the user has them right
     /// now. The UI keeps them fresh even before the first message, so
@@ -99,7 +102,19 @@ impl SessionMailbox {
         }
         mailbox.pending.push_back(Message::observation(text));
         mailbox.wake |= wake;
+        drop(mailbox);
+        if wake
+            && let Some(sender) = lock(&live.waker)
+                .as_ref()
+                .and_then(flume::WeakSender::upgrade)
+        {
+            let _ = sender.try_send(());
+        }
         Ok(())
+    }
+
+    pub fn set_waker(&self, sender: flume::WeakSender<()>) {
+        *lock(&self.live.waker) = Some(sender);
     }
 
     pub fn drain(&self) -> Vec<Message> {
@@ -177,13 +192,14 @@ impl AgentSeed {
             mcp,
             timeouts,
             file_access: FileAccess::fresh(),
+            cwd: None,
             model_policy,
             chat_settings: Mutex::default(),
         }
     }
 
     /// `None` when the session is closed or has no interactive loop, like a
-    /// headless or ACP run.
+    /// one-shot headless or ACP run.
     pub fn live(session_id: MakiId) -> Option<Arc<Self>> {
         let live = lock(&LIVE_SESSIONS).get(&session_id)?.upgrade()?;
         lock(&live.seed).upgrade()
@@ -228,6 +244,7 @@ impl AgentSeed {
             timeouts: self.timeouts,
             opts: self.chat_opts(),
             model_policy: Arc::clone(&self.model_policy),
+            cwd: self.cwd.clone(),
             ..interpreter_ctx(
                 &AgentMode::Build,
                 &EventSender::new(sink, UNATTENDED_RUN_ID),

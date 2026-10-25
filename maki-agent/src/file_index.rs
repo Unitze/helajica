@@ -1465,7 +1465,10 @@ mod tests {
     fn a_query_ranks_the_closest_path_first() {
         let dir = tree(&["vendor/other.rs", "src/main.rs"]);
         let index = file_index(dir.path());
-        assert_eq!(ranked(&index, "mainrs", 5).first().unwrap(), "src/main.rs");
+        assert_eq!(
+            ranked(&index, "mainrs", 5).first().unwrap(),
+            &format!("src{MAIN_SEPARATOR}main.rs")
+        );
     }
 
     #[test]

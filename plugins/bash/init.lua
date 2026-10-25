@@ -357,7 +357,7 @@ end
 -- Returns nil without a live chat to report to, and the caller runs the
 -- command in the foreground instead.
 local function start_background(command, workdir, ctx)
-  local chat = ctx:session_id()
+  local chat = ctx:background_session_id()
   if not chat then
     return nil
   end
@@ -508,7 +508,7 @@ maki.api.register_tool({
     local output_parts = {}
     local has_output = false
     local finished = false
-    local chat = opts.allow_background and input.background ~= false and ctx:session_id()
+    local chat = opts.allow_background and input.background ~= false and ctx:background_session_id()
     local entry = chat and { chat = chat, command = command, lines = {} }
     local detached = false
 

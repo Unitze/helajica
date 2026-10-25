@@ -533,13 +533,15 @@ mod tests {
     #[test_case(PromptId::Research, include_str!("prompts/tests/research.md") ; "research")]
     #[test_case(PromptId::General, include_str!("prompts/tests/general.md") ; "general")]
     #[test_case(PromptId::Plan, include_str!("prompts/tests/plan.md") ; "plan")]
-    fn defaults_preserve_pre_catalogue_bytes(id: PromptId, expected: &str) {
+    fn defaults_match_prompt_snapshots(id: PromptId, expected: &str) {
         let vars = Vars::new()
             .set("{environment}", "Environment:\n- Working directory: /example\n- Platform: example\n- Date: 2000-01-01")
             .set("{plan_path}", "/example/plan.md");
         assert_eq!(
-            ResolvedPrompts::default().render(id, &vars, "\n\nEXAMPLE_INSTRUCTIONS"),
-            expected
+            ResolvedPrompts::default()
+                .render(id, &vars, "\n\nEXAMPLE_INSTRUCTIONS")
+                .replace("\r\n", "\n"),
+            expected.replace("\r\n", "\n")
         );
     }
 
@@ -559,7 +561,7 @@ mod tests {
         const EXTRA: &str = "search";
         let mut prompts = slots(PromptId::System, &[(Slot::EfficientTools, EXTRA)]);
         prompts.set_section(PromptId::System, Slot::EfficientTools, String::new());
-        let out = assemble(PromptId::System, &prompts, "");
+        let out = assemble(PromptId::System, &prompts, "").replace("\r\n", "\n");
         assert!(!out.contains(NATIVE_EFFICIENT_LINE));
         assert!(out.contains(&format!("\n{EXTRA}\n")));
     }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::AgentSeed;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{
     Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
@@ -271,6 +272,14 @@ impl UserData for LuaCtx {
         // no session, as in the `maki index` one-shot.
         methods.add_method("session_id", |_, this, ()| {
             Ok(this.session_id.as_ref().map(|id| id.id().to_string()))
+        });
+
+        methods.add_method("background_session_id", |_, this, ()| {
+            Ok(this
+                .session_id
+                .as_ref()
+                .filter(|id| AgentSeed::live(id.id()).is_some())
+                .map(|id| id.id().to_string()))
         });
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));

@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 
 use crate::InterruptSource;
 use crate::interrupt_queue::InterruptQueue;
-use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
+use maki_providers::{RequestOptions, Timeouts};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -26,9 +27,10 @@ use crate::template;
 use crate::tools::{FileAccess, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::types::EventSender;
 use crate::{
-    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, EventStreamGuard,
-    ImageSource, InputSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionEvents,
-    SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
+    EventStreamGuard, ImageSource, InputSource, McpHandle, McpSession, ModelSlot,
+    PermissionsConfig, RunLedger, SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines,
+    event_stream,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -361,6 +363,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
     let (wake_tx, wake_rx) = flume::bounded(1);
+    let mailbox_waker = wake_tx.downgrade();
     let interrupt = InterruptQueue::with_wake((wake_tx, wake_rx.clone()));
     let interrupt_source: Arc<dyn InterruptSource> = Arc::new(interrupt.clone());
     let task_interrupt = interrupt.clone();
@@ -370,6 +373,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let session_ref = params.resumed.id.clone();
     let mailbox = SessionMailbox::register(session_ref.id());
+    mailbox.set_waker(mailbox_waker);
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
@@ -398,6 +402,23 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         let Some(mut provider) = connect(&mut model, params.timeouts, &base_tx).await else {
             return;
         };
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: model.clone(),
+            provider: Arc::clone(&provider),
+        }));
+        let mut seed = AgentSeed::new(
+            session_ref_clone.clone(),
+            Arc::clone(&model_slot),
+            params.config.clone(),
+            ToolOutputLines::default(),
+            Arc::clone(&task_permissions),
+            mcp.clone(),
+            params.timeouts,
+            Arc::clone(&params.model_policy),
+        );
+        seed.file_access = file_access.sharing_locks();
+        seed.cwd = session_root.clone();
+        let seed = mailbox.publish_seed(seed);
         let mut track =
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
         // Before the first turn waits on the user: a session that was started
@@ -413,15 +434,24 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         // sends while a turn runs is taken by that run (see the interrupt
         // source below), and a message that finds no run waiting starts the
         // next one.
-        let mut next = loop {
-            if let Some(input) = task_interrupt.take() {
-                break input;
-            }
-            // The channel closes with the last way in, so a session nobody
-            // can prompt any more ends instead of waiting forever.
-            if wake_rx.recv_async().await.is_err() {
-                return;
-            }
+        let mut mode = AgentMode::Build;
+        let mut opts = RequestOptions {
+            thinking: params.defaults.thinking.into(),
+            fast: params.defaults.fast,
+        };
+        let mut workflow = params.defaults.workflow;
+        let Some(mut next) = wait_for_input(
+            &task_interrupt,
+            &wake_rx,
+            &cancel_rx,
+            &mailbox,
+            &mode,
+            opts,
+            workflow,
+        )
+        .await
+        else {
+            return;
         };
         loop {
             let (trigger, cancel) = CancelToken::new();
@@ -461,6 +491,17 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             }
 
             if !retry {
+                model_slot.store(Arc::new(ModelSlot {
+                    model: model.clone(),
+                    provider: Arc::clone(&provider),
+                }));
+                seed.set_chat_settings(
+                    RequestOptions {
+                        thinking: next.thinking,
+                        fast: next.fast,
+                    },
+                    &next.mode,
+                );
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
                 // Outlives `agent`, so this turn is on disk before the next prompt
@@ -502,7 +543,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                         images: next.images.clone(),
                     });
                 }
+                workflow = next.workflow;
                 let result = agent.run(next).await;
+                mode = agent.mode().clone();
+                opts = seed.chat_opts();
                 drop(agent);
                 task_cancels.cancel_all();
                 cancel_task.cancel().await;
@@ -516,13 +560,19 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             run_id += 1;
             // The window sends while a run is busy, so whatever is waiting is
             // the start of the next one; nothing means waiting for the window.
-            next = loop {
-                if let Some(input) = task_interrupt.take() {
-                    break input;
-                }
-                if wake_rx.recv_async().await.is_err() {
-                    return;
-                }
+            next = match wait_for_input(
+                &task_interrupt,
+                &wake_rx,
+                &cancel_rx,
+                &mailbox,
+                &mode,
+                opts,
+                workflow,
+            )
+            .await
+            {
+                Some(input) => input,
+                None => return,
             };
         }
     }));
@@ -541,6 +591,52 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         },
         events,
     )
+}
+
+async fn wait_for_input(
+    queue: &InterruptQueue,
+    wake_rx: &flume::Receiver<()>,
+    cancel_rx: &flume::Receiver<()>,
+    mailbox: &SessionMailbox,
+    mode: &AgentMode,
+    opts: RequestOptions,
+    workflow: bool,
+) -> Option<AgentInput> {
+    futures_lite::future::or(
+        async {
+            loop {
+                if cancel_rx.is_disconnected() {
+                    return None;
+                }
+                if let Some(input) = queue.take() {
+                    return Some(input);
+                }
+                let preamble = mailbox.claim_wake();
+                if !preamble.is_empty() {
+                    return Some(AgentInput {
+                        message: String::new(),
+                        mode: mode.clone(),
+                        images: Vec::new(),
+                        preamble,
+                        earlier: Vec::new(),
+                        thinking: opts.thinking,
+                        fast: opts.fast,
+                        workflow,
+                        prompt: None,
+                        source: InputSource::Plugin,
+                    });
+                }
+                if wake_rx.recv_async().await.is_err() {
+                    return None;
+                }
+            }
+        },
+        async {
+            while cancel_rx.recv_async().await.is_ok() {}
+            None
+        },
+    )
+    .await
 }
 
 /// Waits for a session task that has nothing left to do but tear MCP down,
@@ -585,6 +681,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures_lite::future::poll_once;
+    use maki_storage::id::MakiId;
     use test_case::test_case;
 
     use super::*;
@@ -598,6 +695,56 @@ mod tests {
     const BODY_EVENT: &str = "the body's event must be delivered before the close";
     const STILL_WORKING: &str = "await_shutdown must not return while the task still works";
     const TASK_DROPPED: &str = "await_shutdown dropped a task that had work left";
+
+    #[test]
+    fn background_notice_wakes_idle_input_and_preserves_settings() {
+        smol::block_on(async {
+            let (tx, rx) = flume::bounded(1);
+            let queue = InterruptQueue::with_wake((tx.clone(), rx.clone()));
+            let (_cancel, cancel_rx) = flume::bounded(1);
+            let id = MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            mailbox.set_waker(tx.downgrade());
+            let mode = AgentMode::Build;
+            let opts = RequestOptions {
+                fast: true,
+                ..Default::default()
+            };
+            let mut waiting = pin!(wait_for_input(
+                &queue, &rx, &cancel_rx, &mailbox, &mode, opts, true
+            ));
+            assert!(poll_once(&mut waiting).await.is_none());
+            SessionMailbox::notify(id, BODY_EVENT.into(), true).unwrap();
+            let input = poll_once(&mut waiting).await.unwrap().unwrap();
+            assert_eq!(input.preamble[0].user_text(), Some(BODY_EVENT));
+            assert!(input.fast && input.workflow);
+            assert!(matches!(input.source, InputSource::Plugin));
+            assert!(mailbox.claim_wake().is_empty());
+        });
+    }
+
+    #[test]
+    fn dropping_interactive_handle_ends_idle_input() {
+        smol::block_on(async {
+            let (tx, rx) = flume::bounded(1);
+            let queue = InterruptQueue::with_wake((tx, rx.clone()));
+            let (cancel, cancel_rx) = flume::bounded(1);
+            let mailbox = SessionMailbox::register(MakiId::generate());
+            let mode = AgentMode::Build;
+            let mut waiting = pin!(wait_for_input(
+                &queue,
+                &rx,
+                &cancel_rx,
+                &mailbox,
+                &mode,
+                RequestOptions::default(),
+                false
+            ));
+            assert!(poll_once(&mut waiting).await.is_none());
+            drop(cancel);
+            assert!(poll_once(&mut waiting).await.unwrap().is_none());
+        });
+    }
 
     /// A host-written prompt never had maki's facts in it. If the frame
     /// claimed it did, a later edit would be announced to a model that never

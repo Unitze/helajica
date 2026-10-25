@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use maki_agent::types::TodoItem;
-use maki_agent::{AgentEvent, Envelope, SubagentInfo, ToolOutput};
+use maki_agent::{AgentEvent, DoneReason, Envelope, SubagentInfo, ToolOutput};
 use maki_providers::{ContentBlock, ImageSource, Message, MessageKind, Role, TokenUsage};
 use serde::Deserialize as _;
 use serde_json::Value;
@@ -317,6 +317,14 @@ impl Transcript {
                     status: ToolStatus::Running,
                     turns: 0,
                 });
+            if matches!(
+                envelope.event,
+                AgentEvent::ThinkingDelta { .. }
+                    | AgentEvent::TextDelta { .. }
+                    | AgentEvent::ToolStart(_)
+            ) {
+                progress.status = ToolStatus::Running;
+            }
             match &envelope.event {
                 AgentEvent::Notice { text } => progress.activity.clone_from(text),
                 AgentEvent::ThinkingDelta { .. } if progress.activity != "Thinking…" => {
@@ -330,12 +338,16 @@ impl Transcript {
                 }
                 AgentEvent::TurnComplete(_) => progress.turns += 1,
                 AgentEvent::Done { reason, .. } => {
-                    progress.status = if *reason == maki_agent::DoneReason::Cancelled {
-                        ToolStatus::Failed
-                    } else {
-                        ToolStatus::Done
+                    let (state, activity) = match reason {
+                        DoneReason::EndTurn => (ToolStatus::Done, "Finished"),
+                        DoneReason::Compact => (ToolStatus::Done, "Compacted"),
+                        DoneReason::Cancelled => (ToolStatus::Failed, "Stopped"),
+                        DoneReason::MaxTurns => (ToolStatus::Failed, "Turn limit reached"),
+                        DoneReason::MaxTokens => (ToolStatus::Failed, "Token limit reached"),
+                        DoneReason::Dropped => (ToolStatus::Failed, "Skipped"),
                     };
-                    progress.activity = reason.to_string();
+                    progress.status = state;
+                    progress.activity = activity.into();
                 }
                 AgentEvent::Error { message, .. } => {
                     progress.status = ToolStatus::Failed;
@@ -386,9 +398,11 @@ impl Transcript {
                 call.output.clone_from(content);
             }),
             AgentEvent::ToolDone(done) => {
-                if let Some(progress) = self.subagents.get_mut(&done.id) {
-                    progress.status = status(done.is_error);
-                    progress.activity = if done.is_error { "Failed" } else { "Finished" }.into();
+                if done.is_error
+                    && let Some(progress) = self.subagents.get_mut(&done.id)
+                {
+                    progress.status = ToolStatus::Failed;
+                    progress.activity = "Failed".into();
                 }
                 self.upsert_tool(&done.id, |call| {
                     call.name = done.tool.to_string();
@@ -420,8 +434,16 @@ impl Transcript {
                 self.totals.context_size = *context_size;
                 self.totals.context_window = *context_window;
                 self.settle_running();
-                match reason.to_string().as_str() {
-                    "cancelled" => self.push_notice(CANCELLED, Level::Info),
+                match reason {
+                    DoneReason::Cancelled => self.push_notice(CANCELLED, Level::Info),
+                    DoneReason::MaxTurns => self.push_notice(
+                        "Turn limit reached. The task is incomplete.",
+                        Level::Warning,
+                    ),
+                    DoneReason::MaxTokens => self.push_notice(
+                        "Token limit reached. The task is incomplete.",
+                        Level::Warning,
+                    ),
                     _ => Change::None,
                 }
             }
@@ -953,6 +975,16 @@ mod tests {
         }));
         assert_eq!(t.apply(&env), Change::Status);
         assert_eq!(t.subagents[TOOL_ID].activity, "read src/lib.rs");
+        t.apply(&envelope(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            id: TOOL_ID.into(),
+            tool: Arc::from("task"),
+            output: Arc::new(ToolOutput::Plain("Background task started".into())),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            call: None,
+        }))));
+        assert_eq!(t.subagents[TOOL_ID].status, ToolStatus::Running);
         env.event = AgentEvent::Error {
             message: "failed".into(),
             auth: false,
@@ -961,7 +993,46 @@ mod tests {
         env.event = AgentEvent::StreamClosed;
         t.apply(&env);
         assert_eq!(t.subagents[TOOL_ID].status, ToolStatus::Failed);
-        assert!(t.items.is_empty());
+        env.event = AgentEvent::TextDelta {
+            text: "resumed".into(),
+        };
+        t.apply(&env);
+        assert_eq!(t.subagents[TOOL_ID].status, ToolStatus::Running);
+        assert_eq!(t.subagents[TOOL_ID].activity, "Writing…");
+        assert_eq!(t.items.len(), 1);
+    }
+
+    #[test_case(DoneReason::EndTurn, ToolStatus::Done, "Finished" ; "finished")]
+    #[test_case(DoneReason::MaxTurns, ToolStatus::Failed, "Turn limit reached" ; "turn_limit")]
+    #[test_case(DoneReason::MaxTokens, ToolStatus::Failed, "Token limit reached" ; "token_limit")]
+    #[test_case(DoneReason::Cancelled, ToolStatus::Failed, "Stopped" ; "stopped")]
+    fn subagent_completion_explains_why_it_stopped(
+        reason: DoneReason,
+        status: ToolStatus,
+        activity: &str,
+    ) {
+        let mut t = Transcript::default();
+        let mut env = envelope(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 1,
+            reason,
+        });
+        env.subagent = Some(SubagentInfo {
+            parent_tool_use_id: TOOL_ID.into(),
+            name: TOOL_NAME.into(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx: None,
+            inbox: None,
+        });
+        t.apply(&env);
+        assert_eq!(t.subagents[TOOL_ID].status, status);
+        assert_eq!(t.subagents[TOOL_ID].activity, activity);
     }
 
     #[test]

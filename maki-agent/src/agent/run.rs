@@ -31,7 +31,7 @@ use crate::tools::{
     Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
 };
 use crate::{
-    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
+    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentSeed, DoneReason, EventSender,
     ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox, SteerKind,
     TurnCompleteEvent,
 };
@@ -286,6 +286,21 @@ impl<'h> Agent<'h> {
         self
     }
 
+    pub fn mode(&self) -> &AgentMode {
+        &self.mode
+    }
+
+    fn sync_chat_settings(&self) {
+        if self.task_id.is_none()
+            && let Some(seed) = self
+                .session_id
+                .as_ref()
+                .and_then(|id| AgentSeed::live(id.id()))
+        {
+            seed.set_chat_settings(self.opts, &self.mode);
+        }
+    }
+
     /// Cancellation is an ending, not a failure: it comes back as
     /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
     pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
@@ -307,6 +322,7 @@ impl<'h> Agent<'h> {
         self.mode = mode;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
+        self.sync_chat_settings();
         // Each message of a burst is judged on its own, and one kept message is
         // enough for the run to go on.
         let burst = earlier
@@ -423,6 +439,19 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         loop {
+            if self
+                .history
+                .as_slice()
+                .last()
+                .is_none_or(|message| message.role != Role::Assistant)
+                && let Some(mailbox) = &self.mailbox
+            {
+                let before = self.history.len();
+                for message in mailbox.drain() {
+                    self.history.push(message);
+                }
+                self.gauge.append(&self.history.as_slice()[before..]);
+            }
             // Ahead of `try_auto_compact`: a switch landing after the check
             // would compact against the old window and then overflow the new
             // one.
@@ -1119,6 +1148,11 @@ impl<'h> Agent<'h> {
                     let message = kept.map(|text| interrupt_message(text, input.images));
                     if message.is_some() {
                         self.mode = input.mode;
+                        self.opts = RequestOptions {
+                            thinking: input.thinking,
+                            fast: input.fast,
+                        };
+                        self.sync_chat_settings();
                         // The user spoke, so `agent.stop` gets its full
                         // allowance back.
                         self.stop_continuations = 0;

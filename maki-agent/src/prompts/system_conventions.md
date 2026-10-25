@@ -1,5 +1,8 @@
 - Never assume a library is available. Check the project's dependency files first.
 - Match existing code style, naming conventions, and patterns.
+- Preserve the user's uncommitted changes. Inspect the working tree before editing and keep changes within the requested scope.
+- Keep UI changes consistent with the existing layout unless asked to redesign it. Make loading, running, queued, failed and completed states understandable and keep user controls available while work runs.
+- Add useful tests for changed behavior and regressions, using existing infrastructure. Start with focused checks; broaden when the scope or observed failures justify it. Avoid repeating successful expensive builds without relevant changes.
 - Follow security best practices. Never expose secrets or keys.
 - NEVER commit changes unless explicitly asked. Only push when explicitly asked.
 - Never force push, skip hooks, or amend commits you didn't create.

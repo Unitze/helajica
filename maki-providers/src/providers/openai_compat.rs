@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::io;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use crate::{
 };
 
 const STREAM_DONE: &str = "[DONE]";
+const TRUNCATED_STREAM: &str = "completion stream ended before a finish reason or [DONE]";
 /// `tool_calls[].index` comes straight off the wire; a bogus huge value must
 /// not size the accumulator vec.
 const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
@@ -616,6 +618,7 @@ pub async fn parse_sse(
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
+    let mut completed = false;
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
 
@@ -626,6 +629,7 @@ pub async fn parse_sse(
         };
 
         if data == STREAM_DONE {
+            completed = true;
             break;
         }
 
@@ -780,6 +784,10 @@ pub async fn parse_sse(
         }
     }
 
+    if !completed && stop_reason.is_none() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, TRUNCATED_STREAM).into());
+    }
+
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
     if !reasoning_text.is_empty() {
@@ -829,6 +837,33 @@ pub async fn parse_sse(
 mod tests {
     use super::*;
     use futures_lite::io::Cursor;
+
+    #[test_case("" ; "empty_connection")]
+    #[test_case("data: {\"choices\":[{\"delta\":{\"content\":\"Now the tests.\"}}]}\n\n" ; "partial_text")]
+    #[test_case("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"partial\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}]}}]}\n\n" ; "partial_tool")]
+    fn truncated_stream_is_retryable_instead_of_success(sse: &str) {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let error = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, AgentError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+            );
+            assert!(error.retry_kind().is_some());
+        });
+    }
+
+    #[test_case("data: [DONE]\n\n" ; "done_marker")]
+    #[test_case("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ; "finish_reason")]
+    fn stream_accepts_either_terminal_signal(sse: &str) {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+        });
+    }
     use std::sync::Arc;
     use test_case::test_case;
 

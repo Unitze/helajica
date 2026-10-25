@@ -3606,7 +3606,7 @@ fn cancel_hook_reply(
 }
 
 /// Handler returned nil, meaning it went async. Polls job events
-/// until `ctx:finish()`, all jobs die, or the deadline expires.
+/// until `ctx:finish()`, its retained context is released, or the deadline expires.
 async fn dispatch_async(
     lua: &Lua,
     handle: TaskHandle,
@@ -3615,13 +3615,9 @@ async fn dispatch_async(
     finish_rx: flume::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
     let owner = JobOwner::Task(lock_cell(&handle).id);
-    if with_jobs(lua, |store| store.is_empty(&owner)) {
+    let mut had_jobs = with_jobs(lua, |store| !store.is_empty(&owner));
+    if !had_jobs {
         lua.gc_collect().ok();
-        smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-        return match finish_rx.try_recv() {
-            Ok(reply) => reply,
-            _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-        };
     }
 
     loop {
@@ -3655,12 +3651,9 @@ async fn dispatch_async(
             continue;
         }
 
-        if with_jobs(lua, |store| store.is_empty(&owner)) {
-            smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
-            return match finish_rx.try_recv() {
-                Ok(reply) => reply,
-                _ => ToolCallReply::err(NIL_WITHOUT_FINISH_MSG),
-            };
+        if had_jobs && with_jobs(lua, |store| store.is_empty(&owner)) {
+            had_jobs = false;
+            lua.gc_collect().ok();
         }
         smol::Timer::after(DISPATCH_POLL_INTERVAL).await;
     }
@@ -6457,6 +6450,50 @@ mod tests {
     const DISPATCH_TEST_PLUGIN: &str = "shell";
     const DISPATCH_TEST_TOOL: &str = "run";
     const DISPATCH_TEST_DEADLINE_SECS: u64 = 7;
+
+    #[test]
+    fn async_finish_can_be_retained_by_session_job_instead_of_task_job() {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+            let (finish_tx, finish_rx) = flume::bounded(1);
+            let mut pending = Box::pin(dispatch_async(
+                &lua,
+                Arc::clone(scope.handle()),
+                DISPATCH_TEST_PLUGIN,
+                DISPATCH_TEST_TOOL,
+                finish_rx,
+            ));
+            assert!(
+                futures_lite::future::poll_once(&mut pending)
+                    .await
+                    .is_none()
+            );
+            finish_tx
+                .send(ToolCallReply::plain(Ok(HOOK_CHILD_MARK.into())))
+                .unwrap();
+            assert_eq!(pending.await.result, Ok(HOOK_CHILD_MARK.into()));
+        });
+    }
+
+    #[test]
+    fn nil_handler_without_retained_finish_is_still_an_error() {
+        smol::block_on(async {
+            let lua = Lua::new();
+            let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+            let (finish_tx, finish_rx) = flume::bounded(1);
+            drop(finish_tx);
+            let reply = dispatch_async(
+                &lua,
+                Arc::clone(scope.handle()),
+                DISPATCH_TEST_PLUGIN,
+                DISPATCH_TEST_TOOL,
+                finish_rx,
+            )
+            .await;
+            assert_eq!(reply.result, Err(NIL_WITHOUT_FINISH_MSG.into()));
+        });
+    }
 
     /// Drives the job-polling loop of [`dispatch_async`] to its reply. The
     /// cell needs a live job or the loop is never entered. Helper thread

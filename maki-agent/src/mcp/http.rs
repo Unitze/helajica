@@ -547,8 +547,15 @@ mod tests {
 
             match reader.read(&mut [0]) {
                 Ok(0) => true,
-                Err(error) if error.kind() == ErrorKind::ConnectionReset => true,
-                _ => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    true
+                }
+                other => panic!("dropped operation left its HTTP connection open: {other:?}"),
             }
         });
 
