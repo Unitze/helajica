@@ -139,7 +139,7 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
 ///
 /// A plugin belongs here while what it does is worth shipping but what it
 /// costs at scale is not yet known.
-pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
+pub const OPTIONAL_BUILTINS: &[&str] = &["completion", "opencode"];
 
 /// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];

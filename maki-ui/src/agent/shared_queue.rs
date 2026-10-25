@@ -11,7 +11,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{
-    AgentInput, AgentMode, EarlierInput, ExtractedCommand, ImageSource, InterruptSource,
+    AgentEvent, AgentInput, AgentMode, EarlierInput, Envelope, EventSender, ExtractedCommand,
+    ImageSource, InterruptSource,
 };
 
 use crate::components::input::Submission;
@@ -170,23 +171,37 @@ pub(crate) struct QueueSender {
 pub(crate) struct QueueReceiver {
     items: Items,
     notify_rx: flume::Receiver<()>,
+    agent_tx: flume::Sender<Envelope>,
+    interrupt: maki_agent::InterruptQueue,
 }
 
-pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
+pub(crate) fn queue(agent_tx: flume::Sender<Envelope>) -> (QueueSender, QueueReceiver) {
     let (notify_tx, notify_rx) = flume::bounded(1);
     let items: Items = Arc::new(Mutex::new(VecDeque::new()));
+    let interrupt = maki_agent::InterruptQueue::new();
     (
         QueueSender {
             items: Arc::clone(&items),
-            notify_tx,
+            notify_tx: notify_tx.clone(),
         },
-        QueueReceiver { items, notify_rx },
+        QueueReceiver {
+            items,
+            notify_rx,
+            agent_tx,
+            interrupt,
+        },
     )
 }
 
 impl QueueSender {
     pub(crate) fn push(&self, entry: QueueItem) {
         lock(&self.items).push_back(entry);
+        self.notify();
+    }
+
+    /// Wakes the chat loop. Kept apart from the push so a caller that also
+    /// hands the batch to the agent can wake it right after.
+    pub(crate) fn notify(&self) {
         let _ = self.notify_tx.try_send(());
     }
 
@@ -265,6 +280,28 @@ impl QueueReceiver {
 
     pub(crate) async fn recv_notify(&self) -> Result<(), flume::RecvError> {
         self.notify_rx.recv_async().await
+    }
+
+    /// Hands `run` to the agent through the shared inbox, in order, so a
+    /// message typed while a turn runs reaches that turn.
+    pub(crate) fn hand_to_agent(&self, run: QueueRun, run_id: u64) {
+        let QueueRun::Messages(mut messages) = run else {
+            return;
+        };
+        if messages.is_empty() {
+            return;
+        }
+        let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+        for queued in messages.drain(..) {
+            if !queued.displayed {
+                let _ = event_tx.send(AgentEvent::QueueItemConsumed {
+                    text: queued.text,
+                    images: queued.input.images.clone(),
+                });
+            }
+            self.interrupt.push(queued.input);
+        }
+        self.interrupt.wake();
     }
 }
 
@@ -394,7 +431,7 @@ mod tests {
     #[test_case(QueueItem::Message(QueuedInput { displayed: true, ..queued(FIRST, 0) }), false ; "displayed_message_hidden")]
     #[test_case(compact(None), true  ; "compact_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
-        let (tx, _rx) = queue();
+        let (tx, _rx) = queue(flume::unbounded().0);
         tx.push(item);
         let expected = usize::from(visible);
         assert_eq!(tx.panel_len(), expected);
@@ -403,7 +440,7 @@ mod tests {
 
     #[test]
     fn nonempty_queue_does_not_publish_drain() {
-        let (tx, rx) = queue();
+        let (tx, rx) = queue(flume::unbounded().0);
         tx.push(message(FIRST));
         let called = Cell::new(false);
 
@@ -413,7 +450,7 @@ mod tests {
 
     #[test]
     fn drain_publication_is_serialized_with_push() {
-        let (tx, rx) = queue();
+        let (tx, rx) = queue(flume::unbounded().0);
         let barrier = Arc::new(Barrier::new(2));
         let order = Arc::new(Mutex::new(Vec::new()));
         let worker_barrier = Arc::clone(&barrier);
@@ -441,7 +478,7 @@ mod tests {
     #[test_case(vec![plan_message(FIRST), message(SECOND)], vec![vec![FIRST], vec![SECOND]] ; "mode_change_splits_the_drain")]
     #[test_case(vec![message(FIRST), workflow_message(SECOND), message(THIRD)], vec![vec![FIRST], vec![SECOND], vec![THIRD]] ; "workflow_change_splits_the_drain")]
     fn pop_run_groups_the_queue_into_turns(items: Vec<QueueItem>, expected: Vec<Vec<&str>>) {
-        let (tx, rx) = queue();
+        let (tx, rx) = queue(flume::unbounded().0);
         for item in items {
             tx.push(item);
         }
@@ -461,7 +498,7 @@ mod tests {
 
     #[test]
     fn poll_hands_the_whole_message_run_to_one_turn() {
-        let (tx, rx) = queue();
+        let (tx, rx) = queue(flume::unbounded().0);
         for text in [FIRST, SECOND, THIRD] {
             tx.push(message(text));
         }
@@ -477,7 +514,7 @@ mod tests {
 
     #[test]
     fn poll_carries_compact_guidance() {
-        let (tx, rx) = queue();
+        let (tx, rx) = queue(flume::unbounded().0);
         tx.push(compact(Some(GUIDANCE)));
 
         assert!(

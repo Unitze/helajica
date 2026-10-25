@@ -101,11 +101,12 @@ struct Running {
     thread: JoinHandle<()>,
 }
 
-type RunningSessions = Arc<Mutex<HashMap<String, Running>>>;
+type RunningSessions = Arc<Mutex<HashMap<PathBuf, Vec<(String, Running)>>>>;
 
-/// The project whose stack is built, and the thread that owns it.
+type Hosts = Mutex<HashMap<PathBuf, Host>>;
+
+/// A project whose stack is built, and the thread that owns it.
 struct Host {
-    project: PathBuf,
     /// The plugin settings it was built with: a change rebuilds it.
     overlay: PluginOverlay,
     requests: Sender<OpenRequest>,
@@ -122,7 +123,9 @@ struct MakiEngine {
     storage: StateDir,
     /// Where the window keeps its settings, the plugin switches among them.
     gui_dir: Option<PathBuf>,
-    host: Mutex<Option<Host>>,
+    /// One stack per open project: a project's sessions share its plugins,
+    /// its tools and its prompt, and none of them reads another's.
+    hosts: Hosts,
     sessions: RunningSessions,
     /// Where `maki.gui.emit` lands: the focused session's update channel.
     lua_route: LuaRoute,
@@ -153,27 +156,35 @@ impl MakiEngine {
             },
             storage,
             gui_dir,
-            host: Mutex::new(None),
+            hosts: Hosts::default(),
             sessions: RunningSessions::default(),
             lua_route,
         }
     }
 
-    fn close_session(&self, id: &str) {
-        let running = lock(&self.sessions).remove(id);
+    fn close_session(&self, project: &Path, id: &str) {
+        let running = lock(&self.sessions).get_mut(project).and_then(|running| {
+            let at = running.iter().position(|(session, _)| session == id)?;
+            Some(running.remove(at).1)
+        });
         if let Some(running) = running {
             stop(running);
         }
     }
 
-    /// The agent reads the process cwd and the tool registry is global, so
-    /// every session of a project must be gone before another project builds.
-    fn close_host(&self, host: &mut Option<Host>) {
-        let running: Vec<Running> = lock(&self.sessions).drain().map(|(_, r)| r).collect();
+    /// Ends every session of `project`, then its thread: the stack's plugins
+    /// and its tool registry belong to that project and to nothing else.
+    fn close_project(&self, project: &Path) {
+        let running: Vec<Running> = lock(&self.sessions)
+            .remove(project)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, running)| running)
+            .collect();
         running.into_iter().for_each(stop);
         if let Some(Host {
             requests, thread, ..
-        }) = host.take()
+        }) = lock(&self.hosts).remove(project)
         {
             drop(requests);
             if thread.join().is_err() {
@@ -190,7 +201,7 @@ impl MakiEngine {
         let lua_route = Arc::clone(&self.lua_route);
         let sessions = Arc::clone(&self.sessions);
         let thread = thread::Builder::new()
-            .name("maki-project".into())
+            .name(format!("maki-project-{}", project.display()))
             .spawn({
                 let project = project.to_path_buf();
                 let overlay = overlay.clone();
@@ -216,7 +227,6 @@ impl MakiEngine {
             return Err(e);
         }
         Ok(Host {
-            project: project.to_path_buf(),
             overlay,
             requests,
             thread,
@@ -240,42 +250,61 @@ fn stop(Running { commands, thread }: Running) {
 impl Engine for MakiEngine {
     fn open(&self, project: &Path, resume: Option<String>) -> Result<Session> {
         if let Some(id) = &resume {
-            self.close_session(id);
+            self.close_session(project, id);
         }
         let overlay = maki_gui::plugin_overlay(self.gui_dir.as_deref());
-        let mut host = lock(&self.host);
-        if host
-            .as_ref()
-            .is_some_and(|h| h.project != project || h.overlay != overlay)
+        // Held over the open so two projects cannot both swap the process
+        // directory under each other while a stack builds.
+        let mut hosts = lock(&self.hosts);
+        if hosts
+            .get(project)
+            .is_some_and(|host| host.overlay != overlay)
         {
-            self.close_host(&mut host);
+            drop(hosts);
+            self.close_project(project);
+            hosts = lock(&self.hosts);
         }
-        if host.is_none() {
-            *host = Some(self.start_host(project, overlay)?);
+        if !hosts.contains_key(project) {
+            let host = self.start_host(project, overlay)?;
+            hosts.insert(project.to_path_buf(), host);
         }
         let (ready, ready_rx) = flume::bounded::<Result<Session>>(1);
-        let requests = &host.as_ref().expect("host started above").requests;
+        let requests = &hosts.get(project).expect("host started above").requests;
         requests
             .send(OpenRequest { resume, ready })
             .map_err(|_| eyre!("project thread is gone"))?;
+        drop(hosts);
         ready_rx
             .recv()
             .map_err(|_| eyre!("session thread exited before starting"))?
     }
 
-    fn reload(&self) {
-        self.close_host(&mut lock(&self.host));
+    fn reload(&self, project: Option<&Path>) {
+        match project {
+            Some(project) => self.close_project(project),
+            // The stack of a project is built in its own folder, so one at a
+            // time and only after its sessions went.
+            None => {
+                let projects: Vec<PathBuf> = lock(&self.hosts).keys().cloned().collect();
+                projects
+                    .iter()
+                    .for_each(|project| self.close_project(project));
+            }
+        }
     }
 
     fn sessions(&self, project: &Path) -> Vec<SessionSummary> {
         AppSession::list(&project.to_string_lossy(), &self.storage).unwrap_or_default()
     }
 
-    fn delete_session(&self, id: &str) -> Result<()> {
+    /// By `project`, not just by id: the directory it was started in is what
+    /// decides which saved log it is, and an id alone could name another
+    /// project's session.
+    fn delete_session(&self, project: &Path, id: &str) -> Result<()> {
         let parsed: MakiId = id
             .parse()
             .map_err(|e| eyre!("invalid session id {id:?}: {e}"))?;
-        self.close_session(id);
+        self.close_session(project, id);
         // Claiming refuses a session another maki is writing, rather than
         // unlinking the file it keeps appending to.
         let claim = SessionClaim::acquire(parsed, &self.storage).context("claim session")?;
@@ -386,14 +415,16 @@ fn host_project(
             .unwrap_or_else(|_| Err(eyre!("session thread exited before starting")));
         if let Ok(session) = &started {
             let mut sessions = lock(sessions);
-            sessions.retain(|_, running| !running.thread.is_finished());
-            sessions.insert(
-                session.boot.session_id.clone(),
+            let running = sessions.entry(project.to_path_buf()).or_default();
+            running.retain(|(_, r)| !r.thread.is_finished());
+            let id = session.boot.session_id.clone();
+            running.push((
+                id,
                 Running {
                     commands: session.commands.downgrade(),
                     thread,
                 },
-            );
+            ));
         }
         let _ = ready.send(started);
     }
@@ -465,6 +496,9 @@ fn serve_session(
     setup::report_session_start(resolved.start_type, Some(&resolved.id));
     let (resumed, claim) = resolved.into_resumed();
     let history = resumed.history.clone();
+    // Claims the id, so the session is saved under it and the sidebar lists it
+    // the moment it is started rather than once its first turn lands.
+    let session_id = resumed.id.clone();
 
     let (mcp_handle, mcp_errors) =
         smol::block_on(mcp::start_connected(cwd, base.project_config.clone()));
@@ -476,6 +510,8 @@ fn serve_session(
     let (updates_tx, updates_rx) = flume::unbounded::<Update>();
     let (commands_tx, commands_rx) = flume::unbounded::<Command>();
     let lua_handle = &base.lua_handle;
+    // The session belongs to the project it was started in, even though the
+    // process itself sits wherever the last stack was built.
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model: base.model.clone(),
         config: base.agent.clone(),
@@ -485,6 +521,8 @@ fn serve_session(
         excluded_tools: Vec::new(),
         mcp_handle,
         initial_wd: cwd.clone(),
+        working_dir: Some(cwd.clone()),
+        persist_on_start: true,
         resumed,
         claim,
         storage: base.storage.clone(),
@@ -503,7 +541,7 @@ fn serve_session(
 
     let plan = Arc::new(AtomicBool::new(false));
     let snapshot = HeadlessSnapshot::default();
-    let session_id = handle.session_id.to_string();
+    let session_id = session_id.to_string();
     let focus = {
         let snapshot = snapshot.clone();
         let plan = Arc::clone(&plan);
@@ -572,6 +610,7 @@ fn serve_session(
         model: base.model.clone(),
         timeouts: base.timeouts,
         session: handle.session_id.clone(),
+        root: Arc::new(cwd.clone()),
         updates: Some(updates_tx.downgrade()),
     };
     let sent = ready.send(Ok(Session {
@@ -601,14 +640,16 @@ fn serve_session(
     }
     drop(updates_tx);
     let InteractiveHandle {
-        input_tx,
+        interrupt,
         cancel_tx,
         task,
         session_id: session_ref,
         ..
     } = handle;
     let _ = cancel_tx.try_send(());
-    drop(input_tx);
+    // Dropping the last way in is what tells the session loop nobody will
+    // prompt it again.
+    drop(interrupt);
     smol::block_on(async {
         pump.await;
         headless::await_shutdown(task).await;
@@ -623,6 +664,8 @@ struct Aside {
     model: Model,
     timeouts: Timeouts,
     session: SessionRef,
+    /// The session's project, what its paths resolve against.
+    root: Arc<PathBuf>,
     updates: Option<WeakSender<Update>>,
 }
 
@@ -651,13 +694,17 @@ fn serve(
                     true => AgentMode::Plan(cwd.join(PLAN_FILE)),
                     false => AgentMode::Build,
                 };
-                let _ = handle.input_tx.send(AgentInput::from_defaults(
+                // While a turn runs, the agent takes this at its next request
+                // and carries on with it, so the user can redirect the work
+                // without waiting for the turn, or for a whole new run.
+                handle.interrupt.push(AgentInput::from_defaults(
                     expand_command(slash_commands, text),
                     mode,
                     images,
                     defaults,
                     InputSource::Gui,
                 ));
+                handle.interrupt.wake();
             }
             Command::Cancel => {
                 let _ = handle.cancel_tx.try_send(());
@@ -680,6 +727,7 @@ fn serve(
                         aside.model.clone(),
                         aside.timeouts,
                         aside.session.clone(),
+                        Arc::clone(&aside.root),
                         updates,
                     ))
                     .detach();
@@ -717,6 +765,7 @@ async fn answer_aside(
     mut model: Model,
     timeouts: Timeouts,
     session: SessionRef,
+    root: Arc<PathBuf>,
     updates: WeakSender<Update>,
 ) {
     let send = move |event: BtwEvent| {
@@ -735,7 +784,10 @@ async fn answer_aside(
         .map(|m| Vec::clone(&m))
         .unwrap_or_default();
     close_dangling_tool_calls(&mut messages, UNAVAILABLE_RESULT);
-    messages.push(btw_question(&question));
+    messages.push(btw_question(&format!(
+        "The session's working directory is {}.\n\n{question}",
+        root.display()
+    )));
     let messages = adapt_images_for_model(&model, &messages).await;
 
     let (events_tx, events_rx) = flume::unbounded();

@@ -370,6 +370,16 @@ pub struct ToolContext {
     /// clears it, and each caller sets it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    /// The session's working directory, when the driver runs it in a project
+    /// other than the process's. Relative paths resolve against it, and its
+    /// builtin permission rules apply. Shared with nested calls.
+    pub cwd: Option<Arc<PathBuf>>,
+}
+
+impl ToolContext {
+    pub fn working_dir(&self) -> &Path {
+        self.cwd.as_deref().map_or(&BASE, |cwd| cwd)
+    }
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -381,7 +391,9 @@ pub enum ToolLive {
     AllowedBy(Arc<str>),
 }
 
-pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
+/// `base` is the session's working directory, for a driver whose sessions do
+/// not share the process's.
+pub(crate) fn resolve_path_in(path: &str, base: &Path) -> Result<String, String> {
     let expanded = if let Some(rest) = path.strip_prefix("~/") {
         let home = HOME.as_deref().ok_or("cannot expand ~: HOME not set")?;
         home.join(rest).to_string_lossy().into_owned()
@@ -393,28 +405,43 @@ pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
     };
 
     if Path::new(&expanded).is_relative() {
-        let cwd = env::current_dir().map_err(|e| format!("cwd error: {e}"))?;
-        Ok(cwd.join(&expanded).to_string_lossy().into_owned())
+        Ok(base.join(&expanded).to_string_lossy().into_owned())
     } else {
         Ok(expanded)
     }
 }
 
 pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
+    resolve_search_path_in(path, &BASE)
+}
+
+pub(crate) fn resolve_search_path_in(path: Option<&str>, base: &Path) -> Result<String, String> {
     match path {
-        Some(p) => resolve_path(p),
-        None => env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .map_err(|e| format!("cwd error: {e}")),
+        Some(p) => resolve_path_in(p, base),
+        None => Ok(base.to_string_lossy().into_owned()),
     }
 }
 
+/// The process's own directory, what [`BASE`] was read from.
+pub fn process_dir() -> PathBuf {
+    Arc::clone(&PROCESS_DIR).as_ref().clone()
+}
+
+/// Where this process ran at startup, read once.
+static PROCESS_DIR: LazyLock<Arc<PathBuf>> =
+    LazyLock::new(|| Arc::new(env::current_dir().unwrap_or_else(|_| PathBuf::from("."))));
+static BASE: LazyLock<PathBuf> = LazyLock::new(|| PROCESS_DIR.as_ref().clone());
 static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
 static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
 
 pub(crate) fn relative_path(path: &str) -> String {
+    relative_path_to(path, CWD.as_deref())
+}
+
+/// Shows `path` relative to `cwd` when it lies under it.
+pub(crate) fn relative_path_to(path: &str, cwd: Option<&Path>) -> String {
     let p = Path::new(path);
-    if let Some(cwd) = CWD.as_deref()
+    if let Some(cwd) = cwd
         && let Ok(rel) = p.strip_prefix(cwd)
     {
         return format_rel("", ".", rel);
@@ -575,6 +602,7 @@ pub fn interpreter_ctx(
         mode: mode.clone(),
         session_id: None,
         background_for: None,
+        cwd: None,
         task_id: None,
         tool_use_id: None,
         user_response_rx,
@@ -1140,12 +1168,12 @@ mod tests {
         let home = maki_storage::paths::home().unwrap();
 
         assert_eq!(
-            resolve_path("~/foo/bar").unwrap(),
+            resolve_path_in("~/foo/bar", &BASE).unwrap(),
             home.join("foo/bar").to_string_lossy()
         );
-        assert_eq!(resolve_path("~").unwrap(), home.to_string_lossy());
+        assert_eq!(resolve_path_in("~", &BASE).unwrap(), home.to_string_lossy());
         assert_eq!(
-            resolve_path("src/main.rs").unwrap(),
+            resolve_path_in("src/main.rs", &BASE).unwrap(),
             cwd.join("src/main.rs").to_string_lossy()
         );
 
@@ -1157,12 +1185,12 @@ mod tests {
             #[allow(clippy::join_absolute_paths)]
             let expected = cwd.join("/etc/hosts");
             assert_eq!(
-                resolve_path("/etc/hosts").unwrap(),
+                resolve_path_in("/etc/hosts", &BASE).unwrap(),
                 expected.to_string_lossy()
             );
         }
         #[cfg(not(windows))]
-        assert_eq!(resolve_path("/etc/hosts").unwrap(), "/etc/hosts");
+        assert_eq!(resolve_path_in("/etc/hosts", &BASE).unwrap(), "/etc/hosts");
     }
 
     #[test]

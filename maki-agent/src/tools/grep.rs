@@ -10,7 +10,7 @@ use grep_searcher::{Sink, SinkContext, SinkFinish, SinkMatch};
 use ignore::WalkState;
 use tracing::debug;
 
-use super::{mtime, resolve_search_path, truncate_bytes, walk_builder};
+use super::{mtime, resolve_search_path_in, truncate_bytes, walk_builder};
 
 pub(super) const INVALID_REGEX: &str = "invalid regex pattern";
 const MULTILINE_HEAP_LIMIT: usize = 64 * 1024 * 1024;
@@ -28,6 +28,9 @@ pub struct GrepParams {
     pub context_after: usize,
     pub limit: usize,
     pub max_line_bytes: usize,
+    /// What a relative `path` is relative to; the process's directory when
+    /// empty.
+    pub base: Option<PathBuf>,
 }
 
 impl GrepParams {
@@ -40,6 +43,7 @@ impl GrepParams {
             context_after: 0,
             limit: 100,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+            base: None,
         }
     }
 }
@@ -47,7 +51,16 @@ impl GrepParams {
 /// Core grep logic. Blocking — caller must run on a thread pool.
 /// Returns `(base_path, entries)` where entries have paths relative to base.
 pub fn grep_search(params: GrepParams) -> Result<(PathBuf, Vec<GrepFileEntry>), String> {
-    let search_path = resolve_search_path(params.path.as_deref())?;
+    let base = params.base.clone().unwrap_or_else(super::process_dir);
+    grep_search_in(params, &base)
+}
+
+/// With relative paths resolved against `base`, a session's own directory.
+pub fn grep_search_in(
+    params: GrepParams,
+    base: &Path,
+) -> Result<(PathBuf, Vec<GrepFileEntry>), String> {
+    let search_path = resolve_search_path_in(params.path.as_deref(), base)?;
     let is_multiline = needs_multiline(&params.pattern);
     debug!(
         pattern = %params.pattern,

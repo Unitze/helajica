@@ -277,6 +277,12 @@ impl Transcript {
         });
     }
 
+    /// A notice nothing reformats beyond its own line breaks.
+    fn notice_plain(&mut self, text: String, level: Level) -> Change {
+        self.notice(format!("```text\n{text}\n```"), level);
+        Change::Appended
+    }
+
     /// Folds one event in. Subagent events are left to their parent's tool
     /// row: interleaving them would scramble the main conversation.
     pub fn apply(&mut self, envelope: &Envelope) -> Change {
@@ -338,7 +344,10 @@ impl Transcript {
             AgentEvent::Error { message, .. } => {
                 self.working = false;
                 self.settle_running();
-                self.push_notice(message, Level::Error)
+                // An error is shown as it came. The transcript is markdown, so
+                // a provider body (JSON, HTML) is fenced: unfenced it would be
+                // reflowed and its angle brackets read as markup.
+                self.notice_plain(message.clone(), Level::Error)
             }
             AgentEvent::Retry { message, .. } => self.push_notice(message, Level::Warning),
             AgentEvent::Notice { text } | AgentEvent::Steered { text, .. } => {

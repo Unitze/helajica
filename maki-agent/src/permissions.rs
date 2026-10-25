@@ -440,6 +440,14 @@ impl PermissionManager {
         }
     }
 
+    /// With its paths and builtin rules under `cwd`, for a session of a project
+    /// the process itself does not sit in.
+    pub fn rooted(mut self, cwd: &Path) -> Self {
+        self.builtin_rules = builtin_rules(cwd);
+        self.cwd = cwd.to_path_buf();
+        self
+    }
+
     fn session_rules(&self) -> std::sync::MutexGuard<'_, Vec<PermissionRule>> {
         self.session_rules.lock().unwrap_or_else(|e| {
             warn!("permission mutex was poisoned, recovering");

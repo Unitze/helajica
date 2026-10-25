@@ -238,7 +238,7 @@ fn spawn_agent_internal(
     model_policy: Arc<ModelPolicy>,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
-    let (queue_tx, queue_rx) = shared_queue::queue();
+    let (queue_tx, queue_rx) = shared_queue::queue(agent_tx.clone());
     let queue_rx = Arc::new(queue_rx);
     // Seeded empty because `AgentLoop::new` below publishes the real snapshot
     // synchronously, before any handle escapes.
@@ -479,6 +479,10 @@ mod tests {
     }
 
     fn push_prompt(handles: &AgentHandles, run_id: u64, text: &str) {
+        push_prompt_now(handles, run_id, text);
+    }
+
+    fn push_prompt_now(handles: &AgentHandles, run_id: u64, text: &str) {
         handles.queue.push(QueueItem::Message(QueuedInput {
             text: text.into(),
             input: AgentInput {

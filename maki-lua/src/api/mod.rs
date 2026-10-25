@@ -1,3 +1,4 @@
+pub(crate) mod acp;
 pub(crate) mod agent;
 pub(crate) mod r#async;
 pub(crate) mod autocmd;
@@ -155,6 +156,7 @@ pub(crate) fn create_maki_global(
         "agent",
         agent::create_agent_table(lua, Arc::clone(&plugin), permissions.clone())?,
     )?;
+    maki.set("acp", acp::create_acp_table(lua, permissions)?)?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

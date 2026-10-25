@@ -59,6 +59,9 @@ pub(super) struct AgentLoop {
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
+    /// A run is in flight, so a message that arrives now can reach it instead
+    /// of waiting for the next one.
+    running: bool,
 }
 
 impl AgentLoop {
@@ -107,6 +110,7 @@ impl AgentLoop {
             mailbox,
             lua_handle,
             subagent_cancels,
+            running: false,
         }
     }
 
@@ -122,7 +126,22 @@ impl AgentLoop {
                     continue;
                 };
                 last_run_id = Some(run_id);
-                self.process_run(run, run_id).await;
+                match run {
+                    QueueRun::Messages(messages) => {
+                        // The messages ride with the run that is executing, so
+                        // the user can redirect it instead of waiting for it.
+                        // With nothing running, this loop serves them as before.
+                        if self.running {
+                            self.queue
+                                .hand_to_agent(QueueRun::Messages(messages), run_id);
+                            break;
+                        }
+                        self.running = true;
+                        self.process_run(QueueRun::Messages(messages), run_id).await;
+                        self.running = false;
+                    }
+                    run => self.process_run(run, run_id).await,
+                }
             }
             if let Some(run_id) = last_run_id {
                 let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
@@ -139,6 +158,7 @@ impl AgentLoop {
         // so the run ending is what stops whatever still hangs off one, rather
         // than a group emptying out.
         self.subagent_cancels.cancel_all();
+        self.running = false;
 
         // A cancel arrives here as `Ok`, since esc is what the user asked for.
         // As an error it would draw a second "Cancelled." bubble under the one
@@ -319,6 +339,7 @@ impl AgentLoop {
                 permissions: Arc::clone(&self.seed.permissions),
                 session_id: Some(self.seed.session_id.clone()),
                 background_for: None,
+                cwd: None,
                 task_id: None,
                 mailbox: Some(self.mailbox.clone()),
                 timeouts: self.seed.timeouts,

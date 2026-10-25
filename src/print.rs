@@ -218,6 +218,7 @@ pub fn run(params: PrintParams) -> Result<()> {
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,
+        working_dir: None,
         resumed,
         claim,
         storage,

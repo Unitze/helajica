@@ -1,5 +1,6 @@
 //! Async agent loop with tools.
 
+pub mod acp;
 pub mod agent;
 pub mod cancel;
 pub mod child_guard;
@@ -20,8 +21,10 @@ pub use mcp::{
     ToolDeferral,
 };
 pub mod inbox;
+pub mod interrupt_queue;
 pub mod session;
 pub use inbox::SubagentInbox;
+pub use interrupt_queue::InterruptQueue;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,

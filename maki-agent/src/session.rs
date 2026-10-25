@@ -108,6 +108,22 @@ impl SessionTrack {
         }
     }
 
+    /// Writes the session as it stands, so one that has not had a turn yet is
+    /// still one the pickers list: a fresh chat the user opened and left shows
+    /// up under its folder, and a resumed one that moved nothing keeps the
+    /// place it had. A driver calls this once, as it hands the session over.
+    pub fn persist(&mut self) -> Result<(), SessionError> {
+        if self.store.session.messages().is_empty() {
+            return Ok(());
+        }
+        // Every file has a model in it, and the one this session is about to
+        // run on is the right answer before its first turn says otherwise.
+        self.store
+            .session
+            .set_model(self.store.pending_model.clone());
+        self.store.save()
+    }
+
     /// One turn against this transcript. The returned guard is the only way to
     /// reach [`AgentRunParams`] and it persists on drop. An
     /// [`Agent`](crate::Agent) built from it borrows the guard, so borrowck
@@ -151,6 +167,7 @@ impl Drop for SessionTurn<'_> {
             gauge,
             store,
         } = &mut *self.0;
+        store.pending_model = store.session.model.clone();
         if !history.has_unsaved() {
             return;
         }
@@ -170,6 +187,9 @@ struct SessionStore {
     dir: StateDir,
     claim: SessionClaim,
     session: StoredSession,
+    /// The spec this session was opened for, written by
+    /// [`SessionTrack::persist`] before any turn set one.
+    pending_model: String,
 }
 
 impl SessionStore {
@@ -184,11 +204,18 @@ impl SessionStore {
             session.id = claim.id();
             session
         });
+        let pending_model = session.model.clone();
         Self {
             dir,
             claim,
             session,
+            pending_model,
         }
+    }
+
+    /// What a file written before the first turn carries.
+    fn save(&mut self) -> Result<(), SessionError> {
+        self.session.save(&self.claim, &self.dir)
     }
 
     /// `context_size` travels with the messages, since a resumed session seeds

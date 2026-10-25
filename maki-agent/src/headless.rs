@@ -4,6 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
+
+use crate::InterruptSource;
+use crate::interrupt_queue::InterruptQueue;
 use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
@@ -12,7 +15,7 @@ use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde_json::Value;
 use smol::lock::Mutex;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::agent::{self, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken};
@@ -60,6 +63,9 @@ pub struct HeadlessParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
+    /// The directory this run works in, when the caller serves several and
+    /// `initial_wd` is not it. Permission rules stay rooted at `initial_wd`.
+    pub working_dir: Option<PathBuf>,
     pub resumed: Resumed,
     /// The right to write [`Self::resumed`]'s session, taken before its
     /// transcript was read.
@@ -84,6 +90,7 @@ pub struct HeadlessHandle {
 
 /// Read once at startup. A headless host has no `/cd` and its slots come from
 /// the caller, so nothing here changes mid-session.
+#[derive(Clone)]
 struct ContextSpec {
     vars: template::Vars,
     instructions: String,
@@ -143,8 +150,14 @@ impl ContextSpec {
         context
     }
 
-    fn builder(self) -> RunContextBuilder {
-        Arc::new(move |model, workflow| self.render(model, workflow))
+    fn builder(self, rooted: Option<PathBuf>) -> RunContextBuilder {
+        Arc::new(move |model, workflow| {
+            let context = self.render(model, workflow);
+            match &rooted {
+                Some(cwd) => context.rooted(cwd),
+                None => context,
+            }
+        })
     }
 }
 
@@ -174,8 +187,8 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         params.excluded_tools,
         params.mcp_handle.as_ref(),
     );
-    let initial = spec.render(&params.model, params.defaults.workflow);
-    let context = spec.builder();
+    let initial = spec.clone().render(&params.model, params.defaults.workflow);
+    let context = spec.builder(params.working_dir.clone());
 
     let mcp = params
         .mcp_handle
@@ -208,20 +221,26 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         // Outlives `agent`, so dropping it writes the transcript once the agent
         // that produced it is gone, without this body saying so.
         let mut turn = track.turn(model.spec());
+        let mut permissions = PermissionManager::new(
+            params.permissions_config,
+            working_dir_path,
+            params.project_config,
+            params.plugin_rules,
+        );
+        if params.working_dir.is_some() {
+            permissions = permissions.rooted(&params.initial_wd);
+        }
+        let working_dir = params.working_dir.map(Arc::new);
         let mut agent = Agent::new(
             AgentParams {
                 provider,
                 model: model.clone(),
                 config: params.config,
                 tool_output_lines: ToolOutputLines::default(),
-                permissions: Arc::new(PermissionManager::new(
-                    params.permissions_config,
-                    working_dir_path,
-                    params.project_config,
-                    params.plugin_rules,
-                )),
+                permissions: Arc::new(permissions),
                 session_id: Some(run_session_ref),
                 background_for: None,
+                cwd: working_dir,
                 task_id: None,
                 mailbox: Some(mailbox),
                 timeouts: params.timeouts,
@@ -291,11 +310,21 @@ pub struct InteractiveParams {
     /// Host-side overrides that shadow a registered tool's execution while
     /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
     pub local_tools: LocalTools,
+    /// The project this session works in, when the driver serves several and
+    /// the process's own directory is not it. Relative tool paths and the
+    /// builtin permission rules start here instead; the prompt may still name
+    /// another directory in its `{cwd}`.
+    pub working_dir: Option<PathBuf>,
+    /// Write the session when it starts, so its history lists it before any
+    /// turn. A window that opens a fresh chat and shows its sidebar needs it.
+    pub persist_on_start: bool,
 }
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: flume::Sender<AgentInput>,
+    /// What the window sends the session. While a turn runs, what lands here
+    /// reaches the model before its next request instead of after the turn.
+    pub interrupt: InterruptQueue,
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
@@ -319,8 +348,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             params.mcp_handle.as_ref(),
         )
     };
-    let initial = spec.render(&params.model, params.defaults.workflow);
-    let context = spec.builder();
+    let initial = spec.clone().render(&params.model, params.defaults.workflow);
+    let context = spec.builder(params.working_dir.clone());
 
     let mcp = params
         .mcp_handle
@@ -330,7 +359,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
+    let (wake_tx, wake_rx) = flume::bounded(1);
+    let interrupt = InterruptQueue::with_wake((wake_tx, wake_rx.clone()));
+    let interrupt_source: Arc<dyn InterruptSource> = Arc::new(interrupt.clone());
+    let task_interrupt = interrupt.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
@@ -341,12 +373,17 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mut permissions_config = params.permissions_config;
     permissions_config.yolo |= params.yolo;
-    let permissions = Arc::new(PermissionManager::new(
+    let mut permissions = PermissionManager::new(
         permissions_config,
-        params.initial_wd,
+        params.initial_wd.clone(),
         params.project_config,
         Arc::clone(&params.plugin_rules),
-    ));
+    );
+    if params.working_dir.is_some() {
+        permissions = permissions.rooted(&params.initial_wd);
+    }
+    let permissions = Arc::new(permissions);
+    let session_root = params.working_dir.map(Arc::new);
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_access = FileAccess::fresh();
@@ -360,9 +397,30 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
         };
         let mut track =
             SessionTrack::open(params.resumed, params.claim, params.storage, &working_dir);
+        // Before the first turn waits on the user: a session that was started
+        // is one the history shows, even if it is never prompted.
+        if params.persist_on_start
+            && let Err(e) = track.persist()
+        {
+            warn!(error = %e, "failed to write a new session");
+        }
         let mut run_id: u64 = 0;
 
-        while let Ok(input) = input_rx.recv_async().await {
+        // One prompt at a time, but not one per turn: a message the window
+        // sends while a turn runs is taken by that run (see the interrupt
+        // source below), and a message that finds no run waiting starts the
+        // next one.
+        let mut next = loop {
+            if let Some(input) = task_interrupt.take() {
+                break input;
+            }
+            // The channel closes with the last way in, so a session nobody
+            // can prompt any more ends instead of waiting forever.
+            if wake_rx.recv_async().await.is_err() {
+                return;
+            }
+        };
+        loop {
             let (trigger, cancel) = CancelToken::new();
             let cancel_task = smol::spawn({
                 let cancel_rx = cancel_rx.clone();
@@ -383,71 +441,86 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let event_tx = base_tx.with_run_id(run_id);
             let error_tx = event_tx.clone();
 
+            let mut retry = false;
             if let Some(mut new_model) = model_rx
                 .try_iter()
                 .last()
                 .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                 && new_model.spec() != model.spec()
             {
-                let Some(switched) = connect(&mut new_model, params.timeouts, &error_tx).await
-                else {
-                    run_id += 1;
-                    continue;
-                };
-                provider = switched;
-                model = new_model;
+                match connect(&mut new_model, params.timeouts, &error_tx).await {
+                    Some(switched) => {
+                        provider = switched;
+                        model = new_model;
+                    }
+                    None => retry = true,
+                }
             }
 
-            while answer_rx.lock().await.try_recv().is_ok() {}
+            if !retry {
+                while answer_rx.lock().await.try_recv().is_ok() {}
 
-            // Outlives `agent`, so this turn is on disk before the next prompt
-            // is read, without the loop body remembering to write it.
-            let mut turn = track.turn(model.spec());
-            let mut agent = Agent::new(
-                AgentParams {
-                    provider: Arc::clone(&provider),
-                    model: model.clone(),
-                    config: params.config.clone(),
-                    tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::clone(&task_permissions),
-                    session_id: Some(session_ref_clone.clone()),
-                    background_for: None,
-                    task_id: None,
-                    mailbox: Some(mailbox.clone()),
-                    timeouts: params.timeouts,
-                    file_access: Arc::clone(&file_access),
-                    prompt_slots: Arc::clone(&params.prompt_slots),
-                    subagent_cancels: Arc::new(CancelMap::new()),
-                    ledger: Arc::new(RunLedger::default()),
-                    registry: Arc::clone(ToolRegistry::global_arc()),
-                    audience: ToolAudience::MAIN,
-                    model_policy: Arc::clone(&params.model_policy),
-                },
-                turn.run_params(event_tx, Arc::clone(&context)),
-            )
-            .with_loaded_instructions(instructions.loaded.clone())
-            .with_user_response_rx(Arc::clone(&answer_rx))
-            .with_cancel(cancel)
-            .with_local_tools(Arc::clone(&params.local_tools))
-            .with_mcp(mcp.clone());
+                // Outlives `agent`, so this turn is on disk before the next prompt
+                // is read, without the loop body remembering to write it.
+                let mut turn = track.turn(model.spec());
+                let mut agent = Agent::new(
+                    AgentParams {
+                        provider: Arc::clone(&provider),
+                        model: model.clone(),
+                        config: params.config.clone(),
+                        tool_output_lines: ToolOutputLines::default(),
+                        permissions: Arc::clone(&task_permissions),
+                        session_id: Some(session_ref_clone.clone()),
+                        background_for: None,
+                        cwd: session_root.clone(),
+                        task_id: None,
+                        mailbox: Some(mailbox.clone()),
+                        timeouts: params.timeouts,
+                        file_access: Arc::clone(&file_access),
+                        prompt_slots: Arc::clone(&params.prompt_slots),
+                        subagent_cancels: Arc::new(CancelMap::new()),
+                        ledger: Arc::new(RunLedger::default()),
+                        registry: Arc::clone(ToolRegistry::global_arc()),
+                        audience: ToolAudience::MAIN,
+                        model_policy: Arc::clone(&params.model_policy),
+                    },
+                    turn.run_params(event_tx, Arc::clone(&context)),
+                )
+                .with_loaded_instructions(instructions.loaded.clone())
+                .with_user_response_rx(Arc::clone(&answer_rx))
+                .with_interrupt_source(Arc::clone(&interrupt_source))
+                .with_cancel(cancel)
+                .with_local_tools(Arc::clone(&params.local_tools))
+                .with_mcp(mcp.clone());
 
-            let result = agent.run(input).await;
-            drop(agent);
-            cancel_task.cancel().await;
+                let result = agent.run(next).await;
+                drop(agent);
+                cancel_task.cancel().await;
 
-            if let Err(ref e) = result {
-                error!(error = %e, "agent error");
-                let _ = error_tx.send(AgentEvent::error(e));
+                if let Err(ref e) = result {
+                    error!(error = %e, "agent error");
+                    let _ = error_tx.send(AgentEvent::error(e));
+                }
             }
 
             run_id += 1;
+            // The window sends while a run is busy, so whatever is waiting is
+            // the start of the next one; nothing means waiting for the window.
+            next = loop {
+                if let Some(input) = task_interrupt.take() {
+                    break input;
+                }
+                if wake_rx.recv_async().await.is_err() {
+                    return;
+                }
+            };
         }
     }));
 
     (
         InteractiveHandle {
             tool_names,
-            input_tx,
+            interrupt,
             answer_tx,
             cancel_tx,
             model_tx,

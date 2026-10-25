@@ -164,8 +164,14 @@ pub struct WorkspaceView {
     unfolded: HashSet<PathBuf>,
     sessions: HashMap<PathBuf, Vec<SessionSummary>>,
     phase: Phase,
-    /// Sessions of the project switched away from, still running, by id.
+    /// Running sessions the window is not showing, by id: those of the project
+    /// switched away from, and of the background session of a project now in
+    /// the foreground. [`Stash::project`] says whose each is.
     parked: HashMap<String, Parked>,
+    /// The running session of every project other than the one on screen, on
+    /// its way in or out: a background session there runs while this window
+    /// sits in another project, so its updates keep arriving.
+    stashed: HashMap<PathBuf, SessionSlot>,
     transcript: Transcript,
     ext: Extensions,
     composer: Entity<TextareaState>,
@@ -186,8 +192,6 @@ pub struct WorkspaceView {
     thinking: Option<StoredThinking>,
     /// The provider's usage limits; `None` while they load.
     usage: Option<UsageReport>,
-    /// Providers changed mid-run; the session reopens once the run ends.
-    reload_pending: bool,
     mode: Mode,
     update: UpdateState,
     expanded: HashSet<String>,
@@ -253,6 +257,7 @@ impl WorkspaceView {
             sessions: HashMap::new(),
             phase: Phase::Idle,
             parked: HashMap::new(),
+            stashed: HashMap::new(),
             transcript: Transcript::default(),
             ext: Extensions::default(),
             composer,
@@ -267,7 +272,6 @@ impl WorkspaceView {
             model_picker: None,
             thinking: None,
             usage: None,
-            reload_pending: false,
             mode: Mode::Ask,
             update: UpdateState::Idle,
             expanded: HashSet::new(),
@@ -410,9 +414,11 @@ impl WorkspaceView {
             );
             return cx.notify();
         }
-        if self.project.as_ref() != Some(&project) && self.busy() {
-            return self.confirm_switch(project, resume, window, cx);
+        if self.project.as_ref() != Some(&project) {
+            return self.switch_project(project, resume, window, cx);
         }
+        // One session of a project on screen at a time: the background one
+        // steps into the stash while this one opens.
         self.switch_project(project, resume, window, cx);
     }
 
@@ -429,9 +435,12 @@ impl WorkspaceView {
         self.refresh_sessions(&project);
         let same = self.project.as_ref() == Some(&project);
         if !same {
-            self.drop_sessions();
+            self.stash_for_switch();
         }
-        self.project = Some(project);
+        self.project = Some(project.clone());
+        if let Some(slot) = self.stashed.remove(&project) {
+            return self.adopt(slot, window, cx);
+        }
         match resume {
             Some(id) if same && self.current_session() == Some(id.as_str()) => cx.notify(),
             Some(id) if self.parked.contains_key(&id) => self.unpark(&id, window, cx),
@@ -439,61 +448,92 @@ impl WorkspaceView {
         }
     }
 
-    /// Whether any session of the open project is running.
+    /// Whether the session on screen is running.
+    #[allow(dead_code)]
     fn busy(&self) -> bool {
-        self.transcript.working || self.parked.values().any(|p| p.transcript.working)
+        self.transcript.working
     }
 
     /// Ends every session of the open project: they share its stack.
     fn drop_sessions(&mut self) {
         self.parked.clear();
+        self.stashed
+            .remove(&self.project.clone().unwrap_or_default());
+        if let Some(project) = self.project.clone() {
+            self.engine.reload(Some(&project));
+        }
         self._session = None;
         self.phase = Phase::Idle;
     }
 
-    fn confirm_switch(
-        &mut self,
-        project: PathBuf,
-        resume: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let workspace = cx.entity().downgrade();
-        let from = self.project_name().unwrap_or_default();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let workspace = workspace.clone();
-            let project = project.clone();
-            let resume = resume.clone();
-            dialog
-                .title("Stop running sessions?")
-                .w(px(DELETE_DIALOG_WIDTH))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "Sessions in \u{201c}{from}\u{201d} are still working. \
-                             Only one project runs at a time, so opening another stops them."
-                        )),
-                )
-                .footer(
-                    DialogFooter::new().children([
-                        Button::new("cancel-switch")
-                            .label("Cancel")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                        Button::new("confirm-switch")
-                            .danger()
-                            .label("Stop and switch")
-                            .on_click(move |_, window, cx| {
-                                window.close_dialog(cx);
-                                let (project, resume) = (project.clone(), resume.clone());
-                                let _ = workspace.update(cx, |this, cx| {
-                                    this.switch_project(project, resume, window, cx)
-                                });
-                            }),
-                    ]),
-                )
-        });
+    /// The on-screen session of the project being left takes its place in the
+    /// stash, so it keeps running while the window sits in another project and
+    /// comes back as it was.
+    fn stash_for_switch(&mut self) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        if self
+            .parked
+            .contains_key(self.current_session().unwrap_or_default())
+        {
+            // Already put away: only the task that delivers its updates is
+            // left to take over.
+            let task = self._session.take();
+            if let Some(slot) = self.stashed.get_mut(&project) {
+                slot.task = task;
+            }
+            return;
+        }
+        let phase = mem::replace(&mut self.phase, Phase::Idle);
+        let (Phase::Ready { boot, commands }, Some(task)) = (phase, self._session.take()) else {
+            return;
+        };
+        self.thumbs.clear();
+        self.stashed.insert(
+            project,
+            SessionSlot {
+                parked: Parked {
+                    boot,
+                    commands,
+                    transcript: mem::take(&mut self.transcript),
+                    ext: mem::take(&mut self.ext),
+                    aside: self.aside.take(),
+                    goal: self.goal.take(),
+                    usage: self.usage.take(),
+                    model_picker: self.model_picker.take(),
+                    expanded: mem::take(&mut self.expanded),
+                    pending: Vec::new(),
+                    run_ended: None,
+                    _task: Task::ready(()),
+                },
+                task: Some(task),
+                pending: Vec::new(),
+                run_ended: None,
+            },
+        );
+    }
+
+    /// Brings a stashed session back on screen as it was, and its updates with
+    /// it.
+    fn adopt(&mut self, slot: SessionSlot, window: &mut Window, cx: &mut Context<Self>) {
+        let SessionSlot {
+            parked,
+            task,
+            pending,
+            run_ended,
+        } = slot;
+        let id = parked.boot.session_id.clone();
+        self.parked.insert(id.clone(), parked);
+        self._session = task;
+        self.unpark(&id, window, cx);
+        if let Some(cancelled) = run_ended {
+            self.after_run(cancelled, window, cx);
+        }
+        for update in pending {
+            self.receive(update, window, cx);
+        }
+        cx.notify();
     }
 
     /// Moves the session on screen aside, still running. A fresh one with
@@ -648,7 +688,7 @@ impl WorkspaceView {
             self.phase = Phase::Idle;
         }
         self.parked.remove(id);
-        if let Err(e) = self.engine.delete_session(id) {
+        if let Err(e) = self.engine.delete_session(project, id) {
             window.push_notification(
                 Notification::new()
                     .message(format!("Could not delete the session: {e:#}"))
@@ -667,6 +707,7 @@ impl WorkspaceView {
         self.store.remove(project);
         self.unfolded.remove(project);
         self.sessions.remove(project);
+        self.stashed.remove(project);
         if self.project.as_deref() == Some(project) {
             self.project = None;
             self.drop_sessions();
@@ -735,7 +776,6 @@ impl WorkspaceView {
         self.goal = None;
         self.usage = None;
         self.model_picker = None;
-        self.reload_pending = false;
         self._session = None;
         cx.notify();
 
@@ -746,7 +786,7 @@ impl WorkspaceView {
                     let project = project.clone();
                     async move {
                         if reload {
-                            engine.reload();
+                            engine.reload(Some(&project));
                         }
                         engine.open(&project, resume)
                     }
@@ -793,34 +833,38 @@ impl WorkspaceView {
                 cx.notify();
             });
             while let Ok(update) = updates.recv_async().await {
-                if Self::deliver(&this, &session_id, update, cx).is_err() {
+                let Ok(Some(current)) = this.update(cx, |this, _| this.project.clone()) else {
+                    return;
+                };
+                if Self::deliver(&this, &current, &session_id, update, cx).is_err() {
                     return;
                 }
             }
         }));
     }
 
-    /// To the session on screen, or else the parked one it belongs to.
+    /// To the session on screen when it is `project`'s, or else to wherever
+    /// that project's session waits: its stash, or a park of it.
     fn deliver(
         this: &WeakEntity<Self>,
+        project: &Path,
         session: &str,
         update: Update,
         cx: &mut AsyncWindowContext,
     ) -> gpui_kit::Result<()> {
         this.update_in(cx, |this, window, cx| {
-            if this.current_session() == Some(session) {
+            if this.project.as_deref() == Some(project) && this.current_session() == Some(session) {
                 return this.receive(update, window, cx);
             }
-            let Some(parked) = this.parked.get_mut(session) else {
-                return;
+            let parked = match this.stashed.get_mut(project) {
+                Some(slot) if slot.parked.boot.session_id == session => &mut slot.parked,
+                _ => match this.parked.get_mut(session) {
+                    Some(parked) => parked,
+                    None => return,
+                },
             };
             if parked.receive(update) {
-                if let Some(project) = this.project.clone() {
-                    this.refresh_sessions(&project);
-                }
-                if this.reload_pending && !this.busy() {
-                    this.reload_session(window, cx);
-                }
+                this.refresh_sessions(project);
             }
             cx.notify();
         })
@@ -924,12 +968,8 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// A run of the main agent ended: carry a goal on, and reopen the session
-    /// if providers changed while it ran.
+    /// A run of the main agent ended: carry a goal on.
     fn after_run(&mut self, cancelled: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.reload_pending && !self.busy() {
-            return self.reload_session(window, cx);
-        }
         let Some(goal) = &mut self.goal else {
             return;
         };
@@ -984,9 +1024,14 @@ impl WorkspaceView {
     }
 
     /// Reopens the current session so it sees changed providers and models.
+    /// Rebuilds the current project's stack, which ends its other sessions
+    /// too: only there do sessions share a registry. Other projects keep
+    /// running on theirs.
     fn reload_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reload_pending = false;
         let resume = self.current_session().map(str::to_owned);
+        self.parked.clear();
+        self.stashed
+            .remove(&self.project.clone().unwrap_or_default());
         self.start(resume, true, window, cx);
     }
 
@@ -994,10 +1039,7 @@ impl WorkspaceView {
         if !matches!(self.phase, Phase::Ready { .. }) {
             return;
         }
-        match self.busy() {
-            true => self.reload_pending = true,
-            false => self.reload_session(window, cx),
-        }
+        self.reload_session(window, cx);
     }
 
     fn open_customize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2020,13 +2062,25 @@ impl WorkspaceView {
                     Level::Warning => cx.theme().warning,
                     Level::Error => cx.theme().danger,
                 };
+                let section = div().text_xs().text_color(color).child(TextView::markdown(
+                    SharedString::from(format!("notice-{index}")),
+                    text.clone(),
+                ));
+                if *level != Level::Error {
+                    return section.into_any_element();
+                }
+                // Hovering an error shows it whole: it carries the provider's
+                // own words (a 503's body, say), and the line on screen is
+                // only the first of them.
+                let whole = SharedString::from(text.clone());
                 div()
-                    .text_xs()
-                    .text_color(color)
-                    .child(TextView::markdown(
-                        SharedString::from(format!("notice-{index}")),
-                        text.clone(),
-                    ))
+                    .id(SharedString::from(format!("notice-card-{index}")))
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(whole.clone())
+                            .max_w(px(TRANSCRIPT_WIDTH))
+                            .build(window, cx)
+                    })
+                    .child(section)
                     .into_any_element()
             }
         }
@@ -2538,23 +2592,32 @@ impl WorkspaceView {
                             .text_color(rgb(SPINNER_COLOR))
                             .child(SPINNER_FRAMES[frame.min(SPINNER_FRAMES.len() - 1)]),
                     )
-                    .child(div().min_w_0().truncate().child(label.clone()))
-                    .children(elapsed.map(|elapsed| div().flex_none().child(elapsed)))
-                    .when(!thinking.elapsed().is_zero(), |row| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .px_1p5()
-                                .rounded_full()
-                                .border_1()
-                                .border_color(border)
-                                .text_xs()
-                                .child(format!(
-                                    "{THINKING_CHIP} {}",
-                                    short_duration(thinking.elapsed())
-                                )),
-                        )
-                    })
+                    // The line shrinks to what it says, so the animation frame
+                    // and the row it draws into cover the words and nothing
+                    // else: a full-width row puts the whole composer under a
+                    // repaint that never settles.
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_2()
+                            .child(div().min_w_0().truncate().child(label.clone()))
+                            .children(elapsed.map(|elapsed| div().flex_none().child(elapsed)))
+                            .when(!thinking.elapsed().is_zero(), |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1p5()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_xs()
+                                        .child(format!(
+                                            "{THINKING_CHIP} {}",
+                                            short_duration(thinking.elapsed())
+                                        )),
+                                )
+                            }),
+                    )
                 },
             )
     }
@@ -3589,7 +3652,6 @@ fn preview(text: &str, lines: usize) -> String {
     out
 }
 
-/// A `/btw` side question and its answer as it streams in.
 /// A session switched away from: it keeps running, and its updates land
 /// here until it is on screen again.
 struct Parked {
@@ -3611,8 +3673,7 @@ struct Parked {
 }
 
 impl Parked {
-    /// Takes an update in, holding back what needs the window. `true` when
-    /// a run ended.
+    /// Takes an update in, holding back what needs the window. `true` when    /// a run ended.
     fn receive(&mut self, update: Update) -> bool {
         let envelope = match update {
             Update::Agent(envelope) => envelope,
@@ -3645,6 +3706,17 @@ impl Parked {
             _ => false,
         }
     }
+}
+
+/// The running session of a project the window is not in. Its updates still
+/// arrive: the ones a parked session would wait for are held here instead,
+/// since only one window's worth of them may reach it at a time.
+struct SessionSlot {
+    parked: Parked,
+    /// The task delivering its updates; `None` while it is on screen.
+    task: Option<Task<()>>,
+    pending: Vec<Update>,
+    run_ended: Option<bool>,
 }
 
 struct Aside {

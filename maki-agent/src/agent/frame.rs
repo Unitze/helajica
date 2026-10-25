@@ -89,6 +89,16 @@ impl RunContext {
         }
     }
 
+    /// For a driver serving several projects from one process: the facts this
+    /// session's working directory states, since `vars` were built from the
+    /// process's. A changed descriptor reaches this run as a `cwd` update.
+    pub fn rooted(mut self, cwd: &Path) -> Self {
+        if let Some(facts) = &mut self.facts {
+            facts.cwd = cwd.display().to_string();
+        }
+        self
+    }
+
     pub fn with_prompt_policy(mut self, prompts: &ResolvedPrompts) -> Self {
         let policy = prompts.policy_key();
         if !policy.is_empty() {

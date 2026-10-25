@@ -2,18 +2,20 @@
 //! Sync tool calls resolve immediately; async (`await`) calls are batched via `ResolveFutures`
 //! and dispatched concurrently through [`AsyncResolver`], with results fed back one by one.
 //! The sandbox never touches the OS directly. Text files opened with `open()` or `pathlib`
-//! are served by the host's [`FileFn`], and every other `OsCall` is refused.
+//! are served by the host's [`FileFn`], the clock (`datetime.now`, `date.today`) comes from
+//! the host process, and every other `OsCall` is refused.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::absolute;
 use std::time::Duration;
 
+use chrono::{Datelike, Timelike};
 use monty::{MontyRun, RunProgress};
 use monty_types::{
-    CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyFileHandle, MontyObject,
-    NameLookupResult, OpenCallArgs, OsFunctionCall, PathStringDataArgs, PrintWriter,
-    PrintWriterCallback, ResourceLimits, ResourceTracker,
+    CompileOptions, ExcType, ExtFunctionResult, MontyDate, MontyDateTime, MontyException,
+    MontyFileHandle, MontyObject, MontyTimeZone, NameLookupResult, OpenCallArgs, OsFunctionCall,
+    PathStringDataArgs, PrintWriter, PrintWriterCallback, ResourceLimits, ResourceTracker,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -305,6 +307,11 @@ impl FileHost<'_> {
             OsFunctionCall::ReadText(path) => self.read(path.into_string()),
             OsFunctionCall::WriteText(args) => self.write(args, false),
             OsFunctionCall::AppendText(args) => self.write(args, true),
+            // The clock is answered from the process itself: no filesystem and
+            // no new capability, and without it a script times itself by
+            // spawning a shell per measurement.
+            OsFunctionCall::DateTimeNow(tz) => Ok(host_datetime_now(tz)),
+            OsFunctionCall::DateToday => Ok(host_date_today()),
             other => return ExtFunctionResult::Error(other.on_no_handler()),
         };
         match result {
@@ -395,6 +402,41 @@ impl FileHost<'_> {
 /// Lexical only, like the host tools resolve paths, so symlinks still differ.
 fn same_file(a: &str, b: &str) -> bool {
     a == b || matches!((absolute(a), absolute(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// `datetime.now(tz)`: naive local time, or an aware value in the fixed offset
+/// the script passed — CPython's aware/naive split.
+fn host_datetime_now(tz: Option<MontyTimeZone>) -> MontyObject {
+    let (naive, offset_seconds, timezone_name) = match tz {
+        Some(tz) => (
+            chrono::Utc::now().naive_utc()
+                + chrono::TimeDelta::seconds(i64::from(tz.offset_seconds)),
+            Some(tz.offset_seconds),
+            tz.name,
+        ),
+        None => (chrono::Local::now().naive_local(), None, None),
+    };
+    MontyObject::DateTime(MontyDateTime {
+        year: naive.year(),
+        month: naive.month() as u8,
+        day: naive.day() as u8,
+        hour: naive.hour() as u8,
+        minute: naive.minute() as u8,
+        second: naive.second() as u8,
+        microsecond: naive.nanosecond() / 1_000,
+        offset_seconds,
+        timezone_name,
+    })
+}
+
+/// `date.today()`: the local date, as monty's `OsCall` contract expects.
+fn host_date_today() -> MontyObject {
+    let today = chrono::Local::now().naive_local();
+    MontyObject::Date(MontyDate {
+        year: today.year(),
+        month: today.month() as u8,
+        day: today.day() as u8,
+    })
 }
 
 /// Monty counts lines in the whole script, so user frames come back
@@ -801,6 +843,39 @@ mod tests {
         let code = format!("open('{FILE_PATH}')");
         let err = run_code(&code, &empty_tools(), None, default_limits()).unwrap_err();
         assert!(matches!(err, InterpreterError::Sandboxed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn datetime_now_and_date_today_read_the_host_clock() {
+        let code =
+            "import datetime\nprint(datetime.datetime.now().year, datetime.date.today().year)";
+        let result = run_with_files(code, &memory_fs(), false).unwrap();
+        let printed = result.stdout.trim().to_owned();
+        // Both years can lag the test's clock by one at a midnight rollover.
+        let year = chrono::Local::now().year();
+        let same_year = [year - 1, year, year + 1]
+            .into_iter()
+            .any(|y| printed == format!("{y} {y}"));
+        assert!(same_year, "got {printed}");
+    }
+
+    #[test]
+    fn datetime_now_with_timezone_returns_the_aware_value() {
+        let tz = MontyTimeZone {
+            offset_seconds: 7_200,
+            name: Some("UTC+2".to_owned()),
+        };
+        let MontyObject::DateTime(dt) = host_datetime_now(Some(tz)) else {
+            panic!("expected a datetime");
+        };
+        assert_eq!(dt.offset_seconds, Some(7_200));
+        assert_eq!(dt.timezone_name.as_deref(), Some("UTC+2"));
+        assert!((dt.hour as u32) < 24, "hour out of range: {}", dt.hour);
+        let MontyObject::DateTime(naive) = host_datetime_now(None) else {
+            panic!("expected a datetime");
+        };
+        assert_eq!(naive.offset_seconds, None);
+        assert_eq!(naive.timezone_name, None);
     }
 
     #[test]

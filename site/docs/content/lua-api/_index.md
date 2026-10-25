@@ -109,6 +109,9 @@ The rules:
 | [`maki.pack`](#maki-pack) | Declare global packages and inspect package state. |
 | [`maki.api`](#maki-api) | Plugin registration. |
 | [`maki.plan`](#maki-plan) | Plan-mode surface for plugins. |
+| [`maki.acp`](#maki-acp) | Drive an external agent process that speaks the Agent Client Protocol |
+| [`maki.acp.Client`](#maki-acp-Client) | A live ACP agent process, started with `maki.acp.client()`. |
+| [`maki.acp.Session`](#maki-acp-Session) | A conversation in an ACP agent process. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
@@ -1232,6 +1235,217 @@ end
 ```
 
 
+## maki.acp {#maki-acp}
+
+Drive an external agent process that speaks the Agent Client Protocol
+as a delegate. One client is one process hosting many sessions; the
+agent brings its own tools, models and permissions.
+
+```lua
+local client, err = maki.acp.client({ cmd = "opencode", args = { "acp" } })
+if err then error(err) end
+local session, err = client:new_session()
+if err then error(err) end
+local result, err = session:prompt("Summarize the repository structure")
+if err then error(err) end
+print(result.text)
+```
+
+---
+
+### `maki.acp.client()` {#maki-acp-client}
+
+```lua
+maki.acp.client({opts})
+```
+
+Start one ACP agent process and finish its `initialize` handshake. Keep the
+returned client around: every {client.new_session} runs in this process,
+and dropping the last reference kills it.
+
+The agent works with its own tools, models and permissions; maki only pipes
+prompts in and final text out. Give it room to work with {policy}.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts}` (`table`) Required fields:
+  - `cmd` (`string`) executable to start.
+
+  Optional fields:
+
+  - `args` (`string[]?`) command line arguments (e.g. `{"acp"}`).
+  - `policy` (`string?`) how to answer the agent's permission requests:
+    "allow" runs unattended, "deny" refuses each call and lets the turn
+    continue, "cancel" refuses the whole turn. Defaults to "deny".
+
+**Returns:** ([`Client?`](#maki-acp-Client), `string?`) The client, plus an error message on failure.
+
+**Example:**
+
+```lua
+local client, err = maki.acp.client({ cmd = "opencode", args = { "acp" }, policy = "allow" })
+if err then error(err) end
+```
+
+
+## maki.acp.Client {#maki-acp-Client}
+
+A live ACP agent process, started with `maki.acp.client()`. Sessions
+opened with `:new_session()` share it. Dropping the last reference
+kills the process.
+
+---
+
+### `Client:new_session()` {#Client-new_session}
+
+```lua
+Client:new_session({opts?})
+```
+
+Open a conversation in {client}'s process. Independent sessions share the
+process but nothing else.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields:
+  - `cwd` (`string?`) absolute working directory for the session. Defaults
+    to maki's working directory.
+
+**Returns:** ([`Session?`](#maki-acp-Session), `string?`) The new session, plus an error message on failure.
+
+**Example:**
+
+```lua
+local session, err = client:new_session()
+if err then error(err) end
+```
+
+---
+
+### `Client:info()` {#Client-info}
+
+```lua
+Client:info()
+```
+
+The agent's name and version from the `initialize` handshake.
+
+**Returns:** (`table`) `{ name = string?, version = string? }`.
+
+**Example:**
+
+```lua
+local info = client:info()
+```
+
+
+## maki.acp.Session {#maki-acp-Session}
+
+A conversation in an ACP agent process. Send messages with `:prompt()`,
+cancel the running turn with `:cancel()`. The session remembers previous
+turns, so you can hold a conversation. Dropping it ends it.
+
+---
+
+### `Session:prompt()` {#Session-prompt}
+
+```lua
+Session:prompt({text}, {opts?})
+```
+
+Send one message and wait out the turn. The result carries the agent's
+final text and why the turn ended. Updates stream to {opts.on_update} as
+they arrive, as wire-shaped tables (`sessionUpdate` names the kind).
+
+**Parameters:**
+
+- `{text}` (`string`) The user message for the agent.
+- `{opts?}` (`table?`) Optional fields:
+  - `on_update` (`function?`) called with each `session/update` table. Must
+    not yield.
+
+**Returns:** (`table?`, `string?`) `{ text = string, stop_reason = string }` (
+  "end_turn", "max_tokens", "refusal", or "cancelled"), plus an error
+  message on failure.
+
+**Example:**
+
+```lua
+local result, err = session:prompt("Fix the failing test in foo.rs", {
+  on_update = function(update)
+    if update.sessionUpdate == "tool_call" then print(update.title) end
+  end,
+})
+if err then error(err) end
+print(result.text)
+```
+
+---
+
+### `Session:set_config()` {#Session-set_config}
+
+```lua
+Session:set_config({config_id}, {value_id})
+```
+
+Pick a `select` config option the agent offered on {session.new_session}
+(e.g. `("model", "opencode/grok-code")`).
+
+**Parameters:**
+
+- `{config_id}` (`string`) The option id from the session's config options.
+- `{value_id}` (`string`) The option value id to select.
+
+**Returns:** (`boolean?`, `string?`) True on success, plus an error message on failure.
+
+**Example:**
+
+```lua
+local ok, err = session:set_config("model", "opencode/grok-code")
+```
+
+---
+
+### `Session:set_mode()` {#Session-set_mode}
+
+```lua
+Session:set_mode({mode})
+```
+
+Switch the session mode the agent advertised (e.g. "build" or "plan").
+
+**Parameters:**
+
+- `{mode}` (`string`) The mode id.
+
+**Returns:** (`boolean?`, `string?`) True on success, plus an error message on failure.
+
+**Example:**
+
+```lua
+local ok, err = session:set_mode("plan")
+```
+
+---
+
+### `Session:cancel()` {#Session-cancel}
+
+```lua
+Session:cancel()
+```
+
+Ask the agent to abort the running turn. The parked {session.prompt} then
+returns with `stop_reason = "cancelled"`, not an error.
+
+**Example:**
+
+```lua
+session:cancel()
+```
+
+
 ## maki.agent {#maki-agent}
 
 Subagent primitives for plugins that need to talk to an LLM.
@@ -1605,7 +1819,7 @@ session, so opening one fails with "session not live". The
     setting if omitted, and is capped at it otherwise.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
 
-**Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
+**Returns:** ([`Session?`](#maki-acp-Session), `string?`) Session handle, or `(nil, err)` on failure.
 
 **Example:**
 
@@ -3198,7 +3412,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{pattern}` (`string`) Regular expression to search for.
-- `{opts?}` (`table?`) `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
+- `{opts?}` (`table?`) `base` (string): the directory a relative `path` is relative to. `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
 
 **Returns:** (`table?`, `string?`) Array of `{path, groups}` tables, or nil plus an error message.
 

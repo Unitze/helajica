@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -114,6 +114,9 @@ pub struct AgentParams {
     /// inherit it, or a monitor could get around the block by starting one.
     pub background_for: Option<MakiId>,
     pub task_id: Option<Arc<str>>,
+    /// The session's working directory, when it is not the process's. Relative
+    /// tool paths resolve against it; see [`ToolContext::cwd`].
+    pub cwd: Option<Arc<PathBuf>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
@@ -182,6 +185,7 @@ pub struct Agent<'h> {
     workflow: bool,
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
+    cwd: Option<Arc<PathBuf>>,
     model_sync: Option<Arc<ArcSwap<ModelSlot>>>,
     stop_continuations: u32,
 }
@@ -228,6 +232,7 @@ impl<'h> Agent<'h> {
             workflow: false,
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
+            cwd: params.cwd,
             model_sync: None,
             stop_continuations: 0,
         }
@@ -959,6 +964,7 @@ impl<'h> Agent<'h> {
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            cwd: self.cwd.clone(),
         }
     }
 
@@ -1148,7 +1154,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -1362,7 +1368,7 @@ mod tests {
         }
     }
 
-    fn make_agent(
+    pub(crate) fn make_agent(
         provider: impl Provider + 'static,
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
@@ -1396,6 +1402,7 @@ mod tests {
                 session_id: None,
                 background_for: None,
                 task_id: None,
+                cwd: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
                 file_access: FileAccess::fresh(),
@@ -1418,7 +1425,7 @@ mod tests {
         (agent, event_rx)
     }
 
-    fn default_input() -> AgentInput {
+    pub(crate) fn default_input() -> AgentInput {
         AgentInput {
             message: "hello".into(),
             mode: AgentMode::Build,
@@ -1792,7 +1799,7 @@ mod tests {
         events.iter().any(|e| predicate(&e.event))
     }
 
-    fn has_interrupt_in_history(history: &[Message]) -> bool {
+    pub(crate) fn has_interrupt_in_history(history: &[Message]) -> bool {
         history.iter().any(|m| {
             m.content.iter().any(
                 |b| matches!(b, ContentBlock::Text { text } if text.contains("<user-interrupt>")),
@@ -1800,7 +1807,58 @@ mod tests {
         })
     }
 
-    fn tool_call_response(tool_name: &str, tool_id: &str) -> StreamResponse {
+    /// A provider with one scripted turn, for tests outside this module.
+    pub(crate) struct ScriptedProvider(MockProvider);
+
+    impl ScriptedProvider {
+        pub(crate) fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
+            Self(MockProvider::new(
+                responses
+                    .into_iter()
+                    .map(|response| response.unwrap_or_else(|e| panic!("{e}")))
+                    .collect(),
+            ))
+        }
+    }
+
+    impl Provider for ScriptedProvider {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            messages: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            event_tx: &'a flume::Sender<maki_providers::ProviderEvent>,
+            opts: RequestOptions,
+            session: Option<&'a maki_storage::id::SessionRef>,
+        ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.0
+                .stream_message(model, messages, system, tools, event_tx, opts, session)
+        }
+
+        fn list_models(
+            &self,
+        ) -> maki_providers::provider::BoxFuture<
+            '_,
+            Result<Vec<maki_providers::ModelInfo>, AgentError>,
+        > {
+            self.0.list_models()
+        }
+    }
+
+    pub(crate) fn end_turn(text: &'static str) -> Result<StreamResponse, AgentError> {
+        Ok(StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+                ..Default::default()
+            },
+            stop_reason: Some(StopReason::EndTurn),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn tool_call_response(tool_name: &str, tool_id: &str) -> StreamResponse {
         StreamResponse {
             message: Message {
                 role: Role::Assistant,

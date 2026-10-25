@@ -580,6 +580,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd.clone(),
+        working_dir: None,
         resumed,
         claim,
         storage,
@@ -591,6 +592,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         plugin_rules,
         project_config,
         local_tools: Default::default(),
+        persist_on_start: false,
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -698,9 +700,8 @@ pub fn run(params: SdkParams) -> Result<()> {
                     defaults,
                     InputSource::Headless,
                 );
-                if handle.input_tx.send(input).is_err() {
-                    break;
-                }
+                handle.interrupt.push(input);
+                handle.interrupt.wake();
             }
             "control_request" => {
                 let Some(cr) =
@@ -752,12 +753,12 @@ pub fn run(params: SdkParams) -> Result<()> {
     shared.lock().unwrap().permissions.close();
 
     let InteractiveHandle {
-        input_tx,
+        interrupt,
         task,
         session_id,
         ..
     } = handle;
-    drop(input_tx);
+    drop(interrupt);
     smol::block_on(async {
         // Unbounded: the pump ends at the stream marker, which the session
         // emits once it has answered every prompt stdin queued.

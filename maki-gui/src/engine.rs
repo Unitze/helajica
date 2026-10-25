@@ -13,19 +13,21 @@ use maki_storage::sessions::{SessionSummary, StoredThinking};
 use serde_json::Value;
 
 pub trait Engine: Send + Sync + 'static {
-    /// Starts a session in `project`, fresh or `resume`. Sessions of one
-    /// project run side by side on one stack; opening another project closes
-    /// them all, as the agent reads the process cwd. Blocks while plugins load.
+    /// Starts a session in `project`, fresh or `resume`. Each project keeps its
+    /// own stack, so sessions of several projects run side by side, and each
+    /// session works in its project's folder. Blocks while plugins load.
     fn open(&self, project: &Path, resume: Option<String>) -> Result<Session>;
 
-    /// Closes every session and drops the stack, so the next
-    /// [`Engine::open`] builds it again with changed providers or plugins.
-    fn reload(&self);
+    /// Closes `project`'s sessions and drops its stack, so the next
+    /// [`Engine::open`] there builds it again with changed providers or
+    /// plugins. Other projects keep running. `None` closes every project.
+    fn reload(&self, project: Option<&Path>);
 
     fn sessions(&self, project: &Path) -> Vec<SessionSummary>;
 
-    /// Deletes a saved session, closing it first if it is the open one.
-    fn delete_session(&self, id: &str) -> Result<()>;
+    /// Deletes a saved session of `project`, closing it first if it is open.
+    /// The id alone does not say which project's log to delete.
+    fn delete_session(&self, project: &Path, id: &str) -> Result<()>;
 
     /// Records the user's trust in `project`, so its `.maki` config, plugins
     /// and GUI extensions load on the next [`Engine::open`].

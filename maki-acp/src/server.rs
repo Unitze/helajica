@@ -424,6 +424,7 @@ fn start_session(
         excluded_tools,
         mcp_handle: mcp.clone(),
         initial_wd: cwd.clone(),
+        working_dir: None,
         resumed,
         claim: claim.clone(),
         storage: params.storage.clone(),
@@ -435,6 +436,7 @@ fn start_session(
         plugin_rules: Arc::clone(&params.plugin_rules),
         project_config,
         local_tools,
+        persist_on_start: false,
     });
     let session_ref = handle.session_id.clone();
     start_event_pump(
@@ -706,17 +708,14 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     );
 
     // One outstanding id per session, checked and set under the same guard:
-    // `input_tx` is unbounded, so a second prompt would queue happily and
-    // overwrite the first id, leaving that request unanswered forever.
+    // the queue takes any number of prompts, so a second one would queue
+    // happily and overwrite the first id, leaving it unanswered forever.
     let mut pending = session.pending.lock().unwrap();
     if pending.prompt.is_some() {
         return Err(AcpError::new(-32603, "a prompt is already running"));
     }
-    session
-        .handle
-        .input_tx
-        .send(input)
-        .map_err(|_| AcpError::new(-32603, "session ended"))?;
+    session.handle.interrupt.push(input);
+    session.handle.interrupt.wake();
     pending.prompt = Some(id.clone());
     Ok(())
 }
@@ -1308,7 +1307,7 @@ mod tests {
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
-            input_tx: flume::unbounded().0,
+            interrupt: maki_agent::InterruptQueue::new(),
             answer_tx,
             cancel_tx: flume::unbounded().0,
             model_tx: flume::unbounded().0,

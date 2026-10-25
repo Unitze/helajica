@@ -5218,6 +5218,7 @@ dependencies = [
 name = "maki-agent"
 version = "0.6.5"
 dependencies = [
+ "agent-client-protocol-schema",
  "arc-swap",
  "base64 0.23.1",
  "bitflags 2.13.2",
@@ -5341,6 +5342,7 @@ dependencies = [
 name = "maki-interpreter"
 version = "0.6.5"
 dependencies = [
+ "chrono",
  "monty",
  "monty-types",
  "serde_json",

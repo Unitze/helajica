@@ -7,6 +7,9 @@ declare maki: {
   defer_fn: @checked (callback: any, ms: number) -> (any),
   notify: @checked (msg: string, level: string?, opts: any) -> (),
   set_notify_handler: @checked (handler: any) -> (),
+  acp: {
+    client: @checked (opts: any) -> (any, string?),
+  },
   agent: {
     resolve_model: @checked (ctx: any, opts: any) -> (any, string?),
     system_prompt: @checked (ctx: any, opts: any) -> (string?, string?),

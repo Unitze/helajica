@@ -381,7 +381,12 @@ impl AgentError {
             Self::Config { message } => message.clone(),
             Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
             Self::Api { status: 529, .. } => "provider is overloaded, try again later".into(),
-            Self::Api { status, .. } if *status >= 500 => format!("server error ({status})"),
+            // The body is the only place a provider says which fault it hit,
+            // so a 5xx keeps it: "server error (503)" alone leaves the user
+            // with nothing to act on.
+            Self::Api {
+                status, message, ..
+            } if *status >= 500 => full_server_error(*status, message),
             Self::Api { status: 401, .. } => {
                 "authentication failed, run `maki auth login` or check your API key".into()
             }
@@ -457,6 +462,29 @@ impl AgentError {
             _ => self.to_string(),
         }
     }
+}
+
+/// How long a server's own words may take over an error line.
+const MAX_SERVER_DETAIL: usize = 2_000;
+
+/// A 5xx with the body it came with, whole on a line and on its own lines
+/// below it. It is the server's HTML or JSON, so it is not markdown and no
+/// caller should render it as such.
+pub fn full_server_error(status: u16, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return format!("server error ({status})");
+    }
+    let mut body = body.to_owned();
+    if body.len() > MAX_SERVER_DETAIL {
+        let mut end = MAX_SERVER_DETAIL;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push_str("… (truncated)");
+    }
+    format!("server error ({status}):\n{body}")
 }
 
 impl<T> From<flume::SendError<T>> for AgentError {
@@ -668,8 +696,8 @@ mod tests {
 
     #[test_case(429, "rate limited, try again in a moment"                              ; "user_msg_429")]
     #[test_case(529, "provider is overloaded, try again later"                           ; "user_msg_529")]
-    #[test_case(500, "server error (500)"                                                 ; "user_msg_500")]
-    #[test_case(401, "authentication failed, run `maki auth login` or check your API key" ; "user_msg_401")]
+    #[test_case(500, "server error (500):\nbad input"                                     ; "user_msg_500")]
+    #[test_case(503, "server error (503):\nbad input"                                     ; "user_msg_503")]
     #[test_case(400, "API error (400): bad input"                                         ; "user_msg_400")]
     fn user_message_api(status: u16, expected: &str) {
         let err = AgentError::api(status, "bad input");
@@ -987,5 +1015,23 @@ mod tests {
             shared_projections,
             "the corpus needs errors that differ below the projection"
         );
+    }
+
+    /// The user's question is "what did the server say", so the body is kept
+    /// whole on its own lines, and a body the server sent empty is no line.
+    #[test_case("", "server error (503)" ; "empty_body")]
+    #[test_case("   ", "server error (503)" ; "blank_body")]
+    #[test_case("<html>upstream connect error</html>", "server error (503):\n<html>upstream connect error</html>" ; "html_body")]
+    #[test_case("{\"error\":{\"message\":\"overloaded\"}}", "server error (503):\n{\"error\":{\"message\":\"overloaded\"}}" ; "json_body")]
+    fn a_5xx_shows_the_body_it_came_with(body: &str, expected: &str) {
+        assert_eq!(full_server_error(503, body), expected);
+    }
+
+    #[test]
+    fn a_huge_body_is_cut_on_a_character_boundary() {
+        let body = "エ".repeat(MAX_SERVER_DETAIL);
+        let shown = full_server_error(500, &body);
+        assert!(shown.ends_with("… (truncated)"));
+        assert!(shown.len() < body.len() + 64);
     }
 }

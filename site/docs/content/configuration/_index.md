@@ -301,6 +301,16 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
 
+### `plugins.opencode`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `args` | string | `"acp"` | - | Single command line argument for the executable. `opencode` serves ACP behind `acp`. |
+| `cmd` | string | `"opencode"` | - | Executable that serves ACP (`opencode` with args `acp`). |
+| `max_concurrent` | integer | `4` | 1 | Max concurrently running OpenCode turns. |
+| `model` | string | - | - | Default model spec, resolved by OpenCode's own config (e.g. `opencode/grok-code`). Unset uses OpenCode's default. |
+| `policy` | string | `"allow"` | - | How to answer OpenCode's permission requests: 'allow' runs unattended, 'deny' refuses each call, 'cancel' refuses the whole turn. |
+
 ### `plugins.read`
 
 | Field | Type | Default | Min | Description |

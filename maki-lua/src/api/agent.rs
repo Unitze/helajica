@@ -982,6 +982,7 @@ async fn session(
             session_id: agent_ctx.session_id.clone(),
             background_for: agent_ctx.background_for,
             task_id: Some(Arc::from(cancellation.ui_id.as_str())),
+            cwd: agent_ctx.cwd.clone(),
             mailbox: None,
             timeouts: agent_ctx.timeouts,
             // Shared with the parent, not fresh: a lock that a subagent does
