@@ -1,4 +1,5 @@
 mod acp;
+#[cfg(feature = "gui")]
 mod gui;
 mod migrate;
 mod session;
@@ -253,6 +254,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Acp { model, yolo }) => {
             acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
         }
+        #[cfg(feature = "gui")]
         Some(Command::Gui { ref path }) => gui::run(&cli, path.clone())?,
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,

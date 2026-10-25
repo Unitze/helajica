@@ -20,6 +20,7 @@ const TODO_TOOL: &str = "todo_write";
 const IMAGE_CAPTION_PREFIX: &str = "[image: ";
 const TODOS_FIELD: &str = "todos";
 const TEXT_BLOCK_SEPARATOR: &str = "\n";
+
 /// Input fields that say what a call was pointed at, most telling first.
 const TARGET_FIELDS: [&str; 8] = [
     "description",
@@ -31,6 +32,14 @@ const TARGET_FIELDS: [&str; 8] = [
     "query",
     "code",
 ];
+
+fn retry_activity(attempt: u32, message: &str, delay_ms: u64) -> String {
+    if delay_ms == 0 {
+        format!("Retry {attempt}: {message}")
+    } else {
+        format!("Retry {attempt} in {}s: {message}", delay_ms.div_ceil(1000))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -348,8 +357,10 @@ impl Transcript {
                 }
                 AgentEvent::TurnComplete(_) => progress.turns += 1,
                 AgentEvent::Retry {
-                    attempt, message, ..
-                } => progress.activity = format!("Retry {attempt}: {message}"),
+                    attempt,
+                    message,
+                    delay_ms,
+                } => progress.activity = retry_activity(*attempt, message, *delay_ms),
                 AgentEvent::Done { reason, .. } => {
                     let (state, activity) = match reason {
                         DoneReason::EndTurn => (ToolStatus::Done, "Finished"),
@@ -471,8 +482,17 @@ impl Transcript {
                 self.notice_plain(message.clone(), Level::Error)
             }
             AgentEvent::Retry {
-                attempt, message, ..
-            } => self.push_notice(format!("Retry {attempt}: {message}"), Level::Warning),
+                attempt,
+                message,
+                delay_ms,
+            } => {
+                let text = retry_activity(*attempt, message, *delay_ms);
+                if text.contains('\n') {
+                    self.notice_plain(text, Level::Warning)
+                } else {
+                    self.push_notice(text, Level::Warning)
+                }
+            }
             AgentEvent::Notice { text } | AgentEvent::Steered { text, .. } => {
                 self.push_notice(text, Level::Info)
             }
@@ -780,6 +800,21 @@ mod tests {
         assert!(matches!(
             transcript.items.last(),
             Some(Item::Notice { text, level: Level::Warning }) if text == RETRY_NOTICE
+        ));
+    }
+
+    #[test]
+    fn retries_show_the_server_cooldown() {
+        let mut transcript = Transcript::default();
+        transcript.begin_turn();
+        transcript.apply(&envelope(AgentEvent::Retry {
+            attempt: 1,
+            message: "Rate limited (429)".into(),
+            delay_ms: 90_001,
+        }));
+        assert!(matches!(
+            transcript.items.last(),
+            Some(Item::Notice { text, level: Level::Warning }) if text == "Retry 1 in 91s: Rate limited (429)"
         ));
     }
 

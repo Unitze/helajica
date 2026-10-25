@@ -189,12 +189,14 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `background` | boolean | no | Run in the background and continue other work. The result arrives later in a notice. End your turn to wait for it. Background tasks cannot ask for permissions. |
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
-| `prompt` | string | yes | Detailed task prompt for the agent |
+| `background` | boolean | no | Run in the background and continue other work. The result arrives later in a notice. End your turn to wait for it. Background tasks cannot ask for permissions. |
 | `thinking` | any | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
+| `model` | string | no | Exact model spec, e.g. "ollama/glm-5.2". You tell maki the model; maki will not guess. Overrides model_tier. |
+| `output_schema` | object | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
+| `prompt` | string | yes | Detailed task prompt for the agent |
+| `effort` | string | no | Thinking effort. Omit to inherit parent; capped at parent. Use either effort or thinking, not both. |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
 
 ### `todo_write` {#todo_write}

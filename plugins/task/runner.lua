@@ -34,8 +34,8 @@ local opts = maki.api.register_options({
     desc = "Expose a `background` input that pushes subagent results to the chat when they finish.",
   },
   allow_model = {
-    default = false,
-    desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
+    default = true,
+    desc = "Expose an exact `model` input, subject to the configured model policy.",
   },
 })
 
@@ -63,6 +63,11 @@ local schema = {
     thinking = {
       description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
     },
+    effort = {
+      type = "string",
+      enum = { "off", "adaptive", "minimal", "low", "medium", "high", "xhigh", "max" },
+      description = "Thinking effort. Omit to inherit parent; capped at parent. Use either effort or thinking, not both.",
+    },
     output_schema = {
       type = "object",
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
@@ -70,8 +75,6 @@ local schema = {
   },
 }
 
--- Only advertise `model` when the plugin opts in: it costs tokens in every
--- task schema, and an off-by-default flag keeps the common path lean.
 if opts.allow_model then
   schema.properties.model = {
     type = "string",
@@ -99,6 +102,12 @@ local function bounded_errors(errors)
 end
 
 function Runner.prepare(input, ctx)
+  if input.effort ~= nil and input.thinking ~= nil then
+    return nil, "specify either effort or thinking, not both"
+  end
+  if input.model ~= nil and not opts.allow_model then
+    return nil, "exact model selection is disabled by task.allow_model"
+  end
   local subagent_type = input.subagent_type or "research"
   if subagent_type ~= "research" and subagent_type ~= "general" then
     return nil, "unknown subagent type: " .. subagent_type
@@ -177,7 +186,7 @@ function Runner.prepare(input, ctx)
       audience = audience,
       mcp = true,
       name = input.description,
-      thinking = input.thinking,
+      thinking = input.effort or input.thinking,
     },
     message = input.prompt .. (validator and STRUCTURED_OUTPUT_PROMPT_SUFFIX or ""),
     capture = capture,

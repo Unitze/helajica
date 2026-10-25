@@ -359,6 +359,9 @@ pub enum ToolInputErrorKind {
         expected: &'static [&'static str],
         got: String,
     },
+    UnknownParameter {
+        name: String,
+    },
     InternalBug {
         detail: String,
     },
@@ -415,6 +418,12 @@ impl Display for ToolInputError {
             }
             ToolInputErrorKind::InternalBug { detail } => {
                 write!(f, "internal validator bug: {detail}")
+            }
+            ToolInputErrorKind::UnknownParameter { name } => {
+                write!(
+                    f,
+                    "unknown parameter '{name}'. Use the tool's declared parameters"
+                )
             }
         }
     }
@@ -586,8 +595,11 @@ fn validate_object(
             None => {}
         }
     }
-    for (extra_key, _) in map {
-        warn!(path = %path, key = %extra_key, "dropped unknown tool parameter");
+    if let Some((name, _)) = map.into_iter().next() {
+        return Err(ToolInputError::at(
+            path,
+            ToolInputErrorKind::UnknownParameter { name },
+        ));
     }
     Ok(Value::Object(out))
 }
@@ -1055,13 +1067,17 @@ mod tests {
     }
 
     #[test]
-    fn extra_keys_dropped() {
+    fn extra_keys_return_an_actionable_error() {
         const SCHEMA: ParamSchema = ParamSchema::Object {
             properties: &[("name", &STR_PRIM, true, &[])],
             description: "",
         };
-        let out = validate(&SCHEMA, json!({"name": "x", "extra": 42})).unwrap();
-        assert!(out.get("extra").is_none());
+        let error = validate(&SCHEMA, json!({"name": "x", "extra": 42})).unwrap_err();
+        assert!(matches!(
+            error.kind,
+            ToolInputErrorKind::UnknownParameter { .. }
+        ));
+        assert!(error.to_string().contains("unknown parameter 'extra'"));
     }
 
     #[test_case(ParamKind::String,  json!("hello"), json!(42)    ; "string_accepts_string_rejects_int")]

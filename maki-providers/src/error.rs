@@ -384,7 +384,11 @@ impl AgentError {
         }
         match self {
             Self::Config { message } => message.clone(),
-            Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
+            Self::Api {
+                status: 429,
+                message,
+                retry_after,
+            } => rate_limit_message(message, *retry_after),
             Self::Api { status: 529, .. } => "provider is overloaded, try again later".into(),
             // The body is the only place a provider says which fault it hit,
             // so a 5xx keeps it: "server error (503)" alone leaves the user
@@ -461,7 +465,11 @@ impl AgentError {
             return error.message;
         }
         match self {
-            Self::Api { status: 429, .. } => "Rate limited".into(),
+            Self::Api {
+                status: 429,
+                message,
+                retry_after,
+            } => rate_limit_message(message, *retry_after),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
             Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
             Self::Http(e) if e.is_timeout() => REQUEST_TIMEOUT_MESSAGE.into(),
@@ -480,9 +488,21 @@ const MAX_SERVER_DETAIL: usize = 2_000;
 /// below it. It is the server's HTML or JSON, so it is not markdown and no
 /// caller should render it as such.
 pub fn full_server_error(status: u16, body: &str) -> String {
+    full_api_error("server error", status, body)
+}
+
+fn rate_limit_message(body: &str, retry_after: Option<Duration>) -> String {
+    let mut message = full_api_error("Rate limited", 429, body);
+    if let Some(after) = retry_after {
+        message.push_str(&format!("\nRetry-After: {} seconds. Automatic retries respect the configured wait and attempt limits.", after.as_secs()));
+    }
+    message
+}
+
+fn full_api_error(label: &str, status: u16, body: &str) -> String {
     let body = body.trim();
     if body.is_empty() {
-        return format!("server error ({status})");
+        return format!("{label} ({status})");
     }
     let mut body = body.to_owned();
     if body.len() > MAX_SERVER_DETAIL {
@@ -493,7 +513,7 @@ pub fn full_server_error(status: u16, body: &str) -> String {
         body.truncate(end);
         body.push_str("… (truncated)");
     }
-    format!("server error ({status}):\n{body}")
+    format!("{label} ({status}):\n{body}")
 }
 
 impl<T> From<flume::SendError<T>> for AgentError {
@@ -555,7 +575,7 @@ mod tests {
 
     const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
     const MODEL_MESSAGE: &str = "Your trial has ended.";
-    const RATE_LIMITED_RETRY_MESSAGE: &str = "Rate limited";
+    const RATE_LIMITED_RETRY_MESSAGE: &str = "Rate limited (429)";
     /// More rounds than any bounded budget allows, so a budget that survives
     /// all of them is the unbounded one.
     const ROUNDS: u32 = (DEFAULT_MAX_RETRIES + DEFAULT_MAX_TIMEOUT_RETRIES) * 2;
@@ -689,7 +709,8 @@ mod tests {
 
         assert!(err.is_retryable());
         assert!(err.should_rotate_key());
-        assert_eq!(err.retry_message(), RATE_LIMITED_RETRY_MESSAGE);
+        assert!(err.retry_message().starts_with(RATE_LIMITED_RETRY_MESSAGE));
+        assert!(err.retry_message().contains(body));
     }
 
     #[test_case(429, RATE_LIMITED_RETRY_MESSAGE ; "rate_limited")]
@@ -699,7 +720,7 @@ mod tests {
         assert_eq!(api(status).retry_message(), expected);
     }
 
-    #[test_case(429, "rate limited, try again in a moment"                              ; "user_msg_429")]
+    #[test_case(429, "Rate limited (429):\nbad input"                                  ; "user_msg_429")]
     #[test_case(529, "provider is overloaded, try again later"                           ; "user_msg_529")]
     #[test_case(500, "server error (500):\nbad input"                                     ; "user_msg_500")]
     #[test_case(503, "server error (503):\nbad input"                                     ; "user_msg_503")]
@@ -707,6 +728,21 @@ mod tests {
     fn user_message_api(status: u16, expected: &str) {
         let err = AgentError::api(status, "bad input");
         assert_eq!(err.user_message(), expected);
+    }
+
+    #[test]
+    fn rate_limit_keeps_the_body_and_server_cooldown() {
+        const BODY: &str =
+            r#"{"error":{"message":"Request budget exhausted","type":"rate_limit_error"}}"#;
+        let error = AgentError::from_parts(
+            429,
+            |name| (name == RETRY_AFTER_HEADER).then_some("26293"),
+            BODY.into(),
+        );
+        for message in [error.user_message(), error.retry_message()] {
+            assert!(message.contains(BODY));
+            assert!(message.contains("Retry-After: 26293 seconds"));
+        }
     }
 
     #[test_case(429, RetryKind::RateLimit ; "rate_limit")]
@@ -752,15 +788,15 @@ mod tests {
     #[test_case(HttpErrorKind::ConnectionFailed, DEFAULT_MAX_RETRIES ; "a_refused_connection_gives_up")]
     #[test_case(HttpErrorKind::Timeout, DEFAULT_MAX_TIMEOUT_RETRIES ; "an_http_timeout_gives_up")]
     #[test_case(HttpErrorKind::NameResolution, DEFAULT_MAX_RETRIES   ; "an_unresolvable_host_gives_up")]
-    #[test_case(HttpErrorKind::Io, ROUNDS                            ; "a_read_error_keeps_retrying")]
-    #[test_case(HttpErrorKind::TlsEngine, ROUNDS                     ; "a_tls_failure_keeps_retrying")]
+    #[test_case(HttpErrorKind::Io, DEFAULT_MAX_RETRIES                ; "a_read_error_is_bounded")]
+    #[test_case(HttpErrorKind::TlsEngine, DEFAULT_MAX_RETRIES         ; "a_tls_failure_is_bounded")]
     fn a_transport_failure_is_waited_out_only_once_connected(kind: HttpErrorKind, expected: u32) {
         assert_eq!(retries_granted(&AgentError::Http(kind.into())), expected);
     }
 
     #[test_case(io::ErrorKind::ConnectionRefused, DEFAULT_MAX_RETRIES ; "a_refused_socket_gives_up")]
     #[test_case(io::ErrorKind::TimedOut, DEFAULT_MAX_TIMEOUT_RETRIES ; "an_io_timeout_gives_up")]
-    #[test_case(io::ErrorKind::UnexpectedEof, ROUNDS                  ; "a_truncated_read_keeps_retrying")]
+    #[test_case(io::ErrorKind::UnexpectedEof, DEFAULT_MAX_RETRIES     ; "a_truncated_read_is_bounded")]
     fn an_io_failure_gives_up_when_nothing_is_listening(kind: io::ErrorKind, expected: u32) {
         assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
     }

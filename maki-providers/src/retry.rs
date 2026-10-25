@@ -2,16 +2,9 @@ use std::time::Duration;
 
 use maki_config::{
     DEFAULT_MAX_RETRIES, DEFAULT_MAX_TIMEOUT_RETRIES, DEFAULT_RETRY_BASE_MS, DEFAULT_RETRY_MAX_MS,
-    ProviderConfig,
+    DEFAULT_RETRY_MAX_WAIT_SECS, ProviderConfig,
 };
 use tracing::warn;
-
-/// Ceiling for a server sent `Retry-After`. Generous, because the whole point
-/// of obeying the header is to sit out a window only the server knows the
-/// length of, but `Retry-After: 86400` is a real thing servers send and parking
-/// a headless or acp turn for a day with nobody around to press esc is not an
-/// option.
-const RETRY_AFTER_CAP: Duration = Duration::from_secs(60 * 60);
 
 /// What kind of failure a retry is paying for. The ways out of here are not
 /// the same: some errors say "the provider is having a bad day", one says "you
@@ -36,12 +29,9 @@ pub enum RetryKind {
 /// Which counter a failure draws from, and whether that counter has a ceiling.
 #[derive(Debug, Clone, Copy)]
 enum Budget {
-    /// Unbounded: a provider outage can outlast any attempt count, and an agent
-    /// left running overnight should still be there in the morning.
+    /// Server errors and interrupted connections.
     Transient,
-    /// Unbounded: the server named the moment to come back, so waiting it out
-    /// is what it asked for. Anthropic's Claude Code workspace limits arrive
-    /// this way and clear on their own.
+    /// A server-directed cooldown, counted separately from unhinted limits.
     HintedRateLimit,
     /// Bounded: a 429 with no `Retry-After` is how a spend cap reads, and that
     /// one does not clear until the next billing period, so retrying is
@@ -72,11 +62,12 @@ impl Budget {
         }
     }
 
-    fn limit(self, policy: &RetryPolicy) -> Option<u32> {
+    fn limit(self, policy: &RetryPolicy) -> u32 {
         match self {
-            Self::Transient | Self::HintedRateLimit => None,
-            Self::RateLimit | Self::Connect => Some(policy.max_retries),
-            Self::Timeout => Some(policy.max_timeout_retries),
+            Self::Transient | Self::HintedRateLimit | Self::RateLimit | Self::Connect => {
+                policy.max_retries
+            }
+            Self::Timeout => policy.max_timeout_retries,
         }
     }
 }
@@ -88,9 +79,8 @@ impl Budget {
 pub struct RetryPolicy {
     pub base_delay: Duration,
     pub max_delay: Duration,
-    /// Budget for rate limits the server gave no `Retry-After` for, and,
-    /// counted separately, for connections that were never established. `0`
-    /// never retries either.
+    pub max_wait: Duration,
+    /// Retry budget per failure kind. `0` disables automatic retries.
     pub max_retries: u32,
     pub max_timeout_retries: u32,
 }
@@ -100,6 +90,7 @@ impl Default for RetryPolicy {
         Self {
             base_delay: Duration::from_millis(DEFAULT_RETRY_BASE_MS),
             max_delay: Duration::from_millis(DEFAULT_RETRY_MAX_MS),
+            max_wait: Duration::from_secs(DEFAULT_RETRY_MAX_WAIT_SECS),
             max_retries: DEFAULT_MAX_RETRIES,
             max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
         }
@@ -111,6 +102,7 @@ impl From<&ProviderConfig> for RetryPolicy {
         Self {
             base_delay: Duration::from_millis(config.retry_base_ms),
             max_delay: Duration::from_millis(config.retry_max_ms),
+            max_wait: Duration::from_secs(config.retry_max_wait_secs),
             max_retries: config.max_retries,
             max_timeout_retries: config.max_timeout_retries,
         }
@@ -160,38 +152,29 @@ impl RetryState {
     /// Budgets never touch: a flaky connection that burns its whole budget must
     /// not leave a later rate limit with nothing left to spend. `hint` is a
     /// `Retry-After` the server sent, and it knows its own window better than
-    /// we do, within [`RetryPolicy::base_delay`] and [`RETRY_AFTER_CAP`].
+    /// we do. Waits above [`RetryPolicy::max_wait`] return the original error.
     pub fn next_delay(&mut self, kind: RetryKind, hint: Option<Duration>) -> Option<Duration> {
+        if hint.is_some_and(|after| after > self.policy.max_wait) {
+            warn!(
+                retry_after_ms = hint.map(|after| after.as_millis() as u64),
+                max_wait_ms = self.policy.max_wait.as_millis() as u64,
+                "server retry delay exceeds automatic wait limit; preserving error"
+            );
+            return None;
+        }
         let budget = Budget::of(kind, hint);
         let spent = &mut self.spent[budget as usize];
-        if budget
-            .limit(&self.policy)
-            .is_some_and(|limit| *spent >= limit)
-        {
+        if *spent >= budget.limit(&self.policy) {
             return None;
         }
         *spent += 1;
         let attempt = *spent;
 
-        // The hint is obeyed for any retryable error, not only a 429, so a 503
-        // carrying `Retry-After: 3600` parks an unbounded retry for up to
-        // `RETRY_AFTER_CAP`. The server named the moment to come back, and Esc
-        // ends the wait, so we take it at its word.
         let Some(after) = hint else {
-            return Some(self.backoff(attempt));
+            let delay = self.backoff(attempt);
+            return (delay <= self.policy.max_wait).then_some(delay);
         };
-        if after > RETRY_AFTER_CAP {
-            warn!(
-                retry_after_ms = after.as_millis() as u64,
-                cap_ms = RETRY_AFTER_CAP.as_millis() as u64,
-                "Retry-After above cap, trimming"
-            );
-        }
-        // The floor matters as much as the cap: this budget is unbounded, and a
-        // server answering `Retry-After: 1` forever would otherwise become a
-        // one-request-per-second hammer on the rate limiter that is already
-        // saying no.
-        Some(after.clamp(self.policy.base_delay.min(RETRY_AFTER_CAP), RETRY_AFTER_CAP))
+        Some(after.max(self.policy.base_delay.min(self.policy.max_wait)))
     }
 
     /// Half the backoff, plus jitter on top, so a fleet of clients knocked back
@@ -230,6 +213,7 @@ mod tests {
                 max_delay: MAX,
                 max_retries,
                 max_timeout_retries,
+                ..RetryPolicy::default()
             },
             ONE_KEY,
         )
@@ -253,7 +237,8 @@ mod tests {
     #[test_case(0, RetryKind::RateLimit, 0    ; "zero_budget_never_retries_an_unhinted_rate_limit")]
     #[test_case(2, RetryKind::RateLimit, 2    ; "an_unhinted_rate_limit_stops_at_its_budget")]
     #[test_case(2, RetryKind::Timeout, 3      ; "timeouts_have_their_own_budget")]
-    #[test_case(0, RetryKind::Transient, MANY ; "a_5xx_outlives_every_budget")]
+    #[test_case(0, RetryKind::Transient, 0 ; "zero_budget_stops_server_errors")]
+    #[test_case(2, RetryKind::Transient, 2 ; "server_errors_stop_at_the_budget")]
     #[test_case(0, RetryKind::Connect, 0      ; "zero_budget_never_retries_a_refused_connection")]
     #[test_case(2, RetryKind::Connect, 2      ; "a_refused_connection_stops_at_its_budget")]
     fn budget_is_spent_then_exhausted(max_retries: u32, kind: RetryKind, expected: u32) {
@@ -268,20 +253,31 @@ mod tests {
         assert_eq!(spend(&mut state, RetryKind::RateLimit), 2);
     }
 
-    /// A hinted 429 is unbounded and must not spend the budget kept for the
-    /// unhinted kind, which is the one that means "out of money".
+    #[test_case(RetryKind::RateLimit ; "rate_limit")]
+    #[test_case(RetryKind::Transient ; "server_error")]
+    fn long_server_cooldowns_stop_without_retrying_early(kind: RetryKind) {
+        let mut state = state(2, 3);
+        let hint = Some(Duration::from_secs(DEFAULT_RETRY_MAX_WAIT_SECS + 1));
+        assert_eq!(state.next_delay(kind, hint), None);
+        assert!(
+            state
+                .next_delay(kind, Some(Duration::from_secs(5)))
+                .is_some()
+        );
+    }
+
     #[test]
     fn a_hinted_rate_limit_leaves_the_unhinted_budget_alone() {
         let mut state = state(2, 3);
         let hint = Some(Duration::from_secs(5));
-        for _ in 0..MANY {
+        for _ in 0..2 {
             assert!(state.next_delay(RetryKind::RateLimit, hint).is_some());
         }
+        assert!(state.next_delay(RetryKind::RateLimit, hint).is_none());
         assert_eq!(spend(&mut state, RetryKind::RateLimit), 2);
     }
 
     #[test_case(Duration::from_secs(5), Duration::from_secs(5)  ; "sane_hint_beats_the_guess")]
-    #[test_case(Duration::from_secs(86_400), RETRY_AFTER_CAP    ; "absurd_hint_is_trimmed")]
     // An unbounded budget plus a zero or near-zero hint is a tight loop against
     // a rate limiter, so the floor is load bearing, not decoration.
     #[test_case(Duration::ZERO, BASE                            ; "zero_hint_is_raised_to_the_base_delay")]
@@ -298,7 +294,7 @@ mod tests {
     fn a_base_delay_above_the_cap_still_clamps() {
         let mut state = RetryState::new(
             RetryPolicy {
-                base_delay: RETRY_AFTER_CAP * 2,
+                base_delay: Duration::from_secs(DEFAULT_RETRY_MAX_WAIT_SECS * 2),
                 ..RetryPolicy::default()
             },
             ONE_KEY,
@@ -306,7 +302,7 @@ mod tests {
         let hint = Some(Duration::from_secs(1));
         assert_eq!(
             state.next_delay(RetryKind::RateLimit, hint),
-            Some(RETRY_AFTER_CAP)
+            Some(Duration::from_secs(DEFAULT_RETRY_MAX_WAIT_SECS))
         );
     }
 
@@ -341,6 +337,7 @@ mod tests {
                 max_delay: MAX,
                 max_retries: RETRIES,
                 max_timeout_retries: RETRIES,
+                ..RetryPolicy::default()
             },
             KEYS,
         );

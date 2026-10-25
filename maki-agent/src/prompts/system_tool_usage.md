@@ -7,3 +7,5 @@
 - Keep results focused, but do not save a few output tokens by adding extra tool round trips. Run checks appropriate to the change; repeat them after relevant changes or failures.
 - Read files before editing them. Match surrounding context, conventions, and imports.
 - Prefer edits over full file writes.
+- If the same failure or edit recurs without progress, summarize the hypothesis and evidence, then choose one check that distinguishes the remaining causes. Change the approach instead of repeating the same action. Expand validation only for a concrete unresolved risk.
+- During long tasks, retain a short record of requirements, changed files, failed hypotheses and verification results. Retrieve focused source and failure details rather than repeatedly loading whole files or successful test output.

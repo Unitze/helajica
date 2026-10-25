@@ -12,6 +12,10 @@ keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version.workspace = true
 
+[features]
+default = ["gui"]
+gui = ["dep:maki-gui"]
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
 
@@ -22,13 +26,14 @@ path = "src/main.rs"
 [[bin]]
 name = "helajica"
 path = "src/desktop.rs"
+required-features = ["gui"]
 
 [lints]
 workspace = true
 
 [dependencies]
 maki-ui = { workspace = true }
-maki-gui = { workspace = true }
+maki-gui = { workspace = true, optional = true }
 maki-agent = { workspace = true }
 maki-acp = { workspace = true }
 maki-config = { workspace = true }
@@ -226,8 +231,16 @@ gpui-kit = "0.8"
 [profile.bench]
 debug = true
 
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.test]
+debug = false
+incremental = false
+
 # Dev rebuilds are linker bound, and debug info is most of what the linker
-# chews through. Our crates keep theirs so a debugger still works, the 600
+# chews through. Our crates keep line information, the 600
 # dependencies do not need any.
 [profile.dev.package."*"]
 debug = false

@@ -462,9 +462,8 @@ fn thinking_forwards_to_session(thinking: Option<Value>) {
 
 #[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {
-    let mut opts = serde_json::Map::new();
-    opts.insert("allow_model".into(), json!(true));
-    let (reg, _host) = load_task_host_with_opts(opts);
+    let (reg, _host) = load_task_host();
+    assert!(reg.get(TASK_TOOL).unwrap().tool.schema()["properties"]["model"].is_object());
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
     let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
@@ -482,21 +481,52 @@ fn model_spec_forwards_full_spec_to_resolve_model() {
 }
 
 #[test]
-fn model_spec_ignored_when_allow_model_off() {
-    let (reg, _host) = load_task_host();
+fn model_spec_rejected_when_allow_model_off() {
+    let mut opts = serde_json::Map::new();
+    opts.insert("allow_model".into(), json!(false));
+    let (reg, _host) = load_task_host_with_opts(opts);
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
-    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
-    assert_eq!(out, PLAIN_TEXT);
+    let error = reg
+        .get(TASK_TOOL)
+        .unwrap()
+        .tool
+        .parse(&input)
+        .err()
+        .expect("disabled model must not be silently ignored");
+    assert!(error.to_string().contains("unknown parameter 'model'"));
+    assert_eq!(probe(&reg)["sessions"], 0);
+}
 
+#[test_case::test_case(false ; "blocking")]
+#[test_case::test_case(true ; "background")]
+fn explicit_effort_reaches_the_subagent_session(background: bool) {
+    let (reg, _host) = load_task_host();
+    assert!(reg.get(TASK_TOOL).unwrap().tool.schema()["properties"]["effort"].is_object());
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["effort"] = json!("high");
+    input["model"] = json!(FULL_MODEL_SPEC);
+    input["background"] = json!(background);
+    let session = SessionRef::generate();
+    let ctx = session_ctx(&session);
+    exec_tool_with_ctx(&reg, TASK_TOOL, input, &ctx).expect("explicit selection failed");
+    if background {
+        wait(&reg, json!({"notices": 1}));
+    }
     let snap = probe(&reg);
-    let opts = snap["resolve_opts"]
-        .as_object()
-        .expect("resolve_opts missing");
-    assert!(
-        opts.get("spec").is_none_or(Value::is_null),
-        "spec should not be forwarded when allow_model is off"
-    );
+    assert_eq!(snap["thinking"], "high");
+    assert_eq!(snap["resolve_opts"]["spec"], FULL_MODEL_SPEC);
+}
+
+#[test]
+fn conflicting_effort_and_thinking_do_not_start_a_session() {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["thinking"] = json!("low");
+    input["effort"] = json!("high");
+    let error = exec_tool(&reg, TASK_TOOL, input).expect_err("conflicting settings must fail");
+    assert!(error.contains("either effort or thinking"));
+    assert_eq!(probe(&reg)["sessions"], 0);
 }
 
 fn answer_schema() -> Value {

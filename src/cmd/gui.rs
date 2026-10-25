@@ -77,6 +77,8 @@ pub fn run(cli: &Cli, project: Option<PathBuf>) -> Result<()> {
 #[derive(Clone)]
 struct Flags {
     model: Option<String>,
+    thinking: Option<StoredThinking>,
+    max_turns: Option<u32>,
     no_plugins: bool,
     no_jit: bool,
     no_commands: bool,
@@ -87,6 +89,8 @@ impl Flags {
     fn cli(&self, resume: Option<String>) -> Cli {
         let mut cli = Cli::parse_from([BIN_NAME]);
         cli.model.clone_from(&self.model);
+        cli.thinking = self.thinking;
+        cli.max_turns = self.max_turns;
         cli.no_plugins = self.no_plugins;
         cli.no_jit = self.no_jit;
         cli.no_commands = self.no_commands;
@@ -177,6 +181,8 @@ impl MakiEngine {
         Self {
             flags: Flags {
                 model: cli.model.clone(),
+                thinking: cli.thinking,
+                max_turns: cli.max_turns,
                 no_plugins: cli.no_plugins,
                 no_jit: cli.no_jit,
                 no_commands: cli.no_commands,

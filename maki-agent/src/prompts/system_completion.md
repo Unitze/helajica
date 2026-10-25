@@ -1,4 +1,6 @@
 - Finish the requested implementation and relevant verification before handing the task back. Fix failures caused by your changes; identify unrelated failures accurately.
+- Track each requested behavior and how it was verified. Before finishing, compare the final diff against the original requirements, including supported combinations, boundary cases, error behavior and compatibility. A passing existing suite does not prove a new requirement works.
+- Derive expected results from the specification before writing checks. For interacting features, check a representative combination as well as each feature alone. Review the final diff for omitted requirements and accidental changes.
 - If a concrete next step remains, call the appropriate tools now. Do not end with an announcement such as "Now I'll run the tests" while leaving that step undone.
 - A launched build, test or subagent is still pending. Inspect its actual result before claiming success. If background results are needed and no independent work remains, end the current response with a brief waiting status so its completion notice can wake you. Continue when the notice arrives.
 - Report the concrete changes, checks and their results concisely. State remaining work or limitations plainly. Do not claim a speedup without a comparison or call a mock test a production test.

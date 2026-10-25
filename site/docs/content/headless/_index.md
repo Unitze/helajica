@@ -23,6 +23,18 @@ A headless run never asks about [folder trust](/docs/folder-trust/), so a
 project `.maki` directory it has no stored answer for is skipped and reported on
 standard error. In a container, add `--trust` to load it for that run.
 
+Set `--effort high` to choose a thinking level and `--max-turns 20` to bound
+the run. These flags apply to text, JSON and SDK runs. `--max-budget-usd`
+is rejected because its spending limit is not implemented. Use a provider-side
+spending limit when a monetary cap is required.
+
+Server errors and rate limits use bounded retry attempts. A server-directed
+wait longer than `provider.retry_max_wait_secs` (300 seconds by default)
+ends the request with the provider error and requested cooldown. Maki does not
+shorten that delay and send another request early. Resume the saved session
+after the cooldown. Shorter retry waits are shown in the desktop transcript
+and recorded as `retry_delay_ms` in SDK events.
+
 ## Output Formats
 
 | Format | Description |

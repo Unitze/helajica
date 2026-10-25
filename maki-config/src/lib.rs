@@ -57,14 +57,11 @@ pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 
 pub const DEFAULT_RETRY_BASE_MS: u64 = 2_000;
-/// Server errors are retried for as long as they last, so this cap sets the
-/// pace of a long outage: a minute between tries is around 180 requests over
-/// three hours, where the old eight seconds would have sent around 1350.
+/// Maximum guessed backoff between bounded retry attempts.
 pub const DEFAULT_RETRY_MAX_MS: u64 = 60_000;
+pub const DEFAULT_RETRY_MAX_WAIT_SECS: u64 = 300;
 pub const DEFAULT_MAX_TIMEOUT_RETRIES: u32 = 2;
-/// Spent only on rate limits the server sent no `Retry-After` for, which is how
-/// a spend cap reads, and that one does not clear for the rest of the billing
-/// period.
+/// Retry attempts per failure kind, excluding the separate timeout budget.
 pub const DEFAULT_MAX_RETRIES: u32 = 5;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
@@ -875,6 +872,7 @@ pub struct ProviderFileConfig {
     pub stream_timeout_secs: Option<u64>,
     pub retry_base_ms: Option<u64>,
     pub retry_max_ms: Option<u64>,
+    pub retry_max_wait_secs: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_timeout_retries: Option<u32>,
 }
@@ -892,6 +890,7 @@ impl ProviderFileConfig {
             stream_timeout_secs,
             retry_base_ms,
             retry_max_ms,
+            retry_max_wait_secs,
             max_retries,
             max_timeout_retries
         );
@@ -1601,8 +1600,12 @@ pub struct ProviderConfig {
              desc = "Cap on the guessed retry backoff (milliseconds)")]
     pub retry_max_ms: u64,
 
+    #[config(key = "retry_max_wait_secs", ty = "u64", default = DEFAULT_RETRY_MAX_WAIT_SECS,
+             desc = "Maximum automatic retry wait in seconds. Longer server delays stop the request without retrying early")]
+    pub retry_max_wait_secs: u64,
+
     #[config(key = "max_retries", ty = "u32", default = DEFAULT_MAX_RETRIES,
-             desc = "Max retries on a rate limit the server sent no Retry-After for, 0 to never retry them")]
+             desc = "Max retries per failure kind for rate limits, server and connection errors, 0 to disable")]
     pub max_retries: u32,
 
     #[config(key = "max_timeout_retries", ty = "u32", default = DEFAULT_MAX_TIMEOUT_RETRIES,
@@ -1622,6 +1625,7 @@ impl Default for ProviderConfig {
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
             retry_max_ms: DEFAULT_RETRY_MAX_MS,
+            retry_max_wait_secs: DEFAULT_RETRY_MAX_WAIT_SECS,
             max_retries: DEFAULT_MAX_RETRIES,
             max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
         }
@@ -1651,6 +1655,7 @@ impl ProviderConfig {
             ),
             retry_base_ms: f.retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS),
             retry_max_ms: f.retry_max_ms.unwrap_or(DEFAULT_RETRY_MAX_MS),
+            retry_max_wait_secs: f.retry_max_wait_secs.unwrap_or(DEFAULT_RETRY_MAX_WAIT_SECS),
             max_retries: f.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             max_timeout_retries: f.max_timeout_retries.unwrap_or(DEFAULT_MAX_TIMEOUT_RETRIES),
         })
@@ -3117,6 +3122,7 @@ mod tests {
         let from_file = RawConfig::default().into_config(&[]).unwrap().provider;
         assert_eq!(from_file.max_retries, DEFAULT_MAX_RETRIES);
         assert_eq!(from_file.max_retries, ProviderConfig::default().max_retries);
+        assert_eq!(from_file.retry_max_wait_secs, DEFAULT_RETRY_MAX_WAIT_SECS);
     }
 
     #[test]
@@ -3125,6 +3131,7 @@ mod tests {
             provider: ProviderFileConfig {
                 max_retries: Some(3),
                 retry_base_ms: Some(50),
+                retry_max_wait_secs: Some(120),
                 ..Default::default()
             },
             ..Default::default()
@@ -3133,6 +3140,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider.max_retries, 3);
         assert_eq!(config.provider.retry_base_ms, 50);
+        assert_eq!(config.provider.retry_max_wait_secs, 120);
     }
 
     #[test]

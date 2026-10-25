@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::result::Result as ParseResult;
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use maki_agent::tools::{all_builtin_tool_names, is_builtin_tool};
+use maki_storage::sessions::StoredThinking;
 
 use crate::print::OutputFormat;
 
@@ -160,15 +162,12 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub betas: Option<String>,
     #[arg(long, hide = true)]
-    pub max_thinking_tokens: Option<String>,
-    #[arg(long, hide = true)]
-    pub effort: Option<String>,
-    #[arg(long, hide = true)]
     pub json_schema: Option<String>,
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_parser = reject_unenforceable_budget)]
     pub max_budget_usd: Option<String>,
-    #[arg(long, hide = true)]
-    pub thinking: Option<String>,
+    /// Thinking level (off, adaptive, minimal to max) or token budget
+    #[arg(long, visible_aliases = ["effort", "max-thinking-tokens"], value_parser = StoredThinking::parse_setting)]
+    pub thinking: Option<StoredThinking>,
     #[arg(long, hide = true)]
     pub thinking_display: Option<String>,
 
@@ -189,11 +188,7 @@ impl Cli {
             ("mcp-config", self.mcp_config.is_some()),
             ("tools", self.tools.is_some()),
             ("betas", self.betas.is_some()),
-            ("max-thinking-tokens", self.max_thinking_tokens.is_some()),
-            ("effort", self.effort.is_some()),
             ("json-schema", self.json_schema.is_some()),
-            ("max-budget-usd", self.max_budget_usd.is_some()),
-            ("thinking", self.thinking.is_some()),
             ("thinking-display", self.thinking_display.is_some()),
         ];
         for (flag, set) in &ignored {
@@ -206,6 +201,12 @@ impl Cli {
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
     }
+}
+
+fn reject_unenforceable_budget(_: &str) -> ParseResult<String, &'static str> {
+    Err(
+        "--max-budget-usd is not implemented. Use --max-turns or a provider-side spending limit instead of an unenforced cost cap",
+    )
 }
 
 #[derive(Subcommand)]
@@ -254,6 +255,7 @@ pub enum Command {
         yolo: bool,
     },
     /// Open the desktop app
+    #[cfg(feature = "gui")]
     Gui {
         /// Project folder to open right away
         path: Option<PathBuf>,
@@ -392,6 +394,30 @@ mod tests {
     use test_case::test_case;
 
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+
+    #[test_case("--thinking", "max", true ; "thinking_effort")]
+    #[test_case("--effort", "high", true ; "effort_alias")]
+    #[test_case("--max-thinking-tokens", "8192", true ; "budget_alias")]
+    #[test_case("--thinking", "typo", false ; "invalid_effort")]
+    #[test_case("--max-thinking-tokens", "0", false ; "invalid_budget")]
+    fn thinking_flags_are_parsed(flag: &str, value: &str, accepted: bool) {
+        let parsed = Cli::try_parse_from(["maki", "--print", flag, value, "hello"]);
+        assert_eq!(parsed.is_ok(), accepted);
+        if let Ok(cli) = parsed {
+            assert_eq!(
+                cli.thinking,
+                Some(StoredThinking::parse_setting(value).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn an_unenforced_cost_cap_is_rejected_before_startup() {
+        let error = Cli::try_parse_from(["maki", "--print", "--max-budget-usd", "1", "hello"])
+            .err()
+            .expect("an unsupported spending limit must fail before model calls");
+        assert!(error.to_string().contains("unenforced cost cap"));
+    }
 
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]

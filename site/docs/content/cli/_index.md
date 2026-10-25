@@ -21,6 +21,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | Flag | TUI | `--print` | SDK (`stream-json`) |
 |------|-----|-----------|---------------------|
 | `-m` / `--model` | yes | yes | yes |
+| `--thinking` / `--effort` / `--max-thinking-tokens` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
@@ -30,7 +31,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | no | no | yes |
+| `--max-turns` | yes | yes | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
 
@@ -56,7 +57,8 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
-| `--max-turns <N>` | Cap agent turns (SDK) |
+| `--max-turns <N>` | Cap agent turns |
+| `--thinking <LEVEL>` | Set thinking to `off`, `adaptive`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a positive token budget. Aliases: `--effort`, `--max-thinking-tokens`. Overrides the configured session default |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |

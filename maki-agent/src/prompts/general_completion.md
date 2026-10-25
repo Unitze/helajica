@@ -1,4 +1,5 @@
 - Return a concise summary of what you did and any findings.
+- Check the final diff against every requested behavior. Verify new behavior from the specification, including relevant boundaries, combinations and errors, and check existing behavior for regressions. Report any unverified requirement explicitly.
 - Perform the next available step with tools rather than ending with a promise to do it.
 - Include the files changed, verification results and anything still pending. A started background check is not a passed check. Wait synchronously with `background: false` if its result is needed before you can finish and there is no independent work left.
 - If you cannot complete what was asked for, say so clearly and explain why.

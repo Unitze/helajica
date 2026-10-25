@@ -97,6 +97,12 @@ fn load_config(
     raw_config.overlay_plugins(plugin_overlay, &names);
     let mut config = raw_config.into_config(&names).context("invalid config")?;
     config.permissions = load_permissions(project_config);
+    if let Some(max_turns) = cli.max_turns {
+        config.agent.max_turns = Some(max_turns);
+    }
+    if let Some(thinking) = cli.thinking {
+        config.session_defaults.thinking = Some(thinking);
+    }
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -723,6 +729,33 @@ mod tests {
             .expect("builtins load on the live host under --no-plugins");
 
         plugin_host.begin_shutdown();
+    }
+
+    #[test]
+    fn cli_effort_seeds_the_session_defaults() {
+        let dir = tempdir().expect("tempdir");
+        let cli = Cli::parse_from([
+            "maki",
+            "--no-plugins",
+            "--effort",
+            "max",
+            "--max-turns",
+            "4",
+        ]);
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let config = load_config(
+            &host,
+            &cli,
+            InitFiles::Disabled,
+            &ProjectConfig::for_project(dir.path()),
+            &no_names,
+            &PluginOverlay::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(config.session_defaults.thinking, cli.thinking);
+        assert_eq!(config.agent.max_turns, Some(4));
+        host.begin_shutdown();
     }
 
     /// Negative control for the test above: without `--no-plugins`, the

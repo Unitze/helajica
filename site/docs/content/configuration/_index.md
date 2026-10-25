@@ -144,7 +144,8 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
 | `retry_base_ms` | u64 | `2000` | 1 | Base delay between retries (milliseconds, grows per attempt) |
 | `retry_max_ms` | u64 | `60000` | 1 | Cap on the guessed retry backoff (milliseconds) |
-| `max_retries` | u32 | `5` | - | Max retries on a rate limit the server sent no Retry-After for, 0 to never retry them |
+| `retry_max_wait_secs` | u64 | `300` | - | Maximum automatic retry wait in seconds. Longer server delays stop the request without retrying early |
+| `max_retries` | u32 | `5` | - | Max retries per failure kind for rate limits, server and connection errors, 0 to disable |
 | `max_timeout_retries` | u32 | `2` | - | Max retries on stream timeouts |
 
 ### `storage`
@@ -332,7 +333,7 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `allow_background` | boolean | `true` | - | Expose a `background` input that pushes subagent results to the chat when they finish. |
-| `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
+| `allow_model` | boolean | `true` | - | Expose an exact `model` input, subject to the configured model policy. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
 
 ### `plugins.webfetch`
