@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
