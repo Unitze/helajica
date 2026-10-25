@@ -26,6 +26,9 @@ use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
 use crate::runtime::{active_task_id, job_task_id, strip_traceback, with_jobs};
 
 const DEFAULT_TAIL: usize = 20;
+/// What Windows would try after a bare program name on `$PATH`.
+const PATHEXT_ENV: &str = "PATHEXT";
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 const MAX_TAIL_LINES: usize = 1024;
 const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 const DEFAULT_WAIT_MS: u64 = 30_000;
@@ -1333,13 +1336,33 @@ pub(crate) async fn deliver_job_event(lua: &Lua, job_id: u32, event: &JobEvent) 
 /// end
 // A file probe over `$PATH`: it answers whether a file exists, never what the
 // environment holds, so `fs_read` covers it.
+///
+/// On Windows a name without an extension finds `name.exe` and the other
+/// `PATHEXT` suffixes, as the shell would. Everywhere else only the exact
+/// file counts.
 #[lua_fn(guard = FsRead)]
 fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
+    let suffixes = match cfg!(windows) {
+        true => env::var(PATHEXT_ENV).unwrap_or_else(|_| DEFAULT_PATHEXT.into()),
+        false => String::new(),
+    };
     let found = env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(&name).is_file()))
+        .map(|paths| {
+            env::split_paths(&paths)
+                .any(|dir| candidates(&name, &suffixes).any(|c| dir.join(c).is_file()))
+        })
         .unwrap_or(false)
-        || Path::new(&name).is_file();
+        || candidates(&name, &suffixes).any(|c| Path::new(&c).is_file());
     Ok(if found { 1 } else { 0 })
+}
+
+/// `name` itself, then, when it has no extension, `name` with each suffix.
+fn candidates<'a>(name: &'a str, suffixes: &'a str) -> impl Iterator<Item = String> + 'a {
+    let bare = Path::new(name).extension().is_none();
+    std::iter::once(name.to_owned()).chain(suffixes.split(';').filter_map(move |suffix| {
+        let suffix = suffix.trim();
+        (bare && !suffix.is_empty()).then(|| format!("{name}{suffix}"))
+    }))
 }
 
 /// Read the viewport of the focused chat transcript, like Neovim's
@@ -1430,6 +1453,19 @@ mod tests {
     const EXIT_WITHOUT_REAP: &str =
         "an exit event must mean the child was reaped, or a later kill can signal a recycled pid";
     const NEVER_EXITED: &str = "job never reported its exit";
+
+    const WINDOWS_SUFFIXES: &str = ".EXE;.CMD";
+    const EMPTY_SUFFIXES: &str = "";
+
+    use test_case::test_case;
+
+    #[test_case("rg", WINDOWS_SUFFIXES, "rg,rg.EXE,rg.CMD" ; "bare_name_gets_each_suffix")]
+    #[test_case("tool.exe", WINDOWS_SUFFIXES, "tool.exe" ; "an_extension_is_kept_alone")]
+    #[test_case("rg", EMPTY_SUFFIXES, "rg" ; "no_suffixes_on_unix")]
+    fn executable_candidates(name: &str, suffixes: &str, expected: &str) {
+        let found: Vec<String> = candidates(name, suffixes).collect();
+        assert_eq!(found.join(","), expected);
+    }
 
     /// Pull events until {id} reports its exit, so assertions run against a
     /// job that is certainly done.
