@@ -2815,6 +2815,10 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 if maki.fn.executable("rg") == 1 then
   -- use ripgrep
 end
+
+On Windows a name without an extension finds `name.exe` and the other
+`PATHEXT` suffixes, as the shell would. Everywhere else only the exact
+file counts.
 ```
 
 ---

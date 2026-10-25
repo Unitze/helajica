@@ -684,6 +684,7 @@ fn serve_session(
         ..
     } = handle;
     let _ = cancel_tx.try_send(());
+    drop(cancel_tx);
     // Dropping the last way in is what tells the session loop nobody will
     // prompt it again.
     drop(interrupt);

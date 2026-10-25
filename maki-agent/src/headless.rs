@@ -741,6 +741,8 @@ mod tests {
                 false
             ));
             assert!(poll_once(&mut waiting).await.is_none());
+            cancel.send(()).unwrap();
+            assert!(poll_once(&mut waiting).await.is_none());
             drop(cancel);
             assert!(poll_once(&mut waiting).await.unwrap().is_none());
         });

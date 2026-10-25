@@ -2,7 +2,7 @@
 //! conversation in the middle, the composer under it, and whatever Lua
 //! plugins add around them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,7 @@ use gpui_kit::{
 use maki_agent::AgentEvent;
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::types::{TodoItem, TodoStatus};
+use maki_storage::id::MakiId;
 use maki_storage::now_epoch;
 use maki_storage::sessions::{Effort, SessionSummary, StoredThinking};
 use serde_json::Value;
@@ -99,8 +100,8 @@ const TURN_TICK_GAP: f32 = 6.;
 const TURN_CARD_WIDTH: f32 = 320.;
 const TURN_PREVIEW_LINES: usize = 3;
 const FADE_IN: Duration = Duration::from_millis(180);
-const RISE_IN: f32 = 6.;
 const SESSIONS_PER_PROJECT: usize = 30;
+const SESSION_TITLE_CHARS: usize = 120;
 const USAGE_RING_SIZE: f32 = 14.;
 const USAGE_CARD_WIDTH: f32 = 340.;
 const USAGE_WARNING_PERCENT: u32 = 70;
@@ -168,6 +169,8 @@ pub struct WorkspaceView {
     /// Projects unfolded in the sidebar, and the sessions listed under them.
     unfolded: HashSet<PathBuf>,
     sessions: HashMap<PathBuf, Vec<SessionSummary>>,
+    deleting_sessions: HashSet<String>,
+    session_refreshes: HashMap<PathBuf, u64>,
     phase: Phase,
     /// Running sessions the window is not showing, by id: those of the project
     /// switched away from, and of the background session of a project now in
@@ -189,6 +192,7 @@ pub struct WorkspaceView {
     suggestion: usize,
     suggestions_dismissed: bool,
     aside: Option<Aside>,
+    questions: VecDeque<Entity<QuestionForm>>,
     goal: Option<Goal>,
     /// Shown in the main pane in place of the session until one is picked.
     page: Option<MainPage>,
@@ -211,6 +215,7 @@ pub struct WorkspaceView {
     suggestions_scroller: Scroller,
     aside_scroller: Scroller,
     subagents_scroller: Scroller,
+    questions_scroller: Scroller,
     /// Items from here on arrived live and fade in; the loaded history does not.
     animate_from: usize,
     focus: FocusHandle,
@@ -263,6 +268,8 @@ impl WorkspaceView {
             project: None,
             unfolded: HashSet::new(),
             sessions: HashMap::new(),
+            deleting_sessions: HashSet::new(),
+            session_refreshes: HashMap::new(),
             phase: Phase::Idle,
             parked: HashMap::new(),
             stashed: HashMap::new(),
@@ -275,6 +282,7 @@ impl WorkspaceView {
             suggestion: 0,
             suggestions_dismissed: false,
             aside: None,
+            questions: VecDeque::new(),
             goal: None,
             page: None,
             model_picker: None,
@@ -292,6 +300,7 @@ impl WorkspaceView {
             suggestions_scroller: Scroller::area(),
             aside_scroller: Scroller::area(),
             subagents_scroller: Scroller::area(),
+            questions_scroller: Scroller::area(),
             list,
             animate_from: 0,
             focus: cx.focus_handle(),
@@ -443,7 +452,7 @@ impl WorkspaceView {
         self.page = None;
         self.store.touch(&project, now_epoch());
         self.unfolded.insert(project.clone());
-        self.refresh_sessions(&project);
+        self.refresh_sessions(&project, cx);
         let same = self.project.as_ref() == Some(&project);
         if !same {
             self.stash_for_switch();
@@ -470,9 +479,6 @@ impl WorkspaceView {
         self.parked.clear();
         self.stashed
             .remove(&self.project.clone().unwrap_or_default());
-        if let Some(project) = self.project.clone() {
-            self.engine.reload(Some(&project));
-        }
         self._session = None;
         self.phase = Phase::Idle;
     }
@@ -510,6 +516,7 @@ impl WorkspaceView {
                     transcript: mem::take(&mut self.transcript),
                     ext: mem::take(&mut self.ext),
                     aside: self.aside.take(),
+                    questions: mem::take(&mut self.questions),
                     goal: self.goal.take(),
                     usage: self.usage.take(),
                     model_picker: self.model_picker.take(),
@@ -567,6 +574,7 @@ impl WorkspaceView {
                 transcript: mem::take(&mut self.transcript),
                 ext: mem::take(&mut self.ext),
                 aside: self.aside.take(),
+                questions: mem::take(&mut self.questions),
                 goal: self.goal.take(),
                 usage: self.usage.take(),
                 model_picker: self.model_picker.take(),
@@ -591,6 +599,7 @@ impl WorkspaceView {
             transcript,
             ext,
             aside,
+            questions,
             goal,
             usage,
             model_picker,
@@ -603,6 +612,7 @@ impl WorkspaceView {
         self.transcript = transcript;
         self.ext = ext;
         self.aside = aside;
+        self.questions = questions;
         self.goal = goal;
         self.usage = usage;
         self.model_picker = model_picker;
@@ -627,20 +637,61 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn refresh_sessions(&mut self, project: &Path) {
-        let mut sessions = self.engine.sessions(project);
-        // Newest first by when they began (ids are UUIDv7), so using a session
-        // does not move it.
-        sessions.sort_by(|a, b| b.id.as_bytes().cmp(a.id.as_bytes()));
-        sessions.truncate(SESSIONS_PER_PROJECT);
-        self.sessions.insert(project.to_path_buf(), sessions);
+    fn refresh_sessions(&mut self, project: &Path, cx: &mut Context<Self>) {
+        let project = project.to_path_buf();
+        let generation = self.session_refreshes.entry(project.clone()).or_default();
+        *generation += 1;
+        let generation = *generation;
+        let engine = Arc::clone(&self.engine);
+        cx.spawn(async move |this, cx| {
+            let mut sessions = cx
+                .background_spawn({
+                    let project = project.clone();
+                    async move { engine.sessions(&project) }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.session_refreshes.get(&project) != Some(&generation) {
+                    return;
+                }
+                if let Some(existing) = this.sessions.get(&project) {
+                    for session in existing {
+                        let id = session.id.to_string();
+                        if (this.current_session() == Some(id.as_str())
+                            || this.parked.contains_key(&id)
+                            || this
+                                .stashed
+                                .get(&project)
+                                .is_some_and(|slot| slot.parked.boot.session_id == id))
+                            && !sessions.iter().any(|saved| saved.id == session.id)
+                        {
+                            sessions.push(SessionSummary {
+                                id: session.id,
+                                title: session.title.clone(),
+                                cwd: session.cwd.clone(),
+                                updated_at: session.updated_at,
+                            });
+                        }
+                    }
+                }
+                sessions
+                    .retain(|session| !this.deleting_sessions.contains(&session.id.to_string()));
+                // Newest first by when they began (ids are UUIDv7), so using a session
+                // does not move it.
+                sessions.sort_by(|a, b| b.id.as_bytes().cmp(a.id.as_bytes()));
+                sessions.truncate(SESSIONS_PER_PROJECT);
+                this.sessions.insert(project.clone(), sessions);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn toggle_project(&mut self, project: &Path, cx: &mut Context<Self>) {
         if !self.unfolded.remove(project) {
             self.unfolded.insert(project.to_path_buf());
             if !self.sessions.contains_key(project) {
-                self.refresh_sessions(project);
+                self.refresh_sessions(project, cx);
             }
         }
         cx.notify();
@@ -696,6 +747,9 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.deleting_sessions.insert(id.to_owned()) {
+            return;
+        }
         let current =
             self.project.as_deref() == Some(project) && self.current_session() == Some(id);
         if current {
@@ -703,18 +757,38 @@ impl WorkspaceView {
             self.phase = Phase::Idle;
         }
         self.parked.remove(id);
-        if let Err(e) = self.engine.delete_session(project, id) {
-            window.push_notification(
-                Notification::new()
-                    .message(format!("Could not delete the session: {e:#}"))
-                    .with_type(NotificationType::Error),
-                cx,
-            );
+        if let Some(sessions) = self.sessions.get_mut(project) {
+            sessions.retain(|session| session.id.to_string() != id);
         }
-        self.refresh_sessions(project);
         if current {
             self.start(None, false, window, cx);
         }
+        let engine = Arc::clone(&self.engine);
+        let project = project.to_path_buf();
+        let id = id.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let project = project.clone();
+                    let id = id.clone();
+                    async move { engine.delete_session(&project, &id) }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.deleting_sessions.remove(&id);
+                this.refresh_sessions(&project, cx);
+                if let Err(error) = result {
+                    window.push_notification(
+                        Notification::new()
+                            .message(format!("Could not delete the session: {error:#}"))
+                            .with_type(NotificationType::Error),
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -722,12 +796,20 @@ impl WorkspaceView {
         self.store.remove(project);
         self.unfolded.remove(project);
         self.sessions.remove(project);
+        self.session_refreshes.remove(project);
         self.stashed.remove(project);
+        let engine = Arc::clone(&self.engine);
+        let closed_project = project.to_path_buf();
+        cx.background_spawn(async move {
+            engine.reload(Some(&closed_project));
+        })
+        .detach();
         if self.project.as_deref() == Some(project) {
             self.project = None;
             self.drop_sessions();
             self.transcript = Transcript::default();
             self.ext = Extensions::default();
+            self.questions.clear();
             window.refresh();
         }
         cx.notify();
@@ -788,6 +870,7 @@ impl WorkspaceView {
         self.thumbs.clear();
         self.ext = Extensions::default();
         self.aside = None;
+        self.questions.clear();
         self.goal = None;
         self.usage = None;
         self.model_picker = None;
@@ -827,7 +910,7 @@ impl WorkspaceView {
                 for warning in &session.boot.warnings {
                     this.transcript.notice(warning.clone(), Level::Warning);
                 }
-                this.refresh_sessions(&project);
+                this.refresh_sessions(&project, cx);
                 if session.boot.yolo {
                     this.mode = Mode::Bypass;
                 } else if this.mode == Mode::Bypass {
@@ -878,7 +961,7 @@ impl WorkspaceView {
                 },
             };
             if parked.receive(update) {
-                this.refresh_sessions(project);
+                this.refresh_sessions(project, cx);
             }
             cx.notify();
         })
@@ -1262,15 +1345,19 @@ impl WorkspaceView {
         }
         match &envelope.event {
             AgentEvent::Done { reason, .. } => {
+                self.questions.clear();
                 if let Some(project) = self.project.clone() {
-                    self.refresh_sessions(&project);
+                    self.refresh_sessions(&project, cx);
                 }
                 self.send(Command::Usage);
                 let cancelled = reason.to_string() == CANCELLED_REASON;
                 self.after_run(cancelled, window, cx);
                 cx.notify();
             }
-            AgentEvent::Error { .. } => self.goal = None,
+            AgentEvent::Error { .. } => {
+                self.goal = None;
+                self.questions.clear();
+            }
             _ => {}
         }
     }
@@ -1334,6 +1421,7 @@ impl WorkspaceView {
 
     /// Sends `prompt` with the attached images, showing `shown` for it.
     fn prompt(&mut self, shown: String, prompt: String, cx: &mut Context<Self>) {
+        self.show_current_session(&shown);
         let attachments = std::mem::take(&mut self.attachments);
         let images: Vec<_> = attachments.iter().map(Attachment::source).collect();
         self.transcript.push_user(shown, images.clone());
@@ -1348,6 +1436,38 @@ impl WorkspaceView {
         });
         self.scroll_to_end();
         cx.notify();
+    }
+
+    fn show_current_session(&mut self, text: &str) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let Some(id) = self
+            .current_session()
+            .and_then(|id| id.parse::<MakiId>().ok())
+        else {
+            return;
+        };
+        let sessions = self.sessions.entry(project.clone()).or_default();
+        if sessions.iter().any(|session| session.id == id) {
+            return;
+        }
+        sessions.insert(
+            0,
+            SessionSummary {
+                id,
+                title: text
+                    .lines()
+                    .next()
+                    .unwrap_or("New session")
+                    .chars()
+                    .take(SESSION_TITLE_CHARS)
+                    .collect(),
+                cwd: project.to_string_lossy().into_owned(),
+                updated_at: now_epoch(),
+            },
+        );
+        sessions.truncate(SESSIONS_PER_PROJECT);
     }
 
     fn run_builtin(
@@ -1512,40 +1632,75 @@ impl WorkspaceView {
     }
 
     fn ask(&mut self, input: &Value, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(commands) = self.commands().cloned() else {
+        if self.commands().is_some() {
+            self.questions
+                .push_back(cx.new(|cx| QuestionForm::new(input, window, cx)));
+            cx.notify();
+        }
+    }
+
+    fn answer_question(&mut self, submit: bool, cx: &mut Context<Self>) {
+        let Some(form) = self.questions.pop_front() else {
             return;
         };
-        let form = cx.new(|cx| QuestionForm::new(input, window, cx));
-        window.open_dialog(cx, move |dialog, _, _| {
-            let submit_form = form.clone();
-            let submit_commands = commands.clone();
-            let dismiss_commands = commands.clone();
-            dialog
-                .title("maki has a question")
-                .w(px(600.))
-                .overlay_closable(false)
-                .child(form.clone())
-                .footer({
-                    let form = submit_form.clone();
-                    let submit = submit_commands.clone();
-                    let dismiss = dismiss_commands.clone();
-                    DialogFooter::new().children([
-                        Button::new("skip")
+        self.send(Command::Answer(submit.then(|| form.read(cx).answer(cx))));
+        cx.notify();
+    }
+
+    fn render_question(
+        &self,
+        form: &Entity<QuestionForm>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .p_3()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().muted)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(Lucide::MessageCircleQuestionMark).small())
+                    .child(div().text_sm().font_medium().child("Question"))
+                    .when(self.questions.len() > 1, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{} pending", self.questions.len())),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("questions-scroll")
+                    .max_h(px(ASIDE_HEIGHT))
+                    .smooth_scroll(&self.questions_scroller, cx)
+                    .child(form.clone()),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("skip-question")
+                            .small()
+                            .outline()
                             .label("Skip")
-                            .on_click(move |_, window, cx| {
-                                let _ = dismiss.send(Command::Answer(None));
-                                window.close_dialog(cx);
-                            }),
-                        Button::new("answer").primary().label("Answer").on_click(
-                            move |_, window, cx| {
-                                let text = form.read(cx).answer(cx);
-                                let _ = submit.send(Command::Answer(Some(text)));
-                                window.close_dialog(cx);
-                            },
-                        ),
-                    ])
-                })
-        });
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.answer_question(false, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("answer-question")
+                            .small()
+                            .primary()
+                            .label("Answer")
+                            .on_click(cx.listener(|this, _, _, cx| this.answer_question(true, cx))),
+                    ),
+            )
     }
 
     fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -2487,6 +2642,12 @@ impl WorkspaceView {
                         "activity-in",
                     ))
                 })
+                .when_some(self.questions.front(), |this, form| {
+                    this.child(fade_in(
+                        div().child(self.render_question(form, cx)),
+                        SharedString::from(format!("question-in-{}", form.entity_id())),
+                    ))
+                })
                 .when(!todos.is_empty(), |this| {
                     this.child(fade_in(
                         div().child(self.render_todos(&todos, cx)),
@@ -2494,7 +2655,10 @@ impl WorkspaceView {
                     ))
                 })
                 .when(!self.transcript.subagents.is_empty(), |this| {
-                    this.child(self.render_subagents(cx))
+                    this.child(fade_in(
+                        div().child(self.render_subagents(cx)),
+                        "subagents-in",
+                    ))
                 })
                 .child(
                     div()
@@ -2634,7 +2798,7 @@ impl WorkspaceView {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle("subagents", cx))),
             )
             .when(open, |this| {
-                this.child(
+                this.child(fade_in(
                     div()
                         .id("subagents-scroll")
                         .max_h(px(ASIDE_HEIGHT))
@@ -2682,7 +2846,8 @@ impl WorkspaceView {
                                         })
                                 })),
                         ),
-                )
+                    "subagents-details-in",
+                ))
             })
     }
 
@@ -3778,7 +3943,7 @@ fn fade_in<E: gpui_kit::Styled + IntoElement + 'static>(
     element.with_animation(
         id,
         Animation::new(FADE_IN).with_easing(ease_out_quint()),
-        |element, delta| element.opacity(delta).mt(px((1. - delta) * RISE_IN)),
+        |element, delta| element.opacity(delta),
     )
 }
 
@@ -3855,6 +4020,7 @@ struct Parked {
     transcript: Transcript,
     ext: Extensions,
     aside: Option<Aside>,
+    questions: VecDeque<Entity<QuestionForm>>,
     goal: Option<Goal>,
     usage: Option<UsageReport>,
     model_picker: Option<Entity<ModelPicker>>,
@@ -3869,7 +4035,7 @@ struct Parked {
 }
 
 impl Parked {
-    /// Takes an update in, holding back what needs the window. `true` when    /// a run ended.
+    /// Holds updates needing a window. Returns whether the run ended.
     fn receive(&mut self, update: Update) -> bool {
         let envelope = match update {
             Update::Agent(envelope) => envelope,
@@ -3889,6 +4055,14 @@ impl Parked {
         self.transcript.apply(&envelope);
         if envelope.subagent.is_some() {
             return false;
+        }
+        if matches!(
+            envelope.event,
+            AgentEvent::Done { .. } | AgentEvent::Error { .. }
+        ) {
+            self.questions.clear();
+            self.pending
+                .retain(|update| !matches!(update, Update::Question { .. }));
         }
         match &envelope.event {
             AgentEvent::Done { reason, .. } => {
@@ -4246,6 +4420,7 @@ mod tests {
             transcript: Transcript::default(),
             ext: Extensions::default(),
             aside: None,
+            questions: VecDeque::new(),
             goal: None,
             usage: None,
             model_picker: None,
@@ -4278,6 +4453,7 @@ mod tests {
     #[test_case(DoneReason::Cancelled, true ; "cancelled")]
     fn a_parked_run_that_ends_is_remembered(reason: DoneReason, cancelled: bool) {
         let mut session = parked();
+        session.receive(Update::Question { input: Value::Null });
         let ended = session.receive(agent(AgentEvent::Done {
             usage: TokenUsage::default(),
             cost: None,
@@ -4289,6 +4465,7 @@ mod tests {
         }));
         assert!(ended);
         assert_eq!(session.run_ended, Some(cancelled));
+        assert!(session.pending.is_empty());
     }
 
     #[test_case("anthropic/claude-opus-5-5", "claude-opus-5-5" ; "provider_prefix")]
