@@ -5,7 +5,6 @@
 local M = {}
 
 local CAPTURE_TIMEOUT_MS = 20000
-local DBG_BRANCH = "START"
 local SHOTS_DIR = "screenshots"
 local PATH_VAR = "MAKI_SHOT_PATH"
 local TITLE_VAR = "MAKI_SHOT_TITLE"
@@ -104,7 +103,6 @@ end
 -- The PNG's path, or nil and why it could not be taken.
 function M.capture(window)
   local path = next_path()
-  maki.log.error("DBG branch=" .. DBG_BRANCH .. " exe=" .. tostring(maki.fn.executable("powershell")) .. " state=" .. tostring(maki.env.state_dir()))
   local command
   if is_windows() then
     command = windows_command()

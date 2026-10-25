@@ -24,23 +24,8 @@
       }
     ],
     "outcome": {
-      "context_size": 0,
-      "message": {
-        "content": [
-          {
-            "text": "Hel",
-            "type": "text"
-          }
-        ],
-        "role": "assistant"
-      },
-      "stop_reason": null,
-      "usage": {
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "input_tokens": 0,
-        "output_tokens": 0
-      }
+      "error": "Io(UnexpectedEof)",
+      "message": "completion stream ended before a finish reason or [DONE]"
     },
     "requests": [
       {
