@@ -1587,6 +1587,7 @@ mod tests {
     use crate::types::dialect;
 
     const AUTH_HEADER: &str = "authorization";
+    const SHARED_PATHS: &str = "the config dir was resolved before the home was isolated, so a save would land in the real one: run one test per process (cargo nextest)";
     const CONSTANT_TOKEN: &str = "Bearer constant";
     const FIRST_TOKEN: &str = "Bearer refreshed-1";
     const ROTATED_TOKEN: &str = "Bearer refreshed-2";
@@ -1846,6 +1847,8 @@ mod tests {
         ] {
             unsafe { std::env::set_var(var, home.path()) };
         }
+        let config = maki_storage::paths::config_dir().unwrap();
+        assert!(config.starts_with(home.path()), "{SHARED_PATHS}");
         home
     }
 

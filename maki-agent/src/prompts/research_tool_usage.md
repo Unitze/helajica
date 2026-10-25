@@ -1,3 +1,4 @@
 - Every tool result grows your context. Minimize use of verbose tool calls, prefer compact results.
+- Call several tools in one response whenever they do not depend on each other: they run in parallel, while each response with a single call costs a full round trip.
 - **Use batch** for 2+ independent reads, greps, or globs. Never call them one at a time sequentially.
 - **Use code_execution** for dependent/chained calls (e.g. glob then read matches) or filtering large tool outputs.
